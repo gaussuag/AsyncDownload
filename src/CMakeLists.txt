@@ -14,4 +14,4 @@ foreach(inc_dir ${LIB_INCLUDE_DIRS})
     endif()
 endforeach()
 
-target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
+target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)

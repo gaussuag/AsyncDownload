@@ -45,7 +45,7 @@ scripts\build.bat
 ## Code Style Guidelines
 
 ### Language Standard
-- C++17 required
+- C++20 required
 - CMake 3.16+
 
 ### Compiler Options
