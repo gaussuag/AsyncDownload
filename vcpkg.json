@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "playground-cpp",
+  "version": "1.0.0",
+  "dependencies": [
+    "curl",
+    "7zip"
+  ]
+}

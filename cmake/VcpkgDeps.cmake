@@ -1,0 +1,76 @@
+function(target_link_vcpkg_deps TARGET)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/vcpkg.json")
+        return()
+    endif()
+
+    set(VCPKG_INSTALLED_DIR "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows")
+    if(NOT EXISTS "${VCPKG_INSTALLED_DIR}")
+        set(VCPKG_INSTALLED_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows")
+    endif()
+
+    if(EXISTS "${VCPKG_INSTALLED_DIR}/include")
+        target_include_directories(${TARGET} PRIVATE "${VCPKG_INSTALLED_DIR}/include")
+    endif()
+
+    file(READ "${CMAKE_SOURCE_DIR}/vcpkg.json" VCPKG_JSON_CONTENT)
+    string(REGEX MATCHALL "\"([a-zA-Z0-9_-]+)\"" ALL_KEYWORDS "${VCPKG_JSON_CONTENT}")
+    
+    set(VCPKG_NAME "")
+    foreach(KEYWORD ${ALL_KEYWORDS})
+        string(REPLACE "\"" "" KEYWORD "${KEYWORD}")
+        if(KEYWORD STREQUAL "name")
+            set(VCPKG_NAME_FOUND TRUE)
+        elseif(VCPKG_NAME_FOUND)
+            set(VCPKG_NAME "${KEYWORD}")
+            set(VCPKG_NAME_FOUND FALSE)
+        endif()
+    endforeach()
+    
+    foreach(KEYWORD ${ALL_KEYWORDS})
+        string(REPLACE "\"" "" KEYWORD "${KEYWORD}")
+        if(NOT KEYWORD STREQUAL "dependencies" AND 
+           NOT KEYWORD STREQUAL "$schema" AND 
+           NOT KEYWORD STREQUAL "name" AND
+           NOT KEYWORD STREQUAL "${VCPKG_NAME}" AND
+           NOT KEYWORD MATCHES "^version")
+            set(DEP "${KEYWORD}")
+            set(DEP_UPPER "${DEP}")
+            string(TOUPPER "${DEP}" DEP_UPPER)
+            
+            list(APPEND CMAKE_PREFIX_PATH "${VCPKG_INSTALLED_DIR}/share/${DEP}")
+            find_package(${DEP} CONFIG QUIET)
+            list(REMOVE_ITEM CMAKE_PREFIX_PATH "${VCPKG_INSTALLED_DIR}/share/${DEP}")
+            
+            set(FOUND_VAR "${DEP_UPPER}_FOUND")
+            
+            if(TARGET ${DEP}::${DEP})
+                target_link_libraries(${TARGET} PRIVATE ${DEP}::${DEP})
+                set(FOUND_VAR TRUE)
+            elseif(TARGET ${DEP_UPPER}::lib${DEP})
+                target_link_libraries(${TARGET} PRIVATE ${DEP_UPPER}::lib${DEP})
+                set(FOUND_VAR TRUE)
+            elseif(TARGET ${DEP_UPPER}::${DEP_UPPER})
+                target_link_libraries(${TARGET} PRIVATE ${DEP_UPPER}::${DEP_UPPER})
+                set(FOUND_VAR TRUE)
+            endif()
+            
+            if(NOT ${FOUND_VAR})
+                file(GLOB_RECURSE LIBS "${VCPKG_INSTALLED_DIR}/lib/*${DEP}*.lib")
+                foreach(LIB ${LIBS})
+                    if(NOT LIB MATCHES "optimized" AND NOT LIB MATCHES "debug")
+                        target_link_libraries(${TARGET} PRIVATE "${LIB}")
+                    endif()
+                endforeach()
+            endif()
+            
+            if(${FOUND_VAR})
+                if(TARGET ${DEP}::${DEP})
+                    get_target_property(INC_DIRS ${DEP}::${DEP} INTERFACE_INCLUDE_DIRECTORIES)
+                    if(INC_DIRS)
+                        target_include_directories(${TARGET} PRIVATE ${INC_DIRS})
+                    endif()
+                endif()
+            endif()
+        endif()
+    endforeach()
+endfunction()
