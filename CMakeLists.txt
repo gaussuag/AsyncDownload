@@ -9,7 +9,7 @@ if(VCPKG_ROOT AND EXISTS "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(VCPKG_MANIFEST_MODE ON)
 endif()
 
-project(PlaygroundCpp VERSION 1.0.0 LANGUAGES CXX)
+project(AsyncDownload VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
