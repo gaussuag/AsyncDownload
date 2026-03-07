@@ -1,40 +1,76 @@
+﻿#include "asyncdownload/client.hpp"
+
+#include <cstdlib>
+#include <cstdint>
 #include <iostream>
-#include <curl/curl.h>
-#include <concurrentqueue/concurrentqueue.h>
-#include <vector>
 #include <string>
-#include <cstring>
 
-int main() {
-    std::cout << "Hello, World!" << std::endl;
+namespace {
 
-    CURL* curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-
-        CURLcode res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            long response_code;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-            std::cout << "HTTP Response Code: " << response_code << std::endl;
-        } else {
-            std::cout << "curl_easy_perform failed: " << curl_easy_strerror(res) << std::endl;
+[[nodiscard]] bool parse_connections(const char* value, std::size_t& result) {
+    try {
+        const auto parsed = std::stoull(value);
+        if (parsed == 0) {
+            return false;
         }
 
-        curl_easy_cleanup(curl);
+        result = static_cast<std::size_t>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 3 || argc > 4) {
+        std::cerr << "Usage: AsyncDownload <url> <output> [connections]\n";
+        return 1;
     }
 
-    moodycamel::ConcurrentQueue<int> queue;
-    queue.enqueue(1);
-    queue.enqueue(2);
-    queue.enqueue(3);
+    asyncdownload::DownloadRequest request{};
+    request.url = argv[1];
+    request.output_path = argv[2];
 
-    int value;
-    while (queue.try_dequeue(value)) {
-        std::cout << "Dequeued: " << value << std::endl;
+    if (argc == 4 && !parse_connections(argv[3], request.options.max_connections)) {
+        std::cerr << "Invalid connections value\n";
+        return 1;
     }
 
+    request.progress_callback = [](const asyncdownload::ProgressSnapshot& snapshot) {
+        const auto network_mb_per_second =
+            snapshot.network_bytes_per_second / (1024.0 * 1024.0);
+        const auto disk_mb_per_second =
+            snapshot.disk_bytes_per_second / (1024.0 * 1024.0);
+        const auto progress = snapshot.total_bytes > 0
+            ? (100.0 * static_cast<double>(snapshot.persisted_bytes) /
+                static_cast<double>(snapshot.total_bytes))
+            : 0.0;
+        std::cout << "\rdownloaded=" << snapshot.downloaded_bytes
+                  << " persisted=" << snapshot.persisted_bytes
+                  << " vdl=" << snapshot.vdl_offset
+                  << " inflight=" << snapshot.inflight_bytes
+                  << " queued=" << snapshot.queued_packets
+                  << " active=" << snapshot.active_requests
+                  << " paused=" << snapshot.paused_ranges
+                  << " net=" << network_mb_per_second
+                  << "MB/s"
+                  << " disk=" << disk_mb_per_second
+                  << "MB/s"
+                  << " memory=" << snapshot.memory_bytes
+                  << " progress=" << progress << "%" << std::flush;
+    };
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    std::cout << "\n";
+
+    if (!result.ok()) {
+        std::cerr << "Download failed: " << result.error.message() << "\n";
+        return 1;
+    }
+
+    std::cout << "Download completed: " << request.output_path.string() << "\n";
     return 0;
 }

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+﻿cmake_minimum_required(VERSION 3.16)
 
 if(NOT DEFINED VCPKG_ROOT)
     set(VCPKG_ROOT "$ENV{VCPKG_ROOT}")
@@ -19,6 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(MSVC)
     add_compile_options(/utf-8 /W4 /permissive-)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
     add_compile_options(-Wall -Wextra -pedantic)
 endif()
@@ -29,13 +30,14 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/cmake/VcpkgDeps.cmake)
     include(cmake/VcpkgDeps.cmake)
 endif()
 
-enable_testing()
-
-add_subdirectory(src)
-add_subdirectory(tests)
-
 #### AUTO-Generated: libs start ####
 if(EXISTS ${CMAKE_SOURCE_DIR}/libs/googletest/CMakeLists.txt)
     add_subdirectory(libs/googletest)
 endif()
 #### AUTO-Generated: libs end ####
+
+enable_testing()
+
+add_subdirectory(src)
+add_subdirectory(tests)
+
