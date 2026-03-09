@@ -75,6 +75,30 @@ private:
     return core::global_packet_overhead(payload_size, include_map_overhead);
 }
 
+template <typename T>
+void update_peak(std::atomic<T>& target, const T value) noexcept {
+    auto current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+        !target.compare_exchange_weak(current,
+            value,
+            std::memory_order_release,
+            std::memory_order_relaxed)) {
+    }
+}
+
+void maybe_record_relative_time_ms(std::atomic<std::int64_t>& target,
+                                   const core::SessionState& session,
+                                   const Clock::time_point now) noexcept {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - session.task_started_at).count();
+    auto unset = static_cast<std::int64_t>(-1);
+    const auto elapsed_ms = static_cast<std::int64_t>(std::max<std::int64_t>(0, elapsed));
+    target.compare_exchange_strong(unset,
+        elapsed_ms,
+        std::memory_order_release,
+        std::memory_order_relaxed);
+}
+
 void update_progress_rates(core::SessionState& session,
                            ProgressSnapshot& snapshot) noexcept {
     // 速度统一由调度线程基于相邻两次快照做差分计算，这样网络速率和磁盘速率
@@ -108,6 +132,10 @@ void update_progress_rates(core::SessionState& session,
     session.last_progress_persisted_bytes = snapshot.persisted_bytes;
     snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
     snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
+    session.peak_network_bytes_per_second = std::max(session.peak_network_bytes_per_second,
+        snapshot.network_bytes_per_second);
+    session.peak_disk_bytes_per_second = std::max(session.peak_disk_bytes_per_second,
+        snapshot.disk_bytes_per_second);
 }
 
 void invoke_progress(core::SessionState& session,
@@ -158,6 +186,10 @@ void invoke_progress(core::SessionState& session,
         }
     }
 
+    update_peak(session.max_memory_bytes, snapshot.memory_bytes);
+    update_peak(session.max_inflight_bytes, snapshot.inflight_bytes);
+    update_peak(session.max_queued_packets, snapshot.queued_packets);
+    update_peak(session.max_active_requests, snapshot.active_requests);
     update_progress_rates(session, snapshot);
 
     try {
@@ -320,7 +352,8 @@ void enqueue_control_packet(moodycamel::BlockingConcurrentQueue<core::DataPacket
     packet.kind = kind;
     packet.range_id = range_id;
     data_queue.enqueue(std::move(packet));
-    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    const auto queued = session.queued_packets.fetch_add(1, std::memory_order_relaxed) + 1;
+    update_peak(session.max_queued_packets, queued);
 }
 
 void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept {
@@ -388,6 +421,7 @@ void update_speed(TransferHandle& transfer) noexcept {
     transfer.curl_result = CURLE_OK;
     transfer.request_started = Clock::now();
     transfer.range_header.clear();
+    transfer.session->windows_total.fetch_add(1, std::memory_order_relaxed);
 
     curl_easy_reset(transfer.easy);
     curl_easy_setopt(transfer.easy, CURLOPT_URL, session.url.c_str());
@@ -404,6 +438,8 @@ void update_speed(TransferHandle& transfer) noexcept {
             return 0;
         }
 
+        current->session->write_callback_calls.fetch_add(1, std::memory_order_relaxed);
+
         // stop_requested 表示主线程已经决定收尾，回调这里直接返回失败，
         // 让 libcurl 尽快结束该请求。
         if (current->session->stop_requested.load(std::memory_order_acquire)) {
@@ -414,6 +450,10 @@ void update_speed(TransferHandle& transfer) noexcept {
         if (remaining <= 0) {
             // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
             // 就暂停接收，避免把后续字节算进错误的区间。
+            if (!current->paused_by_memory) {
+                current->session->window_boundary_pause_count.fetch_add(1,
+                    std::memory_order_relaxed);
+            }
             current->paused_by_memory = true;
             current->range->pause_for_memory.store(true, std::memory_order_release);
             mark_range_status(*current->range, core::RangeStatus::paused);
@@ -434,6 +474,9 @@ void update_speed(TransferHandle& transfer) noexcept {
                 current->session->options.backpressure_high_bytes)) {
             // 这里不阻塞等待队列腾空间，而是立刻 pause 当前 easy handle，
             // 把“什么时候恢复”交回给事件循环中的统一背压逻辑。
+            if (!current->paused_by_memory) {
+                current->session->memory_pause_count.fetch_add(1, std::memory_order_relaxed);
+            }
             current->paused_by_memory = true;
             current->range->pause_for_memory.store(true, std::memory_order_release);
             mark_range_status(*current->range, core::RangeStatus::paused);
@@ -447,14 +490,19 @@ void update_speed(TransferHandle& transfer) noexcept {
         packet.payload.assign(reinterpret_cast<const std::uint8_t*>(data),
             reinterpret_cast<const std::uint8_t*>(data) + allowed);
         packet.accounted_bytes = accounted;
+        update_peak(current->session->max_packet_size_bytes, allowed);
 
         const auto queued_memory = core::global_memory_accounting().add(packet.accounted_bytes);
-        static_cast<void>(queued_memory);
+        update_peak(current->session->max_memory_bytes, queued_memory);
         if (!current->data_queue->try_enqueue(std::move(packet))) {
             const auto released_memory = core::global_memory_accounting().subtract(accounted);
             static_cast<void>(released_memory);
             // 队列入队失败和高水位触发一样，都采用“非阻塞暂停”策略，
             // 不在 libcurl 回调里做任何等待。
+            if (!current->paused_by_memory) {
+                current->session->queue_full_pause_count.fetch_add(1,
+                    std::memory_order_relaxed);
+            }
             current->paused_by_memory = true;
             current->range->pause_for_memory.store(true, std::memory_order_release);
             mark_range_status(*current->range, core::RangeStatus::paused);
@@ -463,9 +511,19 @@ void update_speed(TransferHandle& transfer) noexcept {
 
         // downloaded_bytes 统计的是“已经从网络收到并交给持久化链路处理”的字节数，
         // 它不等同于 persisted_bytes。
-        current->session->queued_packets.fetch_add(1, std::memory_order_relaxed);
-        current->session->downloaded_bytes.fetch_add(static_cast<std::int64_t>(allowed),
-            std::memory_order_relaxed);
+        current->session->packets_enqueued_total.fetch_add(1, std::memory_order_relaxed);
+        const auto queued = current->session->queued_packets.fetch_add(1,
+            std::memory_order_relaxed) + 1;
+        update_peak(current->session->max_queued_packets, queued);
+        const auto downloaded = current->session->downloaded_bytes.fetch_add(
+            static_cast<std::int64_t>(allowed), std::memory_order_relaxed) +
+            static_cast<std::int64_t>(allowed);
+        const auto inflight = downloaded -
+            current->session->persisted_bytes.load(std::memory_order_relaxed);
+        update_peak(current->session->max_inflight_bytes, std::max<std::int64_t>(0, inflight));
+        maybe_record_relative_time_ms(current->session->time_to_first_byte_ms,
+            *current->session,
+            Clock::now());
         current->next_offset += static_cast<std::int64_t>(allowed);
         current->request_bytes += static_cast<std::int64_t>(allowed);
         return allowed;
@@ -532,6 +590,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 
         const auto pause_for_gap = handle.range->pause_for_gap.load(std::memory_order_acquire);
         if (pause_for_gap && !handle.paused_by_gap) {
+            handle.session->gap_pause_count.fetch_add(1, std::memory_order_relaxed);
             handle.paused_by_gap = true;
             mark_range_status(*handle.range, core::RangeStatus::paused);
             curl_easy_pause(handle.easy, CURLPAUSE_RECV);
@@ -575,6 +634,9 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     const auto pause_count = std::max<std::size_t>(1, (active.size() + 4) / 5);
     for (std::size_t index = 0; index < pause_count && index < active.size(); ++index) {
         auto* handle = active[index];
+        if (!handle->paused_by_memory) {
+            handle->session->memory_pause_count.fetch_add(1, std::memory_order_relaxed);
+        }
         handle->paused_by_memory = true;
         handle->range->pause_for_memory.store(true, std::memory_order_release);
         mark_range_status(*handle->range, core::RangeStatus::paused);
@@ -688,6 +750,62 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
     }
 }
 
+[[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
+                                                           const std::size_t ranges_total,
+                                                           const Clock::time_point now) noexcept {
+    PerformanceSummary summary{};
+    summary.total_duration_ms = std::max<std::int64_t>(0,
+        std::chrono::duration_cast<std::chrono::milliseconds>(now -
+            session.task_started_at).count());
+    summary.time_to_first_byte_ms = session.time_to_first_byte_ms.load(std::memory_order_relaxed);
+    summary.time_to_first_persist_ms =
+        session.time_to_first_persist_ms.load(std::memory_order_relaxed);
+    const auto effective_downloaded = std::max<std::int64_t>(0,
+        session.downloaded_bytes.load(std::memory_order_relaxed) - session.resume_reused_bytes);
+    const auto effective_persisted = std::max<std::int64_t>(0,
+        session.persisted_bytes.load(std::memory_order_relaxed) - session.resume_reused_bytes);
+    if (summary.total_duration_ms > 0) {
+        const auto seconds = static_cast<double>(summary.total_duration_ms) / 1000.0;
+        summary.average_network_bytes_per_second =
+            static_cast<double>(effective_downloaded) / seconds;
+        summary.average_disk_bytes_per_second =
+            static_cast<double>(effective_persisted) / seconds;
+    }
+    summary.peak_network_bytes_per_second = session.peak_network_bytes_per_second;
+    summary.peak_disk_bytes_per_second = session.peak_disk_bytes_per_second;
+    summary.resume_reused_bytes = session.resume_reused_bytes;
+    summary.max_memory_bytes = session.max_memory_bytes.load(std::memory_order_relaxed);
+    summary.max_inflight_bytes = session.max_inflight_bytes.load(std::memory_order_relaxed);
+    summary.max_queued_packets = session.max_queued_packets.load(std::memory_order_relaxed);
+    summary.max_active_requests = session.max_active_requests.load(std::memory_order_relaxed);
+    summary.memory_pause_count = session.memory_pause_count.load(std::memory_order_relaxed);
+    summary.queue_full_pause_count =
+        session.queue_full_pause_count.load(std::memory_order_relaxed);
+    summary.window_boundary_pause_count =
+        session.window_boundary_pause_count.load(std::memory_order_relaxed);
+    summary.gap_pause_count = session.gap_pause_count.load(std::memory_order_relaxed);
+    summary.windows_total = session.windows_total.load(std::memory_order_relaxed);
+    summary.ranges_total = ranges_total;
+    summary.ranges_stolen = session.ranges_stolen.load(std::memory_order_relaxed);
+    summary.write_callback_calls = session.write_callback_calls.load(std::memory_order_relaxed);
+    summary.packets_enqueued_total =
+        session.packets_enqueued_total.load(std::memory_order_relaxed);
+    if (summary.packets_enqueued_total > 0) {
+        summary.average_packet_size_bytes =
+            static_cast<double>(effective_downloaded) /
+            static_cast<double>(summary.packets_enqueued_total);
+    }
+    summary.max_packet_size_bytes =
+        session.max_packet_size_bytes.load(std::memory_order_relaxed);
+    summary.flush_count = session.flush_count.load(std::memory_order_relaxed);
+    summary.flush_time_ms_total = session.flush_time_ms_total.load(std::memory_order_relaxed);
+    summary.metadata_save_count =
+        session.metadata_save_count.load(std::memory_order_relaxed);
+    summary.metadata_save_time_ms_total =
+        session.metadata_save_time_ms_total.load(std::memory_order_relaxed);
+    return summary;
+}
+
 std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
                                        metadata::MetadataStore& metadata_store,
                                        const core::SessionState& session,
@@ -720,6 +838,7 @@ std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
 
 DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
     DownloadResult result{};
+    const auto run_started = Clock::now();
     result.temporary_path = core::make_temporary_path(request.output_path);
     result.metadata_path = core::make_metadata_path(request.output_path);
 
@@ -766,6 +885,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.total_size = probe_result.total_size;
         session.accept_ranges = probe_result.accept_ranges;
         session.progress_callback = request.progress_callback;
+        session.task_started_at = run_started;
         if (!session.accept_ranges) {
             // 不支持 Range 的服务端无法安全做多连接和窗口化调度，所以这里主动
             // 退化到单连接整文件下载，保证行为正确性优先。
@@ -780,6 +900,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         const auto [metadata_error, loaded_metadata] = metadata_store.load();
         if (metadata_error) {
             result.error = metadata_error;
+            result.performance = build_performance_summary(session, 0, Clock::now());
             return result;
         }
 
@@ -795,6 +916,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             request.options.overwrite_existing);
         if (open_error) {
             result.error = open_error;
+            result.performance = build_performance_summary(session, 0, Clock::now());
             return result;
         }
 
@@ -817,6 +939,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             if (validation_error) {
                 result.error = validation_error;
                 file_writer.close();
+                result.performance = build_performance_summary(session, 0, Clock::now());
                 return result;
             }
 
@@ -835,6 +958,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             session.total_size);
         const auto safe_vdl = bitmap.contiguous_finished_bytes(session.options.block_size,
             session.total_size);
+        session.resume_reused_bytes = finished_bytes;
         session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
@@ -856,6 +980,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.persisted_bytes = finished_bytes;
             result.completed_ranges = bitmap.block_count();
             result.resumed = session.resumed;
+            result.performance = build_performance_summary(session,
+                bitmap.block_count(),
+                Clock::now());
             return result;
         }
 
@@ -892,6 +1019,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             persistence.join();
             file_writer.close();
             result.error = make_error_code(DownloadErrc::http_init_failed);
+            result.performance = build_performance_summary(session, ranges.size(), Clock::now());
             return result;
         }
 
@@ -936,6 +1064,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                             break;
                         }
 
+                        session.ranges_stolen.fetch_add(1, std::memory_order_relaxed);
                         persistence.register_range(stolen.get());
                         pending_ranges.push_back(stolen.get());
                         ranges.push_back(std::move(stolen));
@@ -978,6 +1107,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             apply_gap_pauses(handles);
             apply_memory_backpressure(handles, session.options.backpressure_high_bytes);
             resume_paused_transfers(handles, session.options.backpressure_low_bytes);
+            update_peak(session.max_active_requests,
+                static_cast<std::size_t>(std::count_if(handles.begin(),
+                    handles.end(),
+                    [](const TransferHandle& handle) {
+                        return handle.in_multi;
+                    })));
 
             int running_handles = 0;
             const auto perform_status = curl_multi_perform(multi, &running_handles);
@@ -1084,6 +1219,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.resumed = session.resumed;
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
+        result.performance = build_performance_summary(session, ranges.size(), Clock::now());
         return result;
     } catch (...) {
         // 对外契约是不抛异常，所以任何未预期错误最终都折叠成 internal_error。

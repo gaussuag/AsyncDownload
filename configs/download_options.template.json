@@ -1,0 +1,43 @@
+{
+  // DownloadOptions 模板。
+  // CLI 支持带注释的 JSON 配置文件，可直接通过 --config <path> 加载。
+  "download_options": {
+    // 最大并发连接数。仅在服务端支持 Range 时才会真正发挥多连接效果。
+    "max_connections": 4,
+
+    // 网络层到持久化线程之间的队列容量，单位是 packet 个数。
+    "queue_capacity_packets": 4096,
+
+    // 单个 HTTP 请求覆盖的窗口大小，单位是字节。
+    // 4 * 1024 * 1024 = 4MB。
+    "scheduler_window_bytes": 4194304,
+
+    // 全局内存积压高水位，单位是字节。
+    // 超过后开始主动暂停最快的一批连接。
+    "backpressure_high_bytes": 268435456,
+
+    // 全局内存积压低水位，单位是字节。
+    // 只有回落到这里以下才恢复被内存背压暂停的连接。
+    "backpressure_low_bytes": 134217728,
+
+    // 位图颗粒度，也是调度切分和 steal 对齐的基本单位，单位是字节。
+    "block_size": 65536,
+
+    // 持久化写盘的目标对齐单位，单位是字节。
+    "io_alignment": 4096,
+
+    // 单个 range 允许的最大乱序缺口，单位是字节。
+    // 超过后会触发 gap pause。
+    "max_gap_bytes": 33554432,
+
+    // 累积写盘达到该阈值后触发一次异步 flush + metadata 保存，单位是字节。
+    "flush_threshold_bytes": 16777216,
+
+    // 即使没有达到 flush_threshold_bytes，超过该时间间隔也会触发周期性 flush。
+    // 单位是毫秒。
+    "flush_interval_ms": 2000,
+
+    // 下载完成 rename 正式文件时，是否允许覆盖已有目标文件。
+    "overwrite_existing": true
+  }
+}

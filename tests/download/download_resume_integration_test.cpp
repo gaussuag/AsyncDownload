@@ -243,6 +243,15 @@ std::string read_all_from_pipe(HANDLE pipe_handle) {
     return output;
 }
 
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        return {};
+    }
+
+    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
 void write_test_file(const std::filesystem::path& path, const std::size_t size_bytes) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(stream.is_open());
@@ -465,12 +474,85 @@ TEST(DownloadIntegrationTest, ResumeAfterInterruptedCliDownload) {
 
     ASSERT_TRUE(result.ok()) << result.error.message();
     EXPECT_TRUE(result.resumed);
+    EXPECT_GT(result.performance.resume_reused_bytes, 0);
     EXPECT_TRUE(std::filesystem::exists(output_file));
     EXPECT_FALSE(std::filesystem::exists(part_file));
     EXPECT_FALSE(std::filesystem::exists(metadata_file));
     EXPECT_TRUE(files_equal(source_file, output_file));
 
     append_log(trace_file, "finished_asserts");
+    const auto final_removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(final_removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        std::filesystem::temp_directory_path() / "asyncdownload_cli_config_integration";
+    std::error_code ec;
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto summary_file = temp_root / "summary.txt";
+    const auto config_file = temp_root / "download_options.json";
+    write_test_file(source_file, 8 * 1024 * 1024);
+
+    {
+        std::ofstream stream(config_file, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        stream << "{\n"
+               << "  \"download_options\": {\n"
+               << "    \"max_connections\": 1,\n"
+               << "    \"scheduler_window_bytes\": 1048576,\n"
+               << "    \"flush_threshold_bytes\": 1048576,\n"
+               << "    \"flush_interval_ms\": 1000\n"
+               << "  }\n"
+               << "}\n";
+    }
+
+    ChildProcess server;
+    const auto script_path = workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) + L" --port 0 --chunk-size 65536 --delay-ms 5";
+    ASSERT_TRUE(start_process(server, L"", server_command, workspace_root, true));
+
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    ChildProcess cli;
+    const auto cli_path = get_cli_path();
+    ASSERT_TRUE(std::filesystem::exists(cli_path));
+    const auto url = std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    const auto cli_command = quote_arg(cli_path.wstring()) + L" " +
+        quote_arg(std::wstring(url.begin(), url.end())) + L" " +
+        quote_arg(output_file.wstring()) + L" --config " +
+        quote_arg(config_file.wstring()) + L" --summary-file " +
+        quote_arg(summary_file.wstring());
+    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, true));
+    ASSERT_EQ(cli.wait(20000), WAIT_OBJECT_0);
+    const auto output = read_all_from_pipe(cli.stdout_read);
+    const auto exit_code = cli.exit_code();
+    cli.close();
+    stop_child(server, 0);
+
+    ASSERT_EQ(exit_code, 0U) << output;
+    ASSERT_TRUE(std::filesystem::exists(output_file));
+    ASSERT_TRUE(files_equal(source_file, output_file));
+
+    const auto summary_text = read_text_file(summary_file);
+    EXPECT_NE(summary_text.find("status=success"), std::string::npos);
+    EXPECT_NE(summary_text.find("windows_total=8"), std::string::npos);
+    EXPECT_NE(summary_text.find("ranges_total=1"), std::string::npos);
+
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
 #endif
@@ -760,6 +842,33 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     stop_child(server, 0);
 
     ASSERT_TRUE(result.ok()) << result.error.message();
+    EXPECT_GT(result.performance.total_duration_ms, 0);
+    EXPECT_GT(result.performance.average_network_bytes_per_second, 0.0);
+    EXPECT_GT(result.performance.average_disk_bytes_per_second, 0.0);
+    EXPECT_GT(result.performance.peak_network_bytes_per_second, 0.0);
+    EXPECT_GT(result.performance.peak_disk_bytes_per_second, 0.0);
+    EXPECT_GE(result.performance.peak_network_bytes_per_second,
+        result.performance.average_network_bytes_per_second);
+    EXPECT_GE(result.performance.peak_disk_bytes_per_second,
+        result.performance.average_disk_bytes_per_second);
+    EXPECT_GE(result.performance.time_to_first_byte_ms, 0);
+    EXPECT_GE(result.performance.time_to_first_persist_ms, 0);
+    EXPECT_GT(result.performance.max_memory_bytes, 0U);
+    EXPECT_GT(result.performance.max_inflight_bytes, 0);
+    EXPECT_GT(result.performance.max_queued_packets, 0U);
+    EXPECT_GT(result.performance.max_active_requests, 0U);
+    EXPECT_GT(result.performance.windows_total, 0U);
+    EXPECT_GT(result.performance.ranges_total, 0U);
+    EXPECT_GT(result.performance.write_callback_calls, 0U);
+    EXPECT_GT(result.performance.packets_enqueued_total, 0U);
+    EXPECT_GT(result.performance.average_packet_size_bytes, 0.0);
+    EXPECT_GT(result.performance.max_packet_size_bytes, 0U);
+    EXPECT_GE(result.performance.write_callback_calls,
+        result.performance.packets_enqueued_total);
+    EXPECT_GE(static_cast<double>(result.performance.max_packet_size_bytes),
+        result.performance.average_packet_size_bytes);
+    EXPECT_GT(result.performance.flush_count, 0U);
+    EXPECT_GT(result.performance.metadata_save_count, 0U);
 
     std::vector<asyncdownload::ProgressSnapshot> captured;
     {
