@@ -29,5 +29,5 @@ CTestTestfile.cmake
 _deps/
 
 *.log
-*/__pycache__/*
+**/__pycache__/*
 .agents/*
