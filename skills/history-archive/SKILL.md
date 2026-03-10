@@ -1,11 +1,11 @@
 ---
 name: history-archive
-description: Append concise, structured per-thread change records to .agents/history/{thread_key}.json. Use when finishing code changes, documentation updates, configuration edits, policy or AGENTS rule changes, or any task that should leave a durable thread-specific archive record in the workspace.
+description: Append structured per-thread archive records under .agents/history/{thread_key}/ with an index.json plus detailed session markdown files. Use when finishing code changes, documentation updates, configuration edits, policy or AGENTS rule changes, or any task that should preserve enough context to resume the thread later.
 ---
 
 # History Archive
 
-Use this skill to persist a concise, thread-specific change log after a task reaches a clear outcome.
+Use this skill to persist a concise index record and a fuller session archive after a task reaches a clear outcome.
 
 ## Workflow
 
@@ -20,14 +20,22 @@ Use this skill to persist a concise, thread-specific change log after a task rea
 
 3. Build one concise record for the current batch of work.
    Keep `purpose` short and user-facing.
-   Keep `reasoning` to one or two sentences describing the main implementation decision.
+   Keep `request_snapshot` close to the user's task in one sentence.
+   Keep `summary` focused on what was completed and what information was added or changed.
+   Record the source files that informed the work in `sources`.
    Record each touched file once with `created`, `modified`, or `deleted`.
    Record `verification` as a compact summary such as `build pass`, `tests pass`, or `manual check`.
+   Record `next_step` so a later thread can resume from the right place.
    Set `status` to `success`, `partial`, or `failed`.
 
-4. Write the archive entry with the bundled script.
+4. Write both archive layers with the bundled script.
    Run `scripts/upsert_history.py` from the repository root or pass `--base-dir`.
-   The script creates `.agents/history/{thread_key}.json` when missing and appends the new record under the current `YYYY-MM-DD` key.
+   The script writes:
+   - `.agents/history/{thread_key}/index.json`
+   - `.agents/history/{thread_key}/sessions/{timestamp}.md`
+   The markdown file is the detailed session archive.
+   The JSON file is the searchable index and stores the markdown path in `session_archive`.
+   If an old `.agents/history/{thread_key}.json` exists, the script migrates it into the new layout.
    If the script reports invalid JSON, stop and tell the user instead of overwriting the file.
 
 5. Report the result at the end of the reply.
@@ -35,7 +43,8 @@ Use this skill to persist a concise, thread-specific change log after a task rea
 
 ---
 代码改动已存档
-存档文件：`.agents/history/{thread_key}.json`
+索引文件：`.agents/history/{thread_key}/index.json`
+详细存档：`.agents/history/{thread_key}/sessions/{timestamp}.md`
 本次记录：`{YYYY-MM-DD} {HH:mm:ss} - {purpose}`
 改动文件：`{file1}, {file2}, ...`
 存储结果：`success`
@@ -53,11 +62,16 @@ Example:
 python skills/history-archive/scripts/upsert_history.py \
   --thread-key asyncdownload-cli-config-20260310-a \
   --purpose "Add CLI config loading" \
-  --reasoning "Load DownloadOptions from JSON so repeat runs can reuse a checked config file." \
+  --request-snapshot "Load download options from a JSON config file and reflect the behavior in CLI output and tests." \
+  --summary "Add --config loading, extend summary output, and cover the flow with an integration test." \
+  --source src/main.cpp \
+  --source include/asyncdownload/types.hpp \
+  --source tests/download/download_resume_integration_test.cpp \
   --change src/main.cpp:modified \
   --change tests/download/download_resume_integration_test.cpp:modified \
   --verification "scripts\\build.bat pass; AsyncDownload_tests.exe pass" \
+  --next-step "No immediate follow-up required." \
   --status success
 ```
 
-The script prints a small JSON object to stdout with the archive path, date, time, and changed files so the calling agent can build the final status card without re-reading the archive file.
+The script prints a small JSON object to stdout with the index path, detailed session archive path, date, time, and changed files so the calling agent can build the final status card without re-reading the archive files.

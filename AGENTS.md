@@ -152,19 +152,40 @@ AsyncDownload/
 
 ## Thread History Archive
 
-- For any completed code change, documentation update, configuration edit, or AGENTS/rule update, use the local `history-archive` skill to append a record to `.agents/history/{thread_key}.json`.
+- For any completed code change, documentation update, configuration edit, or AGENTS/rule update, use the local `history-archive` skill to append a record under `.agents/history/{thread_key}/`.
 - If the user already provided a `thread_key` in the current thread, use it directly.
 - If no `thread_key` is available yet, the first reply must ask: `本次会话的唯一标识是什么？`
 - Do not invent a `thread_key`, and do not read or write another thread's archive unless the user explicitly requests it.
-- Keep each archive record concise and high value. Include: `purpose`, `reasoning`, `changes`, `verification`, and `status`.
+- Write both archive layers:
+  - Index: `.agents/history/{thread_key}/index.json`
+  - Detailed session archive: `.agents/history/{thread_key}/sessions/{timestamp}.md`
+- Keep each archive record concise and high value. Include: `purpose`, `request_snapshot`, `summary`, `sources`, `changes`, `verification`, `next_step`, `session_archive`, and `status`.
 - Merge multiple file edits from the same task into one archive record instead of writing fragmented entries.
 - Perform the archive write as part of the normal workflow without interrupting the main task.
 - After a successful archive write, end the reply with this status card:
 
 ---
 代码改动已存档  
-存档文件：`.agents/history/{thread_key}.json`  
+索引文件：`.agents/history/{thread_key}/index.json`  
+详细存档：`.agents/history/{thread_key}/sessions/{timestamp}.md`  
 本次记录：`{YYYY-MM-DD} {HH:mm:ss} - {purpose}`  
 改动文件：`{file1}, {file2}, ...`  
 存储结果：`success`
 ---
+
+## Documentation Placement Rules
+
+- These rules apply to newly created documents only. Existing documents do not need to be moved just to satisfy this rule.
+- All newly created project documents must be placed under `docs/`.
+- Do not place new topic-specific documents directly under `docs/`.
+- When creating a new document under `docs/`, first check whether an existing topic directory already matches the document.
+- If a matching topic directory already exists, place the new document in that directory.
+- If no suitable topic directory exists, create a new topic directory first, then place the document inside it.
+- Organize documentation by topic, not by date, temporary task name, or generic document type.
+- Directory names under `docs/` should use lowercase English names.
+- Document file names should prefer `snake_case`. Existing filename patterns such as `_zh.md` are allowed and may continue to be used.
+- The only documents that may be placed directly under `docs/` are top-level overview documents:
+  - README-style overviews
+  - Navigation or index pages
+  - Overall architecture overviews
+- Example: performance-related documents should be placed under `docs/performance/` if that directory already exists; otherwise create it and place the new document there.

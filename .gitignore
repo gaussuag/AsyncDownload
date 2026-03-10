@@ -30,3 +30,4 @@ _deps/
 
 *.log
 */__pycache__/*
+.agents/*
