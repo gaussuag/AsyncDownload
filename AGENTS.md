@@ -149,3 +149,22 @@ AsyncDownload/
 - Run tests before committing changes
 - Do not modify `.gitignore` or build artifacts
 - Set `VCPKG_ROOT` environment variable before building
+
+## Thread History Archive
+
+- For any completed code change, documentation update, configuration edit, or AGENTS/rule update, use the local `history-archive` skill to append a record to `.agents/history/{thread_key}.json`.
+- If the user already provided a `thread_key` in the current thread, use it directly.
+- If no `thread_key` is available yet, the first reply must ask: `本次会话的唯一标识是什么？`
+- Do not invent a `thread_key`, and do not read or write another thread's archive unless the user explicitly requests it.
+- Keep each archive record concise and high value. Include: `purpose`, `reasoning`, `changes`, `verification`, and `status`.
+- Merge multiple file edits from the same task into one archive record instead of writing fragmented entries.
+- Perform the archive write as part of the normal workflow without interrupting the main task.
+- After a successful archive write, end the reply with this status card:
+
+---
+代码改动已存档  
+存档文件：`.agents/history/{thread_key}.json`  
+本次记录：`{YYYY-MM-DD} {HH:mm:ss} - {purpose}`  
+改动文件：`{file1}, {file2}, ...`  
+存储结果：`success`
+---

@@ -1,0 +1,4 @@
+interface:
+  display_name: "History Archive"
+  short_description: "Append structured thread history records"
+  default_prompt: "Use $history-archive to append a concise change record to .agents/history/{thread_key}.json after a code, docs, config, or policy update."
