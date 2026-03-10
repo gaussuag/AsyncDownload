@@ -36,13 +36,20 @@
 职责：
 
 - 定义 `DownloadRequest`、`DownloadResult`、`ProgressSnapshot`
+- 定义 `PerformanceSummary`，对外暴露任务级性能指标
 - 暴露 `DownloadClient::download(...)`
-- CLI 将这些接口包装成可执行工具
+- CLI 负责参数解析、配置文件加载、进度展示和 summary 输出
 
 这里要注意两点：
 
 1. `ProgressSnapshot` 是“下载任务快照”，不是底层线程的原始状态镜像。
 2. `DownloadResult` 表达的是最终结果，而不是中途瞬时状态。
+
+当前 CLI 已支持这些增强能力：
+
+- `--config <path>`：从 JSON 文件加载 `DownloadOptions`
+- `--summary-file <path>`：把最终 summary 额外写入文件
+- `--pause-on-exit`：保留窗口以便手工观察结果
 
 ### 3.2 下载引擎层
 
@@ -445,6 +452,7 @@ Persistence 线程会在两种情况下异步发起 flush：
 - 主动背压
 - `.part + .config.json` 恢复现场
 - CLI 进度展示
+- CLI 配置文件加载与 summary 输出
 
 当前仍然是“工程化可用实现”，而不是“所有理想规格都做到极限”的终态。比较明显的差异有：
 

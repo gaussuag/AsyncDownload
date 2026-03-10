@@ -597,6 +597,32 @@
 
 - 其中 `net` 和 `disk` 当前展示单位为 `MB/s`
 
+### 6.3 配置文件加载
+
+#### T-CLI-003 `P1`
+
+目标：
+
+- CLI 必须能从 `--config` 读取 `DownloadOptions`，并影响实际下载行为
+
+步骤：
+
+1. 构造一个 JSON 配置文件
+2. 在其中设置较小的 `scheduler_window_bytes`
+3. 通过 CLI 传入 `--config`
+4. 同时传入 `--summary-file`
+
+期望：
+
+- 下载成功
+- summary 文件存在
+- summary 中能反映配置生效后的 `windows_total` / `ranges_total`
+
+当前参考：
+
+- `DownloadIntegrationTest.LoadsDownloadOptionsFromConfigFile`
+- 文件：[download_resume_integration_test.cpp](D:/git_repository/coding_with_agents/AsyncDownload/tests/download/download_resume_integration_test.cpp)
+
 ## 7. 推荐的最小验收组合
 
 如果你重写后时间有限，至少先跑这 8 条：
@@ -652,6 +678,7 @@ build\tests\Debug\AsyncDownload_tests.exe --gtest_list_tests
 - `FileWriterTest.OpenFailsWhenOverwriteIsDisabledAndFileExists`
 - `MetadataStoreTest.SavesAndLoadsState`
 - `DownloadIntegrationTest.ResumeAfterInterruptedCliDownload`
+- `DownloadIntegrationTest.LoadsDownloadOptionsFromConfigFile`
 - `DownloadIntegrationTest.ResumesAfterCrcRollbackPastVdl`
 - `DownloadIntegrationTest.ResetsDownloadingBlocksToEmptyOnResume`
 - `DownloadIntegrationTest.UsesDistinctClientPortsAcrossConcurrentRanges`
