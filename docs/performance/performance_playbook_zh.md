@@ -1,337 +1,278 @@
-# AsyncDownload 性能优化寻路指南
+# AsyncDownload 性能优化 Playbook
 
 ## 1. 目的
 
-这份文档是 `docs/performance` 目录的总入口。
+这份文档是 `docs/performance` 的入口文档。
 
-它的目标是让任何一个新接手性能优化任务的 agent，都能快速理解：
+它只承担 3 类职责：
 
-- 这个目录下每份文档分别是做什么的
-- 哪份文档是当前正式基线
-- 哪份文档是历史基线
-- 哪份文档记录优化历史
-- 哪份文档指导日常回归
-- 哪份文档记录 profiler 行为基线
-- 做完新的性能优化后，应该更新哪些文档
+- 告诉接手者这个目录里每份文档各自负责什么
+- 给出当前仍然有效、且足够稳定的性能工作上下文
+- 说明后续性能优化时，应该如何阅读、更新和维护这些文档
 
-如果你是第一次接手这个项目的性能优化工作，**先读这份文档，再去读其他文档**。
+它**不是**正式 benchmark 基线，也**不是** profiler 结论文档。  
+具体数字、当前主回归套件、当前主 case、热点判断，应以对应的基线文档和指南文档为准。
 
-## 2. 目录结构与文档职责
+## 2. 当前稳定上下文
 
-当前 `docs/performance` 下的文档有：
+截至当前版本，下面这些上下文是稳定且必须知道的：
 
-### 2.1 正式 benchmark 基线
+- 性能优化已经从“临时试验”进入“持续迭代”阶段，不能只依赖 `build/` 下的测试结果目录保存上下文。
+- 当前性能工作同时依赖两类基线：
+  - benchmark 基线：用于正式性能回归
+  - profiler 行为基线：用于热点路径和行为结构对比
+- 当前项目已经完成至少一轮真实性能优化，并且已经把“优化前后变化”沉淀进文档。
+- 性能优化工作默认应按“单主题单线程”推进。
+  - 一轮优化闭环结束后，应优先把结论写入文档，再考虑新开 thread 进入下一个主瓶颈。
+- 新 agent 接手时，应先从 `docs/performance` 恢复上下文，而不是依赖旧 thread 的长历史。
 
-- [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
+这些规则如果发生变化，应优先更新这份 Playbook。
 
-作用：
+## 3. 文档地图
 
-- 这是当前**正式主 benchmark 基线**
-- 代表聚合缓冲优化落地之后，后续继续优化时应该优先参考的基准
-- 当前建议后续优化都基于 `regression_v2` 做 before/after 对比
-
-你应该在这些情况下优先看它：
-
-- 想知道当前正式回归套件是什么
-- 想知道后续主要对比哪些 case
-- 想知道当前最重要的性能结论是什么
-
-### 2.2 聚合前历史 benchmark 基线
-
-- [performance_baseline_20260310_regression_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260310_regression_zh.md)
-
-作用：
-
-- 这是**聚合缓冲优化前**的 `Release regression` 历史基线
-- 不再是后续继续优化时的主基线
-- 它的主要价值是帮助理解“第一次性能优化前，系统长什么样”
-
-你应该在这些情况下看它：
-
-- 想回顾第一次性能优化前的系统状态
-- 想对比“第一次性能优化到底改变了什么”
-- 想理解旧 `regression` 为什么被降级为历史对照套件
-
-### 2.3 性能优化历史
-
-- [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
-
-作用：
-
-- 这是**优化迭代日志**
-- 记录每一次性能优化做了什么、为什么这么做、前后指标如何变化
-- 当前已经收录了第一次性能优化：`TransferHandle` 聚合缓冲
-
-你应该在这些情况下看它：
-
-- 想知道某个优化为什么被引入
-- 想知道优化前后结论是如何变化的
-- 想避免后续 agent 重复做已经证明不值得的方向
-
-### 2.4 回归与防劣化指南
-
-- [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
-
-作用：
-
-- 这是**日常性能回归操作指南**
-- 说明改代码前后怎么跑 benchmark、看哪些指标、怎么判定是否退化
-- 当前已经切换到以 `regression_v2` 为主
-
-你应该在这些情况下看它：
-
-- 想做一次正规的 before/after 回归
-- 想知道哪些 case 是主观察点
-- 想知道什么变化该视为退化，什么变化可以接受
-
-### 2.5 profiler 行为基线
-
-- [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
-
-作用：
-
-- 这是**代码行为基线**，不是性能数值基线
-- 记录的是热点路径、pause 类型、函数栈方向
-- 主要用于对比“优化后热点是否迁移”
-
-你应该在这些情况下看它：
-
-- 想知道当前 profiler 观察到了哪些热点
-- 想知道下一轮 profiler 该重点对比哪些函数路径
-- 想知道为什么 profiler 不适合作为正式吞吐基线
-
-### 2.6 优化方案说明
-
-- [transfer_handle_packet_aggregation_plan_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/transfer_handle_packet_aggregation_plan_zh.md)
-
-作用：
-
-- 这是某一个具体优化方向的技术设计说明
-- 当前记录的是第一次优化的方案文档：`TransferHandle` 聚合缓冲
-
-你应该在这些情况下看它：
-
-- 想理解这个优化方案的设计边界
-- 想回顾这个优化原本的目标和约束
-- 想在后续做同类优化时复用类似的说明结构
-
-## 3. 当前文档体系的角色划分
-
-可以把这些文档理解成 4 类：
-
-### 3.1 基线类
+### 3.1 正式 benchmark 基线
 
 - [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
+
+职责：
+
+- 记录当前正式 benchmark 基线
+- 记录当前正式对比套件与关键 case
+- 记录当前应以什么 benchmark 结论为准
+
+何时看它：
+
+- 想知道当前正式基线是什么
+- 想知道后续 before/after 应该基于什么比较
+- 想知道当前最重要的 benchmark 结论
+
+### 3.2 历史 benchmark 基线
+
 - [performance_baseline_20260310_regression_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260310_regression_zh.md)
 
 职责：
 
-- 保存性能数字
-- 保存 case 的解释
-- 保存某个阶段的正式结论
+- 保存聚合前的历史基线
+- 解释为什么旧套件只作为历史对照
 
-### 3.2 流程类
+何时看它：
+
+- 想回顾第一次性能优化前系统是什么样
+- 想比较“第一次优化到底改变了什么”
+
+### 3.3 回归与防劣化指南
 
 - [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
 
 职责：
 
-- 告诉你怎么跑
-- 告诉你怎么看
-- 告诉你什么叫退化
+- 说明后续优化前后应该如何跑 benchmark
+- 说明主要观察哪些 case、哪些指标
+- 说明什么情况应视为退化、什么情况可以接受
 
-### 3.3 历史类
+何时看它：
+
+- 想做一次正式 before/after 回归
+- 想知道当前回归套件和判定规则
+
+### 3.4 性能优化历史
 
 - [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
 
 职责：
 
-- 记录“做过什么”
-- 记录“为什么这么做”
-- 记录“效果如何”
+- 记录每次性能优化做了什么
+- 记录为什么这么做
+- 记录前后 benchmark/profiler 结果如何变化
 
-### 3.4 行为与设计类
+何时看它：
+
+- 想知道某个方向以前做过没有
+- 想知道以前的理解后来有没有被修正
+
+### 3.5 profiler 行为基线
 
 - [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
+
+职责：
+
+- 记录热点路径和行为结构
+- 记录 profiler 应该拿什么做后续对照
+
+何时看它：
+
+- 想知道当前热点路径是什么
+- 想知道下一轮 profiler 应该重点盯哪里
+
+### 3.6 thread 初始化文档
+
+- [performance_thread_initialization_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_thread_initialization_zh.md)
+
+职责：
+
+- 固定当前性能开发 thread 的正式起点
+- 统一当前 thread 默认沿用的基线、关注 case、验证入口和边界
+- 避免后续讨论混用旧 thread 的临时结论
+
+何时看它：
+
+- 想接手当前正在进行的性能开发 thread
+- 想确认这个 thread 默认从哪份基线继续
+- 想确认本 thread 已约定的首阶段目标和验证顺序
+
+### 3.7 具体优化方案文档
+
 - [transfer_handle_packet_aggregation_plan_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/transfer_handle_packet_aggregation_plan_zh.md)
 
 职责：
 
-- 一个描述“当前热点与行为”
-- 一个描述“某次优化的技术方案”
+- 保存某个具体优化方向的设计说明
+- 解释该方案的边界、约束和验证思路
 
-## 4. 新 agent 的建议阅读顺序
+何时看它：
 
-如果一个新的 agent 要接手性能优化任务，建议按这个顺序看：
+- 想理解某个具体优化方案为什么这样设计
+- 想复用同类方案文档的写法
+
+## 4. 新 agent 的推荐阅读顺序
+
+如果一个新的 agent 要接手性能优化任务，建议按下面顺序阅读：
 
 1. [performance_playbook_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_playbook_zh.md)
-   先建立整体地图
+2. [performance_thread_initialization_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_thread_initialization_zh.md)
+3. [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
+4. [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
+5. [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
+6. [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
 
-2. [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
-   理解当前正式 benchmark 基线和主要 case
+如果当前任务与某个已存在方案直接相关，再补读对应方案文档。
 
-3. [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
-   理解日常回归流程和判定标准
+## 5. 当前目录的表述逻辑
 
-4. [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
-   理解已经做过的优化、收益和教训
+这个目录里的文档应保持下面的逻辑分工：
 
-5. [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
-   理解热点与行为基线
+- 基线文档：给结论和数字
+- 回归指南：给验证流程和判定规则
+- 优化历史：给演进过程
+- profiler 基线：给热点行为结构
+- 线程初始化文档：给当前 thread 的起点和默认边界
+- 方案文档：给某个具体优化的设计说明
+- Playbook：给地图、上下文和维护规则
 
-6. [transfer_handle_packet_aggregation_plan_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/transfer_handle_packet_aggregation_plan_zh.md)
-   理解第一次优化的原始技术设计
+如果某份文档开始同时承担多个职责，应优先收敛，而不是继续叠加内容。
 
-7. [performance_baseline_20260310_regression_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260310_regression_zh.md)
-   如果需要，再回头补看聚合前历史基线
+## 6. 文档更新规则
 
-## 5. 当前应以哪份文档为准
-
-### 5.1 想知道“现在该用哪套 benchmark”
-
-看：
-
-- [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
-- [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
-
-当前答案是：
-
-- 主套件：`regression_v2`
-- 历史对照：`regression`
-- 必须使用 `Release`
-
-### 5.2 想知道“以前为什么这么改”
-
-看：
-
-- [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
-
-### 5.3 想知道“当前热点是什么”
-
-看：
-
-- [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
-
-### 5.4 想知道“第一次优化前系统是什么样”
-
-看：
-
-- [performance_baseline_20260310_regression_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260310_regression_zh.md)
-
-## 6. 什么时候更新哪些文档
-
-### 6.1 做完一次新的正式 benchmark 基线复测
+### 6.1 做完一次新的正式 benchmark 验证
 
 如果新的 benchmark 结果会成为后续正式比较依据，应更新：
 
-- [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
+- 正式 benchmark 基线文档
 
-如果结论变化影响回归策略，也要同步更新：
+如果新的结果改变了回归判定方式或主要观察点，还要更新：
 
-- [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
+- 回归与防劣化指南
 
 ### 6.2 做完一次新的性能优化
 
-如果代码已经产生实际性能变化，应该更新：
+无论优化幅度大小，只要代码和性能结论发生了有效变化，都应更新：
 
 - [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
 
-如果新的优化结果改变了正式 benchmark 结论，也要更新：
+如果这次优化改变了正式 benchmark 结论，还要同步更新：
 
-- [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
-- [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
+- 正式 benchmark 基线文档
+- 回归与防劣化指南
 
 ### 6.3 做完一次新的 profiler 基线采集
 
-如果新的 profiler 结果要作为后续行为对照基线，应更新：
+如果新的 profiler 结果要作为后续热点对照基线，应更新：
 
-- [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
+- profiler 行为基线文档
 
-### 6.4 设计了新的优化方案，但还没动代码
+### 6.4 新增一个长期存在的性能文档
 
-如果只是提出新的技术方案，应新增或更新方案文档，例如：
+如果新增一份长期保留的性能文档，应同步更新这份 Playbook，补上：
 
-- 某个新的 `*_plan_zh.md`
+- 文档职责
+- 推荐阅读顺序中的位置
+- 何时使用它
 
-如果方案后来真正落地并产生结果，再把它补进：
+### 6.5 自主检查关联文档
 
-- [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
+文档维护应按“全局一致性”处理，而不是按“只改当前这份文档”处理。
 
-## 7. 文档维护规则
+每次更新 `docs/performance` 中任意一份文档时，都应主动判断这次变化是否会影响：
 
-后续维护这个目录时，建议遵守下面几条规则：
+- 正式 benchmark 基线文档
+- 历史 benchmark 基线文档
+- 回归与防劣化指南
+- 优化历史文档
+- profiler 行为基线文档
+- Playbook 本身
 
-### 7.1 不要覆盖历史
+至少要问自己这几个问题：
 
-- 旧基线不要直接删
-- 旧优化记录不要直接改写成“当前状态”
-- 新阶段基线应新增文档，或在历史文档中明确降级为“历史基线”
+- 当前结论是否改变了正式基线的解释
+- 当前变化是否改变了回归套件、主观察 case 或判定方式
+- 当前变化是否应该写进优化历史，而不是只留在基线文档里
+- 当前变化是否让 Playbook 中的文档职责、阅读顺序或维护规则失效
 
-### 7.2 明确文档角色
+如果答案可能是“会影响”，就应在同一轮工作里同步更新关联文档，而不是把不一致留到以后。
 
-如果新增文档，要明确它属于哪一类：
+## 7. 维护约束
 
-- benchmark 基线
-- profiler 行为基线
-- 回归指南
-- 优化历史
-- 技术方案
+### 7.1 不要依赖 `build/`
 
-不要把它们混成一份“大杂烩”文档。
+`build/` 目录中的 benchmark 和 profiler 结果可以随时被清理。  
+关键数字、关键判断、关键演进过程必须进入 `docs/performance`。
 
-### 7.3 基线文档优先保存整理后的结论
+### 7.2 不要把当前结论复制到多个地方
 
-不要依赖 `build/` 目录长期存在。
+当前正式 suite、当前主要 case、当前热点判断，只应在“最合适的那份文档”里维护。
 
-每次确认一个新的正式基线后，应把关键数据写进文档，包括：
+Playbook 可以告诉你“去哪看”，但不应该成为这些结论的第二份拷贝。
 
-- 来源目录名
-- suite 名
-- repeats
-- 关键 case 指标
-- 当前结论
+### 7.3 文档维护是全局工作
 
-### 7.4 优化历史文档优先保存“前后变化”
+文档更新不是局部补丁动作，而是全局维护动作。
 
-每次记录一次优化时，至少写清楚：
+一次性能优化、一次基线变更、一次 profiler 结论修正，往往会同时影响多份文档。
 
-- 为什么改
-- 改了什么
-- 用哪组 benchmark/profiler 验证
-- 结果怎么变化
-- 哪些理解被证实了
-- 哪些理解被修正了
+因此，维护者应主动检查关联文档，而不是等待别人之后再补。
 
-### 7.5 回归指南必须和当前正式基线一致
+### 7.4 不要覆盖历史
 
-如果主 benchmark 套件变了，或者主 case 的优先级变了，必须同步更新：
+- 旧基线保留为历史
+- 旧优化记录保留为历史
+- 如果进入新阶段，应新增正式基线或明确降级旧文档的角色
 
-- [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md)
+### 7.5 一轮优化闭环后再切线程
 
-否则后面的 agent 很容易用错套件。
+一轮性能优化如果已经完成下面这些步骤：
+
+- 目标明确
+- 代码改动完成
+- benchmark 回归完成
+- profiler 对照完成（如有必要）
+- 文档更新完成
+
+则应优先视为一个闭环。  
+如果后续主瓶颈已经变化，建议新开 thread 继续，而不是在旧 thread 里无限滚动。
 
 ## 8. 当前接手建议
 
-截至目前，如果一个新的 agent 要继续做性能优化，最推荐的出发点是：
+如果今天有一个新的 agent 接手性能优化任务，最稳的起手方式是：
 
-1. 先读 [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)
-2. 再读 [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)
-3. 用 [optimization_regression_guide_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/optimization_regression_guide_zh.md) 约束新的 before/after 验证
-4. 如果要做热点定位，再看 [profiler_behavior_baseline_20260311_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/profiler_behavior_baseline_20260311_zh.md)
+1. 先读这份 Playbook
+2. 再读当前正式 benchmark 基线
+3. 再读回归与防劣化指南
+4. 再读优化历史
+5. 如果涉及热点判断，再读 profiler 行为基线
+6. 在开始改代码前，先和用户确认这轮优化目标
 
-当前阶段，后续优化的主目标已经比较清楚：
+这份文档的目标不是替代其他文档，而是保证任何接手者都知道：
 
-- 降低高 pause churn
-- 保住 `balanced_candidate` 的收益
-- 保住 `memory_guard` 的低内存优势
-- 继续观察 `scheduler_stress` 的稳定性
-
-## 9. 当前版本结论
-
-这份“寻路指南”本身不定义性能结论，它定义的是：
-
-- 这个目录的结构
-- 文档之间的关系
-- 后续 agent 应该如何阅读、更新和维护这些文档
-
-如果目录结构或文档职责发生变化，应优先更新这份文档。
+- 当前上下文该从哪里恢复
+- 当前规则该从哪里确认
+- 做完工作后该更新什么

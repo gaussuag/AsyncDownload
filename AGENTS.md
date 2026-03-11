@@ -173,6 +173,43 @@ AsyncDownload/
 存储结果：`success`
 ---
 
+## Repository Skills
+
+### Skill Discovery Rule
+
+- This repository may define local skills under `skills/<skill-name>/SKILL.md`.
+- Before starting substantial work, check whether the task matches any local repository skill.
+- Treat local repository skills as the first place to look for project-specific workflow guidance.
+- Use the minimal set of matching skills instead of loading all skills.
+
+### Skill Matching Rule
+
+- Load a local skill when either condition is true:
+  - the user explicitly names the skill
+  - the task clearly matches the workflow or domain that the skill owns
+- If multiple local skills match, use all relevant ones in the smallest useful combination.
+- If a local skill conflicts with generic habits or older thread context, prefer the local skill and the current project docs it points to.
+
+### Skill Loading Rule
+
+- When a local skill matches, read its `SKILL.md` before doing the main task.
+- Follow the skill's workflow, boundaries, and document update rules.
+- If the skill points to project docs as the source of truth, do not duplicate or override those project-specific conclusions from memory.
+- If the skill is process-oriented, keep it as the workflow authority and use the linked project docs for current evolving technical conclusions.
+- After successfully loading one or more local skills for the current task, explicitly tell the user which skill or skills were loaded in this thread.
+
+### Current Local Skills
+
+- `asyncdownload-performance`
+  - Use for benchmark analysis, profiler analysis, choosing performance optimization targets, running an optimization loop, or maintaining `docs/performance`
+
+### Skill Evolution Rule
+
+- These repository skill rules are intended to be generic and reusable.
+- When adding a new local skill under `skills/`, update this section only if the matching guidance or current local skill list must change.
+- Do not list always-on workflow rules here if they are already governed elsewhere in `AGENTS.md`.
+- Prefer stable workflow rules here. Keep volatile technical conclusions inside the skill itself or the project docs that the skill references.
+
 ## Documentation Placement Rules
 
 - These rules apply to newly created documents only. Existing documents do not need to be moved just to satisfy this rule.

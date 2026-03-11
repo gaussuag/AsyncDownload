@@ -1,0 +1,4 @@
+interface:
+  display_name: "AsyncDownload Performance"
+  short_description: "Run and document one full performance optimization loop"
+  default_prompt: "Use $asyncdownload-performance to recover the current performance context from docs/performance, confirm the optimization goal, run the right benchmark and profiler workflow, and update the required performance docs before closing the loop."
