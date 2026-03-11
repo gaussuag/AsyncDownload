@@ -146,6 +146,7 @@ class BenchmarkSuiteDefinition:
     name: str
     description: str
     cases: list[CaseDefinition]
+    baseline_overrides: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -386,12 +387,92 @@ def build_benchmark_suites() -> dict[str, BenchmarkSuiteDefinition]:
                     max_gap_bytes=64 * MIB,
                 ),
             ],
+            baseline_overrides={},
+        ),
+        "regression_v2": BenchmarkSuiteDefinition(
+            name="regression_v2",
+            description=(
+                "Post-aggregation regression suite with queue depths re-normalized so the queue "
+                "byte budget stays close to the original regression suite."
+            ),
+            cases=[
+                make_case(
+                    "throughput_candidate",
+                    "conn=16 window=4MiB queue=1024",
+                    1,
+                    purpose="High-throughput candidate after aggregation, with queue depth scaled to the old byte budget.",
+                    max_connections=16,
+                    scheduler_window_bytes=4 * MIB,
+                    queue_capacity_packets=1024,
+                ),
+                make_case(
+                    "balanced_candidate",
+                    "conn=16 window=4MiB queue=256 gap=32MiB",
+                    2,
+                    purpose="Balanced post-aggregation profile with tighter queue depth and moderate gap budget.",
+                    max_connections=16,
+                    scheduler_window_bytes=4 * MIB,
+                    queue_capacity_packets=256,
+                    max_gap_bytes=32 * MIB,
+                ),
+                make_case(
+                    "deep_buffer_candidate",
+                    "conn=16 window=4MiB queue=4096 gap=64MiB",
+                    3,
+                    purpose="Deep-buffer post-aggregation profile that preserves a large queue byte budget without inflating it by 4x.",
+                    max_connections=16,
+                    scheduler_window_bytes=4 * MIB,
+                    queue_capacity_packets=4096,
+                    max_gap_bytes=64 * MIB,
+                ),
+                make_case(
+                    "memory_guard",
+                    "conn=4 queue=64 bp=64/32MiB",
+                    4,
+                    purpose="Memory-sensitive post-aggregation profile with queue depth scaled down to preserve the old byte ceiling.",
+                    max_connections=4,
+                    queue_capacity_packets=64,
+                    backpressure_high_bytes=64 * MIB,
+                    backpressure_low_bytes=32 * MIB,
+                ),
+                make_case(
+                    "scheduler_stress",
+                    "conn=8 queue=1024 window=16MiB",
+                    5,
+                    purpose="Scheduler stress canary after queue-depth re-normalization.",
+                    max_connections=8,
+                    queue_capacity_packets=1024,
+                    scheduler_window_bytes=16 * MIB,
+                ),
+                make_case(
+                    "queue_backpressure_stress",
+                    "queue=4096 bp=64/32MiB",
+                    6,
+                    purpose="Deep-queue and tight-backpressure stress case re-normalized for 64KiB packets.",
+                    queue_capacity_packets=4096,
+                    backpressure_high_bytes=64 * MIB,
+                    backpressure_low_bytes=32 * MIB,
+                ),
+                make_case(
+                    "gap_tolerance_probe",
+                    "conn=16 queue=1024 window=4MiB gap=64MiB",
+                    7,
+                    purpose="Gap-tolerance probe after queue-depth re-normalization.",
+                    max_connections=16,
+                    queue_capacity_packets=1024,
+                    scheduler_window_bytes=4 * MIB,
+                    max_gap_bytes=64 * MIB,
+                ),
+            ],
+            baseline_overrides={
+                "queue_capacity_packets": 1024,
+            },
         ),
     }
 
 
-def default_baseline_case() -> CaseDefinition:
-    return CaseDefinition("baseline_default", {}, "default", 1)
+def default_baseline_case(overrides: dict[str, Any] | None = None) -> CaseDefinition:
+    return CaseDefinition("baseline_default", {} if overrides is None else dict(overrides), "default", 1)
 
 
 def resolve_repo_path(path_text: str) -> Path:
@@ -687,8 +768,9 @@ def build_execution_plan(
             if only_sweep is None or sweep.name == only_sweep
         ]
 
+    baseline_overrides = {} if benchmark_suite is None else benchmark_suite.baseline_overrides
     execution_plan: list[tuple[str, CaseDefinition, dict[str, Any]]] = [
-        ("baseline", default_baseline_case(), {}),
+        ("baseline", default_baseline_case(baseline_overrides), baseline_overrides),
     ]
     if benchmark_suite is not None:
         for case in benchmark_suite.cases:
@@ -724,6 +806,9 @@ def default_metadata(
     executed_sweeps: list[str],
     overwrite_existing: bool,
 ) -> dict[str, Any]:
+    baseline_options = {**DEFAULT_OPTIONS, "overwrite_existing": overwrite_existing}
+    if benchmark_suite is not None:
+        baseline_options.update(benchmark_suite.baseline_overrides)
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "label": label,
@@ -741,7 +826,7 @@ def default_metadata(
         "benchmark_suite_description": benchmark_suite.description if benchmark_suite is not None else "",
         "selected_case_names": requested_case_names,
         "executed_sweeps": executed_sweeps,
-        "baseline_options": {**DEFAULT_OPTIONS, "overwrite_existing": overwrite_existing},
+        "baseline_options": baseline_options,
     }
 
 

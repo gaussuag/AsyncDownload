@@ -6,14 +6,17 @@
 
 本指南中的所有回归判断都基于 `Release` 版本可执行文件，不再使用 `Debug` 数据作为正式对比基线。
 
-本指南默认使用固定回归套件：
+当前建议优先使用的固定回归套件：
+
+- `python scripts/performance/benchmark.py --benchmark-suite regression_v2`
+
+历史对照套件：
 
 - `python scripts/performance/benchmark.py --benchmark-suite regression`
 
 当前正式核心参考数据来自：
 
-- `build/benchmarks/20260311_113724_pre-change-release-retest`
-- `build/benchmarks/20260311_151155_pre-change-release-40`
+- `build/benchmarks/20260311_211702_post-aggregation-regression-v2`
 
 当前 profiler 行为基线参考文档：
 
@@ -24,6 +27,10 @@
 - benchmark 用于正式性能回归判断。
 - profiler 用于热点与行为路径对比。
 - profiler 结果不能替代 benchmark 结果做吞吐基线判断。
+- `regression_v2` 是聚合后继续迭代时的主回归套件。
+- `regression` 保留为聚合前后的历史对照套件，不要覆盖旧结论。
+- 新正式基线快照见 [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)。
+- 第一次性能优化记录见 [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)。
 
 ## 2. 优化后的验证原则
 
@@ -42,7 +49,7 @@
 保存一轮基准结果，推荐：
 
 ```powershell
-python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.zip" --benchmark-suite regression --repeats 20 --label "pre-change"
+python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.zip" --benchmark-suite regression_v2 --repeats 20 --label "pre-change"
 ```
 
 要求：
@@ -55,13 +62,13 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 使用同一台机器、同一 URL、同一 repeats 再跑一轮：
 
 ```powershell
-python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.zip" --benchmark-suite regression --repeats 20 --label "post-change"
+python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.zip" --benchmark-suite regression_v2 --repeats 20 --label "post-change"
 ```
 
 说明：
 
-- 当前正式 `Release` 基线已经用 `20` 次复测校准。
-- 另外已有一轮 `40` 次确认样本，用于验证 `Release` 方向稳定性。
+- 当前正式 `regression_v2` 基线已经用 `20` 次复测校准。
+- 如果后续结果接近阈值，建议继续按相同 suite 补高重复次数确认。
 - 日常优化回归建议先用 `20` 次。
 - 如果结果接近阈值、或者涉及高波动路径，再补到 `40` 次。
 
@@ -94,13 +101,13 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 
 补充：
 
-- 当前 `Release` 下，`baseline_default` 已经是正式最快组之一，因此它的退化优先级比过去更高。
+- 当前 `regression_v2` 下，`baseline_default` 是正式默认锚点，但不再是唯一最快路径。
 
 ### 4.2 平衡点 `balanced_candidate`
 
 重点：
 
-- 它仍然是高并发平衡点，但当前 `Release` 下不再是默认最优路径
+- 它是当前最值得优先维护的高吞吐低内存平衡点之一
 
 建议判定：
 
@@ -110,7 +117,7 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 
 补充：
 
-- 当前更重要的是观察它是否能向 `baseline_default` 靠近，而不是继续沿用旧 `Debug` 时代的“它天然优于 baseline”的假设。
+- 当前更重要的是保护它相对 `baseline_default` 的吞吐优势和低内存特性。
 
 ### 4.3 高吞吐路线
 
@@ -122,7 +129,7 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 
 重点：
 
-- 判断高并发路径是否被修复
+- 判断高并发路线是否仍有必要保留
 - 判断代价是否失控
 
 建议判定：
@@ -140,12 +147,12 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 重点：
 
 - 保护性路径是否被破坏
-- 低并发、低内存路径是否继续保持当前 `Release` 优势
+- 低内存路径是否继续保持当前优势
 
 建议判定：
 
 - 吞吐小幅波动可以接受
-- 内存如果明显偏离当前 `~4.7 MB` 水平，需要重点检查
+- 内存如果明显偏离当前 `~4.2 MB` 水平，需要重点检查
 - 如果内存翻倍但吞吐没有实质提升，应视为退化
 
 ### 4.5 高波动 canary
@@ -169,8 +176,8 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 
 补充：
 
-- `scheduler_stress` 在当前 `Release` 基线下仍然是明显的风险路径，更适合做稳定性指标，而不是默认性能目标。
-- `gap_tolerance_probe` 也应一并视为高风险探针，因为它已经在 `Release` 复测中出现过极端慢跑尾部。
+- `scheduler_stress` 在 `regression_v2` 下不再是旧坏点，但仍然值得持续观察其稳定性和内存代价。
+- `gap_tolerance_probe` 仍然是次级探针，不是当前主收益点。
 
 ## 5. 哪些变化不能直接当作优化
 
@@ -187,7 +194,7 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 以下类型的变化通常更有价值：
 
 - `baseline_default` 和 `balanced_candidate` 同时提升
-- `throughput_candidate` 提升，同时 `memory_guard` 不退化
+- `memory_guard` 与 `balanced_candidate` 同时成立
 - `scheduler_stress` 波动显著收敛
 - pause 降低，而吞吐持平或略升
 - 内存下降，而吞吐持平或略升
@@ -221,9 +228,9 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 1. benchmark 是否用的是同一 URL、同一 suite、同一 repeats
 2. 默认基线是否退化
 3. `balanced_candidate` 是否变好
-4. 高吞吐 case 是否只是“用更高内存换速度”
-5. `memory_guard` 是否仍然保持低内存
-6. `scheduler_stress` 是否更稳定
+4. `memory_guard` 是否仍然保持高吞吐且低内存
+5. 高并发 case 是否只是“用更高内存换速度”
+6. `scheduler_stress` 是否继续改善
 7. `gap_tolerance_probe` 是否出现异常尾部
 8. 如果结果接近噪声区间，是否需要追加重复次数
 
@@ -236,6 +243,7 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 3. 重点复看：
    - `baseline_default`
    - `balanced_candidate`
+   - `memory_guard`
    - `scheduler_stress`
 
 如果问题落在高波动或尾部异常上，建议直接追加到 `20` 或 `40`，而不是只补到 `10`。
@@ -245,9 +253,9 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 当前阶段最适合的优化目标不是单纯追求更高峰值吞吐，而是优先追求：
 
 1. `baseline_default` 不退化
-2. `memory_guard` 与 `queue_backpressure_stress` 不退化
-3. 高并发 `throughput_candidate` / `balanced_candidate` 能向 baseline 靠近
-4. `scheduler_stress` 与 `gap_tolerance_probe` 波动收敛
+2. `balanced_candidate` 不退化并尽量继续提升
+3. `memory_guard` 不丢掉低内存优势
+4. `scheduler_stress` 继续稳定
 
 这四件事同时满足，才更像是对下载器真实质量有价值的优化。
 

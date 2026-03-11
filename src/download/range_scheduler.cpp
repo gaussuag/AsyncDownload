@@ -63,8 +63,13 @@ RangeScheduler::steal_largest_range(
         }
     }
 
-    if (donor == nullptr || donor_remaining <
-        static_cast<std::int64_t>(options_.block_size * 2)) {
+    auto minimum_remaining_for_steal = static_cast<std::int64_t>(options_.block_size * 2);
+    if (options_.max_connections >= 16) {
+        minimum_remaining_for_steal = std::max<std::int64_t>(
+            minimum_remaining_for_steal,
+            static_cast<std::int64_t>(options_.scheduler_window_bytes * 2));
+    }
+    if (donor == nullptr || donor_remaining < minimum_remaining_for_steal) {
         return nullptr;
     }
 

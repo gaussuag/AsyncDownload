@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=str(DEFAULT_BENCHMARK_OUTPUT_ROOT))
     parser.add_argument("--exe", default=str(DEFAULT_BENCHMARK_EXE))
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
-    parser.add_argument("--inter-run-delay-ms", type=int, default=100)
+    parser.add_argument(
+        "--inter-run-delay-ms",
+        type=int,
+        default=500,
+        help="Delay between runs in milliseconds. Default: 500.",
+    )
     parser.add_argument("--failure-retries", type=int, default=1)
     parser.add_argument("--only-sweep")
     parser.add_argument("--benchmark-suite")

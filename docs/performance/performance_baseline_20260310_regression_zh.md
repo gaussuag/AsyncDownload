@@ -1,10 +1,15 @@
-# AsyncDownload 性能基线快照（2026-03-10）
+# AsyncDownload 性能基线快照（2026-03-10，聚合前历史基线）
 
 ## 1. 目的
 
-这份文档用于固化当前代码版本在本地回环环境下的可复用性能基线，作为后续代码优化前后的对比依据。
+这份文档用于固化聚合缓冲优化落地之前的 `Release regression` 历史基线，作为后续对比“第一次性能优化前后差异”的依据。
 
 这份基线不是“理论最优值”，而是当前仓库、当前机器、当前本地服务器、当前 benchmark 工具版本下的一组可重复参考值。
+
+补充说明：
+
+- 如果你要看聚合缓冲优化之后的新正式主基线，请优先参考 [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)。
+- 如果你要看优化迭代过程，请参考 [performance_optimization_history_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_optimization_history_zh.md)。
 
 ## 2. 基线来源
 
@@ -28,6 +33,7 @@
 - 文件大小: `1073741824 bytes`
 - 场景: `loopback_external_url`
 - benchmark 入口: `python scripts/performance/benchmark.py --benchmark-suite regression`
+- 聚合后重定标入口: `python scripts/performance/benchmark.py --benchmark-suite regression_v2`
 - 当前正式核心基线 repeats: `20`
 - 当前更高重复次数确认样本 repeats: `40`
 - CLI: `build/src/Release/AsyncDownload.exe`
@@ -39,6 +45,8 @@
 - 从当前版本开始，所有性能复测、before/after 对比、回归判断都必须使用 `Release` 可执行文件。
 - 这份文档只定义 benchmark 性能基线，不定义 profiler 行为基线。
 - profiler 基线用于热点路径和行为结构对比，不能替代 benchmark 的正式性能数值基线。
+- `regression` 保留为聚合前后的历史基线套件。
+- `regression_v2` 是聚合后新增的重定标套件，用于把 `queue_capacity_packets` 调回更接近旧字节预算的比较尺度。
 
 ## 4. 当前固定回归套件
 

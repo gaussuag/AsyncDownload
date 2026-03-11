@@ -53,6 +53,9 @@ struct TransferHandle {
     bool paused_by_gap = false;
     CURLcode curl_result = CURLE_OK;
     Clock::time_point request_started{};
+    std::int64_t buffered_offset = 0;
+    std::size_t buffered_accounted_bytes = 0;
+    std::vector<std::uint8_t> buffered_payload;
 };
 
 class CurlGlobal {
@@ -74,6 +77,8 @@ private:
                                                  const bool include_map_overhead) noexcept {
     return core::global_packet_overhead(payload_size, include_map_overhead);
 }
+
+constexpr std::size_t kAggregatedPacketBytes = 64 * 1024;
 
 template <typename T>
 void update_peak(std::atomic<T>& target, const T value) noexcept {
@@ -393,6 +398,91 @@ void update_speed(TransferHandle& transfer) noexcept {
     }
 }
 
+void reset_transfer_buffer(TransferHandle& transfer) noexcept {
+    transfer.buffered_offset = 0;
+    transfer.buffered_accounted_bytes = 0;
+    transfer.buffered_payload.clear();
+}
+
+[[nodiscard]] bool append_to_transfer_buffer(TransferHandle& transfer,
+                                             const std::uint8_t* data,
+                                             const std::size_t size) noexcept {
+    if (size == 0) {
+        return true;
+    }
+
+    if (transfer.buffered_payload.empty()) {
+        transfer.buffered_offset = transfer.next_offset;
+        if (transfer.buffered_payload.capacity() < kAggregatedPacketBytes) {
+            transfer.buffered_payload.reserve(kAggregatedPacketBytes);
+        }
+    } else if (transfer.buffered_offset +
+            static_cast<std::int64_t>(transfer.buffered_payload.size()) != transfer.next_offset) {
+        return false;
+    }
+
+    const auto old_size = transfer.buffered_payload.size();
+    transfer.buffered_payload.resize(old_size + size);
+    std::copy_n(data, size, transfer.buffered_payload.begin() + static_cast<std::ptrdiff_t>(old_size));
+
+    const auto new_accounted = packet_accounted_bytes(transfer.buffered_payload.size(), false);
+    if (new_accounted > transfer.buffered_accounted_bytes) {
+        const auto delta = new_accounted - transfer.buffered_accounted_bytes;
+        const auto current_memory = core::global_memory_accounting().add(delta);
+        update_peak(transfer.session->max_memory_bytes, current_memory);
+        transfer.buffered_accounted_bytes = new_accounted;
+    }
+
+    return true;
+}
+
+[[nodiscard]] bool flush_transfer_buffer(TransferHandle& transfer) noexcept {
+    if (transfer.buffered_payload.empty()) {
+        return true;
+    }
+
+    const auto packet_size = transfer.buffered_payload.size();
+    core::DataPacket packet{};
+    packet.kind = core::PacketKind::data;
+    packet.range_id = transfer.range != nullptr ? transfer.range->range_id : 0;
+    packet.offset = transfer.buffered_offset;
+    packet.payload = std::move(transfer.buffered_payload);
+    packet.accounted_bytes = transfer.buffered_accounted_bytes;
+    update_peak(transfer.session->max_packet_size_bytes, packet.payload.size());
+
+    if (!transfer.data_queue->try_enqueue(std::move(packet))) {
+        transfer.buffered_payload = std::move(packet.payload);
+        return false;
+    }
+
+    transfer.session->packets_enqueued_total.fetch_add(1, std::memory_order_relaxed);
+    const auto queued = transfer.session->queued_packets.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    update_peak(transfer.session->max_queued_packets, queued);
+    const auto downloaded = transfer.session->downloaded_bytes.fetch_add(
+        static_cast<std::int64_t>(packet_size), std::memory_order_relaxed) +
+        static_cast<std::int64_t>(packet_size);
+    const auto inflight = downloaded -
+        transfer.session->persisted_bytes.load(std::memory_order_relaxed);
+    update_peak(transfer.session->max_inflight_bytes, std::max<std::int64_t>(0, inflight));
+    reset_transfer_buffer(transfer);
+    return true;
+}
+
+[[nodiscard]] std::error_code flush_transfer_buffer_blocking(TransferHandle& transfer) noexcept {
+    while (!flush_transfer_buffer(transfer)) {
+        if (transfer.session->stop_requested.load(std::memory_order_acquire) &&
+            transfer.session->queued_packets.load(std::memory_order_relaxed) >=
+                transfer.session->options.queue_capacity_packets) {
+            return make_error_code(DownloadErrc::http_transfer_failed);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    return {};
+}
+
 [[nodiscard]] std::error_code arm_transfer(TransferHandle& transfer,
                                            CURLM* multi,
                                            const core::SessionState& session,
@@ -421,6 +511,10 @@ void update_speed(TransferHandle& transfer) noexcept {
     transfer.curl_result = CURLE_OK;
     transfer.request_started = Clock::now();
     transfer.range_header.clear();
+    reset_transfer_buffer(transfer);
+    if (transfer.buffered_payload.capacity() < kAggregatedPacketBytes) {
+        transfer.buffered_payload.reserve(kAggregatedPacketBytes);
+    }
     transfer.session->windows_total.fetch_add(1, std::memory_order_relaxed);
 
     curl_easy_reset(transfer.easy);
@@ -448,6 +542,17 @@ void update_speed(TransferHandle& transfer) noexcept {
 
         const auto remaining = current->request_end - current->next_offset + 1;
         if (remaining <= 0) {
+            if (!current->buffered_payload.empty() && !flush_transfer_buffer(*current)) {
+                if (!current->paused_by_memory) {
+                    current->session->queue_full_pause_count.fetch_add(1,
+                        std::memory_order_relaxed);
+                }
+                current->paused_by_memory = true;
+                current->range->pause_for_memory.store(true, std::memory_order_release);
+                mark_range_status(*current->range, core::RangeStatus::paused);
+                return CURL_WRITEFUNC_PAUSE;
+            }
+
             // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
             // 就暂停接收，避免把后续字节算进错误的区间。
             if (!current->paused_by_memory) {
@@ -467,10 +572,26 @@ void update_speed(TransferHandle& transfer) noexcept {
             return 0;
         }
 
-        const auto accounted = packet_accounted_bytes(allowed, false);
+        if (!current->buffered_payload.empty() &&
+            current->buffered_payload.size() + allowed > kAggregatedPacketBytes &&
+            !flush_transfer_buffer(*current)) {
+            if (!current->paused_by_memory) {
+                current->session->queue_full_pause_count.fetch_add(1,
+                    std::memory_order_relaxed);
+            }
+            current->paused_by_memory = true;
+            current->range->pause_for_memory.store(true, std::memory_order_release);
+            mark_range_status(*current->range, core::RangeStatus::paused);
+            return CURL_WRITEFUNC_PAUSE;
+        }
+
+        const auto previous_accounted = current->buffered_accounted_bytes;
         const auto current_bytes = core::global_memory_accounting().current_bytes();
+        const auto projected_size = current->buffered_payload.size() + allowed;
+        const auto projected_accounted = packet_accounted_bytes(projected_size, false);
         if (core::should_pause_for_backpressure(current_bytes,
-                accounted,
+                projected_accounted > previous_accounted ?
+                    projected_accounted - previous_accounted : 0,
                 current->session->options.backpressure_high_bytes)) {
             // 这里不阻塞等待队列腾空间，而是立刻 pause 当前 easy handle，
             // 把“什么时候恢复”交回给事件循环中的统一背压逻辑。
@@ -483,44 +604,12 @@ void update_speed(TransferHandle& transfer) noexcept {
             return CURL_WRITEFUNC_PAUSE;
         }
 
-        core::DataPacket packet{};
-        packet.kind = core::PacketKind::data;
-        packet.range_id = current->range->range_id;
-        packet.offset = current->next_offset;
-        packet.payload.assign(reinterpret_cast<const std::uint8_t*>(data),
-            reinterpret_cast<const std::uint8_t*>(data) + allowed);
-        packet.accounted_bytes = accounted;
-        update_peak(current->session->max_packet_size_bytes, allowed);
-
-        const auto queued_memory = core::global_memory_accounting().add(packet.accounted_bytes);
-        update_peak(current->session->max_memory_bytes, queued_memory);
-        if (!current->data_queue->try_enqueue(std::move(packet))) {
-            const auto released_memory = core::global_memory_accounting().subtract(accounted);
-            static_cast<void>(released_memory);
-            // 队列入队失败和高水位触发一样，都采用“非阻塞暂停”策略，
-            // 不在 libcurl 回调里做任何等待。
-            if (!current->paused_by_memory) {
-                current->session->queue_full_pause_count.fetch_add(1,
-                    std::memory_order_relaxed);
-            }
-            current->paused_by_memory = true;
-            current->range->pause_for_memory.store(true, std::memory_order_release);
-            mark_range_status(*current->range, core::RangeStatus::paused);
-            return CURL_WRITEFUNC_PAUSE;
+        if (!append_to_transfer_buffer(*current,
+                reinterpret_cast<const std::uint8_t*>(data),
+                allowed)) {
+            return 0;
         }
 
-        // downloaded_bytes 统计的是“已经从网络收到并交给持久化链路处理”的字节数，
-        // 它不等同于 persisted_bytes。
-        current->session->packets_enqueued_total.fetch_add(1, std::memory_order_relaxed);
-        const auto queued = current->session->queued_packets.fetch_add(1,
-            std::memory_order_relaxed) + 1;
-        update_peak(current->session->max_queued_packets, queued);
-        const auto downloaded = current->session->downloaded_bytes.fetch_add(
-            static_cast<std::int64_t>(allowed), std::memory_order_relaxed) +
-            static_cast<std::int64_t>(allowed);
-        const auto inflight = downloaded -
-            current->session->persisted_bytes.load(std::memory_order_relaxed);
-        update_peak(current->session->max_inflight_bytes, std::max<std::int64_t>(0, inflight));
         maybe_record_relative_time_ms(current->session->time_to_first_byte_ms,
             *current->session,
             Clock::now());
@@ -656,6 +745,12 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     // 这里处理的是“一个 HTTP window 请求结束了”，不是“整个下载任务结束了”。
     // 所以它既负责校验这次请求，也负责决定后续应该继续调度还是宣告 range 完成。
     update_speed(transfer);
+    if (const auto flush_error = flush_transfer_buffer_blocking(transfer); flush_error) {
+        rollback_inflight_window(transfer);
+        mark_range_status(*transfer.range, core::RangeStatus::failed);
+        return flush_error;
+    }
+
     if (transfer.curl_result != CURLE_OK) {
         rollback_inflight_window(transfer);
         mark_range_status(*transfer.range, core::RangeStatus::failed);
@@ -695,6 +790,7 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_memory = false;
+    reset_transfer_buffer(transfer);
     return {};
 }
 
@@ -710,18 +806,26 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_memory = false;
+    reset_transfer_buffer(transfer);
 }
 
-void stop_network_phase(core::SessionState& session,
-                        CURLM* multi,
-                        std::vector<TransferHandle>& handles) noexcept {
+std::error_code stop_network_phase(core::SessionState& session,
+                                   CURLM* multi,
+                                   std::vector<TransferHandle>& handles) noexcept {
     // 退出红线的第一步是先停网络生产，避免 Persistence 在 drain 队列时又收到
     // 新数据，从而把收尾阶段拉回“边消费边生产”的竞态。
     session.stop_requested.store(true, std::memory_order_release);
     for (auto& handle : handles) {
+        const auto flush_error = flush_transfer_buffer_blocking(handle);
+        if (flush_error) {
+            return flush_error;
+        }
+
         rollback_inflight_window(handle);
         release_transfer(multi, handle);
     }
+
+    return {};
 }
 
 std::error_code stop_persistence_phase(persistence::PersistenceThread& persistence,
@@ -1183,7 +1287,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         // 收尾严格按“先停网络、再停持久化、最后 finalize 文件”的顺序执行，
         // 这样 VDL、bitmap 和磁盘内容才能在退出时保持一致。
-        stop_network_phase(session, multi, handles);
+        if (!failure) {
+            failure = stop_network_phase(session, multi, handles);
+        } else {
+            const auto ignored = stop_network_phase(session, multi, handles);
+            static_cast<void>(ignored);
+        }
         failure = stop_persistence_phase(persistence, failure);
 
         // Persistence 线程拥有每个 range 的真正写盘前沿；停下来之后再做一次 bitmap
