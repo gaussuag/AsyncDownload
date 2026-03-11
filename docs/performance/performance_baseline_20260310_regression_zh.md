@@ -18,6 +18,10 @@
 - `build/benchmarks/20260311_103039_pre-change`
 - `build/benchmarks/20260310_184639_retest-core-cases-40`
 
+行为级 profiler 参考基线见：
+
+- `docs/performance/profiler_behavior_baseline_20260311_zh.md`
+
 ## 3. 测试环境
 
 - URL: `http://127.0.0.1:4287/1gb_files.zip`
@@ -33,6 +37,8 @@
 
 - 之前基于 `Debug` 版本采集的回归数据仅保留为历史参考，不再作为正式性能基线。
 - 从当前版本开始，所有性能复测、before/after 对比、回归判断都必须使用 `Release` 可执行文件。
+- 这份文档只定义 benchmark 性能基线，不定义 profiler 行为基线。
+- profiler 基线用于热点路径和行为结构对比，不能替代 benchmark 的正式性能数值基线。
 
 ## 4. 当前固定回归套件
 

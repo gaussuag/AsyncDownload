@@ -15,6 +15,16 @@
 - `build/benchmarks/20260311_113724_pre-change-release-retest`
 - `build/benchmarks/20260311_151155_pre-change-release-40`
 
+当前 profiler 行为基线参考文档：
+
+- `docs/performance/profiler_behavior_baseline_20260311_zh.md`
+
+说明：
+
+- benchmark 用于正式性能回归判断。
+- profiler 用于热点与行为路径对比。
+- profiler 结果不能替代 benchmark 结果做吞吐基线判断。
+
 ## 2. 优化后的验证原则
 
 每次做完一批代码改动后，不要直接凭单个 case 的吞吐判断“优化成功”，而是按下面的顺序看：
