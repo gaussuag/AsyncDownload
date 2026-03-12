@@ -25,8 +25,11 @@
 说明：
 
 - benchmark 用于正式性能回归判断。
-- profiler 用于热点与行为路径对比。
+- benchmark 结果应作为性能优化方向的主驱动依据。
+- profiler 用于热点与行为路径对比，不用于单独给出指导性性能结论。
 - profiler 结果不能替代 benchmark 结果做吞吐基线判断。
+- 如果 benchmark 还没有说明收益或退化趋势，不应先凭 profiler 下优化方向结论。
+- benchmark 与 profiler 应串行执行，不要在同一轮 benchmark 执行期间同时开启 profiler。
 - `regression_v2` 是聚合后继续迭代时的主回归套件。
 - `regression` 保留为聚合前后的历史对照套件，不要覆盖旧结论。
 - 新正式基线快照见 [performance_baseline_20260311_regression_v2_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/performance_baseline_20260311_regression_v2_zh.md)。
@@ -41,6 +44,14 @@
 3. 高吞吐 case 是否提升
 4. 内存保护 case 是否仍成立
 5. 高波动 canary 是否更稳定
+
+补充原则：
+
+1. 先跑 benchmark，再决定是否需要 profiler
+2. benchmark 负责回答“有没有收益、有没有退化、主要影响了哪些 case”
+3. profiler 负责回答“热点在哪里、热点有没有迁移、哪条路径值得继续查”
+4. 不要一边跑 benchmark 一边开 profiler
+5. 如果需要 profiler，应在 benchmark 结束并完成初步判断后单独执行
 
 ## 3. 固定验证流程
 
@@ -83,6 +94,24 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 - `wall_clock_duration_ms_median`
 
 如果只看吞吐，不看内存、inflight、pause，很容易把“堆积更多数据”误判成优化。
+
+### 3.4 benchmark 与 profiler 的执行顺序
+
+建议固定按下面顺序执行：
+
+1. 改动前 benchmark
+2. 改动后 benchmark
+3. 先根据 benchmark 判断：
+   - 是否确实有收益
+   - 是否出现退化
+   - 哪些 case 值得继续深挖
+4. 只有在需要解释热点、确认热点迁移、或者决定下一刀优化方向时，再单独跑 profiler
+
+换句话说：
+
+- benchmark 是主流程
+- profiler 是解释和确认流程
+- profiler 不应与 benchmark 混跑
 
 ## 4. 推荐的判定规则
 

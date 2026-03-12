@@ -88,6 +88,8 @@ If the playbook or baseline docs conflict with this skill on a project-specific 
 
 Use the benchmark tooling and suite that the current docs define.
 
+Benchmark is the primary driver for optimization decisions.
+
 Use benchmark results to answer:
 - did throughput improve
 - did memory regress
@@ -98,6 +100,8 @@ Use benchmark results to answer:
 
 - Profiler is a behavior baseline, not the official throughput baseline
 - Compare hotspot structure, not absolute MB/s
+- Do not use profiler alone to drive optimization conclusions when benchmark evidence is missing
+- Use profiler after benchmark, not during benchmark
 
 Use profiler results to answer:
 - which code path is hot now
@@ -111,12 +115,14 @@ Use profiler results to answer:
 2. Confirm the optimization goal with the user
 3. Choose the benchmark cases and profiler cases that match that goal, using the current docs as the authoritative guide
 4. Make one focused code change
-5. Rebuild and rerun `Release` benchmark
-6. Rerun profiler if the change targets a hotspot or changes behavior shape
-7. Re-check whether the change preserved the intended design boundaries
-8. Decide whether the change is a keeper
-9. Update the required docs
-10. If the loop is closed, recommend a new thread for the next bottleneck
+5. Rebuild and rerun `Release` benchmark first
+6. Use the benchmark result to decide whether the change produced meaningful improvement, regression, or an unclear outcome
+7. Rerun profiler only if hotspot explanation or hotspot confirmation is needed
+8. Keep benchmark and profiler execution separate; do not run profiler while running benchmark
+9. Re-check whether the change preserved the intended design boundaries
+10. Decide whether the change is a keeper
+11. Update the required docs
+12. If the loop is closed, recommend a new thread for the next bottleneck
 
 Prefer one focused optimization per loop. Do not combine unrelated bottlenecks in one batch.
 
