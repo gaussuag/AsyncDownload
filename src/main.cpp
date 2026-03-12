@@ -199,7 +199,6 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     const auto avg_disk_mb = perf.average_disk_bytes_per_second / (1024.0 * 1024.0);
     const auto peak_net_mb = perf.peak_network_bytes_per_second / (1024.0 * 1024.0);
     const auto peak_disk_mb = perf.peak_disk_bytes_per_second / (1024.0 * 1024.0);
-
     stream << std::fixed << std::setprecision(2);
     stream << "Summary\n";
     stream << "  status=" << (result.ok() ? "success" : "failed") << "\n";
@@ -234,6 +233,18 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  flush_time_ms_total=" << perf.flush_time_ms_total << "\n";
     stream << "  metadata_save_count=" << perf.metadata_save_count << "\n";
     stream << "  metadata_save_time_ms_total=" << perf.metadata_save_time_ms_total << "\n";
+    stream << "  handle_data_packet_sample_count=" << perf.handle_data_packet.sample_count << "\n";
+    stream << "  handle_data_packet_avg_us=" << perf.handle_data_packet.avg_us << "\n";
+    stream << "  handle_data_packet_max_us=" << perf.handle_data_packet.max_us << "\n";
+    stream << "  append_bytes_sample_count=" << perf.append_bytes.sample_count << "\n";
+    stream << "  append_bytes_avg_us=" << perf.append_bytes.avg_us << "\n";
+    stream << "  append_bytes_max_us=" << perf.append_bytes.max_us << "\n";
+    stream << "  file_write_sample_count=" << perf.file_write.sample_count << "\n";
+    stream << "  file_write_avg_us=" << perf.file_write.avg_us << "\n";
+    stream << "  file_write_max_us=" << perf.file_write.max_us << "\n";
+    stream << "  file_write_calls_total=" << perf.file_write_calls_total << "\n";
+    stream << "  staged_write_flush_count=" << perf.staged_write_flush_count << "\n";
+    stream << "  staged_write_bytes_total=" << perf.staged_write_bytes_total << "\n";
     if (!result.ok()) {
         stream << "  error=" << result.error.message() << "\n";
     }

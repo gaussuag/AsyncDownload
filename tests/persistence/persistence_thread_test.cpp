@@ -161,6 +161,84 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     static_cast<void>(removed);
 }
 
+TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
+    asyncdownload::core::global_memory_accounting().reset();
+
+    const auto temp_root =
+        std::filesystem::temp_directory_path() / "asyncdownload_packet_latency_sampling_test";
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    asyncdownload::DownloadOptions options{};
+    options.block_size = 4096;
+    options.io_alignment = 4096;
+    options.max_gap_bytes = 4096;
+    options.flush_threshold_bytes = 4096;
+    options.flush_interval = std::chrono::milliseconds(10);
+
+    asyncdownload::core::SessionState session{};
+    session.paths.output_path = temp_root / "output.bin";
+    session.paths.temporary_path = temp_root / "output.bin.part";
+    session.paths.metadata_path = temp_root / "output.bin.config.json";
+    session.url = "http://127.0.0.1/test.bin";
+    session.options = options;
+    session.total_size = 4096;
+    session.accept_ranges = true;
+
+    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    asyncdownload::core::AtomicBlockBitmap bitmap(
+        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+    asyncdownload::storage::FileWriter writer;
+    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
+    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread persistence(
+        session, queue, bitmap, writer, store, workers);
+
+    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
+    persistence.register_range(&range);
+    persistence.start();
+
+    asyncdownload::core::DataPacket packet{};
+    packet.kind = asyncdownload::core::PacketKind::data;
+    packet.range_id = 0;
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x55);
+    enqueue_data_packet(queue, session, std::move(packet));
+
+    EXPECT_TRUE(wait_for_condition([&session]() {
+        return session.persisted_bytes.load(std::memory_order_acquire) == 4096;
+    }, std::chrono::milliseconds(1000)));
+
+    persistence.stop();
+    persistence.join();
+    writer.close();
+
+    EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(session.performance_metrics.latency.handle_data_packet.sample_count.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_GT(session.performance_metrics.latency.handle_data_packet.total_time_ns.load(
+        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.performance_metrics.latency.append_bytes.sample_count.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_GT(session.performance_metrics.latency.append_bytes.total_time_ns.load(
+        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.performance_metrics.latency.file_write.sample_count.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_GT(session.performance_metrics.latency.file_write.total_time_ns.load(
+        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.performance_metrics.file_write_calls_total.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.staged_write_flush_count.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.staged_write_bytes_total.load(
+        std::memory_order_relaxed), 0);
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+}
+
 TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     asyncdownload::core::global_memory_accounting().reset();
 

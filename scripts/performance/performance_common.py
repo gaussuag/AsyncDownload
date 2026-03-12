@@ -74,6 +74,18 @@ SUMMARY_SPECS: list[tuple[str, str, str]] = [
     ("flush_time_ms_total", "flush_time_ms_total", "int"),
     ("metadata_save_count", "metadata_save_count", "int"),
     ("metadata_save_time_ms_total", "metadata_save_time_ms_total", "int"),
+    ("handle_data_packet_sample_count", "handle_data_packet_sample_count", "int"),
+    ("handle_data_packet_avg_us", "handle_data_packet_avg_us", "float"),
+    ("handle_data_packet_max_us", "handle_data_packet_max_us", "float"),
+    ("append_bytes_sample_count", "append_bytes_sample_count", "int"),
+    ("append_bytes_avg_us", "append_bytes_avg_us", "float"),
+    ("append_bytes_max_us", "append_bytes_max_us", "float"),
+    ("file_write_sample_count", "file_write_sample_count", "int"),
+    ("file_write_avg_us", "file_write_avg_us", "float"),
+    ("file_write_max_us", "file_write_max_us", "float"),
+    ("file_write_calls_total", "file_write_calls_total", "int"),
+    ("staged_write_flush_count", "staged_write_flush_count", "int"),
+    ("staged_write_bytes_total", "staged_write_bytes_total", "int"),
 ]
 
 SUMMARY_REQUIRED_KEYS = {source_key for source_key, _, _ in SUMMARY_SPECS}

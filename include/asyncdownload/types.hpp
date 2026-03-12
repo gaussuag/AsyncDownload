@@ -1,5 +1,7 @@
 #pragma once
 
+#include "asyncdownload/performance_metrics.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -63,61 +65,15 @@ struct ProgressSnapshot {
 
 using ProgressCallback = std::function<void(const ProgressSnapshot&)>;
 
-struct PerformanceSummary {
-    // 整个任务总耗时，包含 probe、恢复判定、下载和最终收尾。
+struct PerformanceSummary : performance::SummaryDirectPerformanceMetrics {
     std::int64_t total_duration_ms = 0;
-    // 首次收到网络数据包的时间点，单位是相对任务启动的毫秒数。
-    std::int64_t time_to_first_byte_ms = -1;
-    // 首次真正写盘的时间点，单位是相对任务启动的毫秒数。
-    std::int64_t time_to_first_persist_ms = -1;
-    // 基于任务总耗时计算的平均网络接收速度。
     double average_network_bytes_per_second = 0.0;
-    // 基于任务总耗时计算的平均磁盘写入速度。
     double average_disk_bytes_per_second = 0.0;
-    // 下载过程中的峰值网络接收速度。
-    double peak_network_bytes_per_second = 0.0;
-    // 下载过程中的峰值磁盘写入速度。
-    double peak_disk_bytes_per_second = 0.0;
-    // 恢复启动时直接复用的安全字节数。
-    std::int64_t resume_reused_bytes = 0;
-    // 下载过程中观测到的最大内存占用。
-    std::size_t max_memory_bytes = 0;
-    // downloaded 与 persisted 之间出现过的最大积压字节数。
-    std::int64_t max_inflight_bytes = 0;
-    // 队列中的 packet 数量峰值。
-    std::size_t max_queued_packets = 0;
-    // 并发活跃 HTTP 请求峰值。
-    std::size_t max_active_requests = 0;
-    // 真正因超过内存高水位触发的暂停次数。
-    std::size_t memory_pause_count = 0;
-    // 因队列 try_enqueue 失败触发的暂停次数。
-    std::size_t queue_full_pause_count = 0;
-    // 因当前 window 已经没有剩余额度而触发的暂停次数。
-    std::size_t window_boundary_pause_count = 0;
-    // 因 gap 熔断暂停 handle 的次数。
-    std::size_t gap_pause_count = 0;
-    // 实际发起的 window 请求总数。
-    std::size_t windows_total = 0;
-    // 任务期间总共存在过的逻辑 range 数量。
     std::size_t ranges_total = 0;
-    // 运行期通过 stealing 新增出来的 range 数量。
-    std::size_t ranges_stolen = 0;
-    // libcurl 写回调被调用的次数。
-    std::size_t write_callback_calls = 0;
-    // 成功入队到持久化线程的数据 packet 数量。
-    std::size_t packets_enqueued_total = 0;
-    // 数据 packet 的平均负载大小。
     double average_packet_size_bytes = 0.0;
-    // 观测到的最大数据 packet 负载大小。
-    std::size_t max_packet_size_bytes = 0;
-    // 实际执行的 flush 次数。
-    std::size_t flush_count = 0;
-    // flush 累积耗时。
-    std::int64_t flush_time_ms_total = 0;
-    // metadata 保存次数。
-    std::size_t metadata_save_count = 0;
-    // metadata 保存累积耗时。
-    std::int64_t metadata_save_time_ms_total = 0;
+    performance::LatencySummarySampleMetrics<std::size_t, double> handle_data_packet{};
+    performance::LatencySummarySampleMetrics<std::size_t, double> append_bytes{};
+    performance::LatencySummarySampleMetrics<std::size_t, double> file_write{};
 };
 
 struct DownloadRequest {

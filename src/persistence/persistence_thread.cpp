@@ -14,6 +14,9 @@ namespace asyncdownload::persistence {
 
 namespace {
 
+constexpr std::uint64_t kLatencySampleStride = 64;
+constexpr std::uint64_t kLatencySampleMask = kLatencySampleStride - 1;
+
 template <typename T>
 void update_peak(std::atomic<T>& target, const T value) noexcept {
     auto current = target.load(std::memory_order_relaxed);
@@ -30,7 +33,7 @@ void maybe_record_first_persist(core::SessionState& session) noexcept {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - session.task_started_at).count();
     auto unset = static_cast<std::int64_t>(-1);
-    session.time_to_first_persist_ms.compare_exchange_strong(unset,
+    session.performance_metrics.time_to_first_persist_ms.compare_exchange_strong(unset,
         static_cast<std::int64_t>(std::max<std::int64_t>(0, elapsed)),
         std::memory_order_release,
         std::memory_order_relaxed);
@@ -39,7 +42,23 @@ void maybe_record_first_persist(core::SessionState& session) noexcept {
 void update_inflight_peak(core::SessionState& session) noexcept {
     const auto inflight = session.downloaded_bytes.load(std::memory_order_relaxed) -
         session.persisted_bytes.load(std::memory_order_relaxed);
-    update_peak(session.max_inflight_bytes, std::max<std::int64_t>(0, inflight));
+    update_peak(session.performance_metrics.max_inflight_bytes,
+        std::max<std::int64_t>(0, inflight));
+}
+
+[[nodiscard]] std::int64_t elapsed_ns(const std::chrono::steady_clock::time_point started_at) noexcept {
+    return std::max<std::int64_t>(0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_at).count());
+}
+
+void record_latency_sample(std::atomic<std::size_t>& sample_count,
+                           std::atomic<std::int64_t>& total_ns,
+                           std::atomic<std::int64_t>& max_ns,
+                           const std::int64_t elapsed) noexcept {
+    sample_count.fetch_add(1, std::memory_order_relaxed);
+    total_ns.fetch_add(elapsed, std::memory_order_relaxed);
+    update_peak(max_ns, elapsed);
 }
 
 } // namespace
@@ -157,37 +176,53 @@ void PersistenceThread::handle_packet(core::DataPacket packet) {
 }
 
 void PersistenceThread::handle_data_packet(core::DataPacket packet) {
+    const auto sample_timing = (sampled_data_packet_counter_++ & kLatencySampleMask) == 0;
+    const auto started_at = sample_timing ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
+    const auto finish_sample = [&]() noexcept {
+        if (!sample_timing) {
+            return;
+        }
+        record_latency_sample(session_.performance_metrics.latency.handle_data_packet.sample_count,
+            session_.performance_metrics.latency.handle_data_packet.total_time_ns,
+            session_.performance_metrics.latency.handle_data_packet.max_time_ns,
+            elapsed_ns(started_at));
+    };
+
     auto* range = lookup_range(packet.range_id);
     if (range == nullptr) {
         release_packet_memory(packet);
         set_error(make_error_code(DownloadErrc::internal_error));
+        finish_sample();
         return;
     }
 
     if (packet.offset == range->persisted_offset) {
         // 命中当前 expected offset 时，说明这批数据正好可以接到已经落盘的前沿后面，
         // 于是直接写入，并尝试把 map 里后续连续片段一并 drain 掉。
-        const auto append_error = append_bytes(*range, packet.offset, packet.payload);
+        const auto append_error = append_bytes(*range, packet.offset, packet.payload, sample_timing);
         release_packet_memory(packet);
         if (append_error) {
             set_error(append_error);
+            finish_sample();
             return;
         }
 
         range->persisted_offset += static_cast<std::int64_t>(packet.size());
         update_finished_blocks(*range);
-        drain_ordered_packets(*range);
+        drain_ordered_packets(*range, sample_timing);
     } else {
         // 回调线程不能阻塞等待缺口补齐，所以乱序包先进入 map。
         // Persistence 线程只要等到 expected offset 到达，就能把后续连续片段一起链式写下去。
         packet.accounted_bytes += core::kMapNodeOverheadBytes;
         const auto queued_memory = core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
-        update_peak(session_.max_memory_bytes, queued_memory);
+        update_peak(session_.performance_metrics.max_memory_bytes, queued_memory);
         range->out_of_order_queue.emplace(packet.offset, std::move(packet));
         update_gap_flag(*range);
     }
 
     maybe_schedule_flush(false);
+    finish_sample();
 }
 
 void PersistenceThread::handle_range_complete(const std::size_t range_id) {
@@ -199,7 +234,7 @@ void PersistenceThread::handle_range_complete(const std::size_t range_id) {
 
     // 网络层认定一个 range 的 HTTP 请求已经全部结束后，Persistence 仍然要做
     // 两件事：把最后没凑满对齐块的 tail 刷掉，以及把状态正式推进到 finished。
-    const auto flush_error = flush_tail(*range);
+    const auto flush_error = flush_tail(*range, false);
     if (flush_error) {
         set_error(flush_error);
         return;
@@ -222,7 +257,19 @@ core::RangeContext* PersistenceThread::lookup_range(const std::size_t range_id) 
 
 std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
                                                 const std::int64_t offset,
-                                                std::span<const std::uint8_t> bytes) {
+                                                std::span<const std::uint8_t> bytes,
+                                                const bool sample_timing) {
+    const auto started_at = sample_timing ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
+    const auto finish_sample = [&]() noexcept {
+        if (!sample_timing) {
+            return;
+        }
+        record_latency_sample(session_.performance_metrics.latency.append_bytes.sample_count,
+            session_.performance_metrics.latency.append_bytes.total_time_ns,
+            session_.performance_metrics.latency.append_bytes.max_time_ns,
+            elapsed_ns(started_at));
+    };
     auto cursor = offset;
     std::size_t index = 0;
     const auto alignment = session_.options.io_alignment;
@@ -248,8 +295,9 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
             const auto is_last_chunk = range.tail_buffer.offset +
                 static_cast<std::int64_t>(range.tail_buffer.length) >= session_.total_size;
             if (range.tail_buffer.length == alignment || is_last_chunk) {
-                const auto flush_error = flush_tail(range);
+                const auto flush_error = flush_tail(range, sample_timing);
                 if (flush_error) {
+                    finish_sample();
                     return flush_error;
                 }
             }
@@ -276,14 +324,15 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
             range.tail_buffer.offset = cursor;
             std::memcpy(range.tail_buffer.data.data(), bytes.data() + index, bytes.size() - index);
             range.tail_buffer.length = bytes.size() - index;
+            finish_sample();
             return {};
         }
 
         // 真正的磁盘写入只发生在 Persistence 线程里，这样相邻 range 在扇区边界上
         // 不会出现并发 RMW 竞争。
-        const auto write_error = file_writer_.write(cursor,
-            bytes.subspan(index, aligned_bytes));
+        const auto write_error = write_bytes(cursor, bytes.subspan(index, aligned_bytes), sample_timing);
         if (write_error) {
+            finish_sample();
             return write_error;
         }
 
@@ -300,10 +349,28 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
         index += aligned_bytes;
     }
 
+    finish_sample();
     return {};
 }
 
-std::error_code PersistenceThread::flush_tail(core::RangeContext& range) {
+std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
+                                               const std::span<const std::uint8_t> bytes,
+                                               const bool sample_timing) {
+    const auto write_started_at = sample_timing ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
+    const auto write_error = file_writer_.write(offset, bytes);
+    session_.performance_metrics.file_write_calls_total.fetch_add(
+        1, std::memory_order_relaxed);
+    if (sample_timing) {
+        record_latency_sample(session_.performance_metrics.latency.file_write.sample_count,
+            session_.performance_metrics.latency.file_write.total_time_ns,
+            session_.performance_metrics.latency.file_write.max_time_ns,
+            elapsed_ns(write_started_at));
+    }
+    return write_error;
+}
+
+std::error_code PersistenceThread::flush_tail(core::RangeContext& range, const bool sample_timing) {
     if (range.tail_buffer.length == 0) {
         return {};
     }
@@ -317,8 +384,9 @@ std::error_code PersistenceThread::flush_tail(core::RangeContext& range) {
 
     // range 结束时即使不足 4KB 也要把尾巴刷掉，否则 metadata 看起来完成了，
     // 但磁盘上最后一个扇区还停留在内存里。
-    const auto write_error = file_writer_.write(range.tail_buffer.offset,
-        std::span<const std::uint8_t>(bytes.data(), write_size));
+    const auto write_error = write_bytes(range.tail_buffer.offset,
+        std::span<const std::uint8_t>(bytes.data(), write_size),
+        sample_timing);
     if (write_error) {
         return write_error;
     }
@@ -346,7 +414,7 @@ void PersistenceThread::update_finished_blocks(const core::RangeContext& range) 
         session_.total_size);
 }
 
-void PersistenceThread::drain_ordered_packets(core::RangeContext& range) {
+void PersistenceThread::drain_ordered_packets(core::RangeContext& range, const bool sample_timing) {
     // 一旦 expected offset 对上，就尽量把 map 里后面连续的 packet 一次性清空。
     // 这样既能减少 map 常驻量，也能快速消除 gap pause。
     while (!range.out_of_order_queue.empty()) {
@@ -358,7 +426,7 @@ void PersistenceThread::drain_ordered_packets(core::RangeContext& range) {
         auto packet = std::move(next->second);
         range.out_of_order_queue.erase(next);
 
-        const auto append_error = append_bytes(range, packet.offset, packet.payload);
+        const auto append_error = append_bytes(range, packet.offset, packet.payload, sample_timing);
         release_packet_memory(packet);
         if (append_error) {
             set_error(append_error);
@@ -414,8 +482,8 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
         auto flush_error = file_writer_.flush();
         const auto flush_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - flush_started_at).count();
-        session_.flush_count.fetch_add(1, std::memory_order_relaxed);
-        session_.flush_time_ms_total.fetch_add(
+        session_.performance_metrics.flush_count.fetch_add(1, std::memory_order_relaxed);
+        session_.performance_metrics.flush_time_ms_total.fetch_add(
             static_cast<std::int64_t>(std::max<std::int64_t>(0, flush_elapsed_ms)),
             std::memory_order_relaxed);
         if (flush_error) {
@@ -431,8 +499,9 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
         auto metadata_error = metadata_store_.save(snapshot);
         const auto metadata_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - metadata_started_at).count();
-        session_.metadata_save_count.fetch_add(1, std::memory_order_relaxed);
-        session_.metadata_save_time_ms_total.fetch_add(
+        session_.performance_metrics.metadata_save_count.fetch_add(
+            1, std::memory_order_relaxed);
+        session_.performance_metrics.metadata_save_time_ms_total.fetch_add(
             static_cast<std::int64_t>(std::max<std::int64_t>(0, metadata_elapsed_ms)),
             std::memory_order_relaxed);
         return metadata_error;

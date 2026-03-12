@@ -62,13 +62,17 @@ private:
     // 把一段逻辑字节按对齐规则写入磁盘，必要时借助 tail buffer 补齐。
     [[nodiscard]] std::error_code append_bytes(core::RangeContext& range,
                                                std::int64_t offset,
-                                               std::span<const std::uint8_t> bytes);
+                                               std::span<const std::uint8_t> bytes,
+                                               bool sample_timing);
+    [[nodiscard]] std::error_code write_bytes(std::int64_t offset,
+                                              std::span<const std::uint8_t> bytes,
+                                              bool sample_timing);
     // 强制把当前 range 的尾部残留刷到磁盘。
-    [[nodiscard]] std::error_code flush_tail(core::RangeContext& range);
+    [[nodiscard]] std::error_code flush_tail(core::RangeContext& range, bool sample_timing);
     // 根据 persisted_offset 推进位图 finished 状态。
     void update_finished_blocks(const core::RangeContext& range) noexcept;
     // 从乱序 map 中连续提取已经可以按序写盘的 packet。
-    void drain_ordered_packets(core::RangeContext& range);
+    void drain_ordered_packets(core::RangeContext& range, bool sample_timing);
     // 根据当前缺口大小更新 pause_for_gap。
     void update_gap_flag(core::RangeContext& range);
     // 达到字节阈值或时间阈值后，异步提交 flush + metadata 保存任务。
@@ -102,6 +106,7 @@ private:
     mutable std::mutex error_mutex_;
     std::error_code error_;
     bool stopping_ = false;
+    std::uint64_t sampled_data_packet_counter_ = 0;
 };
 
 } // namespace asyncdownload::persistence
