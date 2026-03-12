@@ -67,6 +67,71 @@ If a change may alter component behavior, weaken an existing guarantee, or reint
 
 If you are not confident whether the change stays within the intended design philosophy, pause and ask the user to confirm the tradeoff before implementing it.
 
+## Implementation Drill-Down Rule
+
+Do not promote a repeated call site into an optimization candidate until you inspect the called implementation.
+
+When profiler output, call structure, or code reading suggests a hotspot such as repeated state updates, repeated helper calls, or repeated bookkeeping:
+- open the concrete implementation of the helper before proposing the optimization
+- classify the actual cost source instead of reasoning from call count alone
+- distinguish between:
+  - simple arithmetic or cheap condition checks
+  - linear scans or bitmap walks
+  - memory copies or reallocations
+  - lock acquisition
+  - system calls
+  - cross-thread synchronization
+- verify whether the suspected cost is really on the hot path and at the frequency you think it is
+
+Do not treat "called many times" as sufficient evidence that the code is worth optimizing.
+
+If the implementation is lightweight after inspection, explicitly downgrade that idea instead of keeping it as a stage-one optimization candidate.
+
+## Flow Context Rule
+
+Before presenting a concrete optimization plan, inspect not only the suspected helper itself, but also the nearby business flow, data flow, or call-chain surface that determines whether the optimization is a real runtime path.
+
+In practice, this means checking enough surrounding code to answer questions such as:
+- where the data comes from before it reaches this hotspot
+- whether the suspected optimization surface is on the main path, a repair path, or a fallback path
+- where contiguous work, batching opportunities, or backpressure actually form
+- whether the dominant cost is likely created upstream, consumed locally, or exposed downstream
+
+Do not assume that a locally valid optimization surface is also a high-hit runtime surface.
+
+If chain-level reading suggests the optimization may only trigger in a narrow or secondary path, explicitly downgrade it before presenting it as a main proposal.
+
+You do not need to read the entire project for every optimization idea. Read enough of the surrounding chain to understand:
+- the relevant producer side
+- the local component
+- the next cost-bearing boundary
+
+## Experiment Framing Rule
+
+If implementation-level and chain-level reading still cannot confirm whether a proposed optimization will be a real high-hit path, you may still propose and implement it, but label it clearly as an experiment rather than as a likely keeper.
+
+When doing that:
+- say what has been confirmed in code
+- say what remains unconfirmed about the real runtime path
+- define the concrete metrics that would prove the path was actually hit
+- treat the result as hypothesis testing, not as implicit evidence that the direction is already well-founded
+
+## Prior Experiment Rule
+
+Before proposing a new optimization stage, compare it against prior accepted and rejected experiments in `docs/performance`.
+
+If a new idea is materially similar to a previously rejected direction, do not present it as a fresh low-risk candidate unless you can state the concrete implementation difference that changes the expected outcome.
+
+Examples of "materially similar" include:
+- reducing the same class of per-packet bookkeeping by a different helper boundary
+- batching state updates without reducing the dominant copy, write, or syscall count
+- revisiting a hotspot that previously improved profiler shape but failed the benchmark keeper cases
+
+When in doubt, explicitly say:
+- what was tried before
+- what failed
+- why this new version is meaningfully different, or why it should be deprioritized
+
 ## Source Of Truth Rule
 
 Do not duplicate evolving performance conclusions inside this skill.
@@ -113,16 +178,20 @@ Use profiler results to answer:
 
 1. Recover current baseline and current hotspot story from `docs/performance`
 2. Confirm the optimization goal with the user
-3. Choose the benchmark cases and profiler cases that match that goal, using the current docs as the authoritative guide
-4. Make one focused code change
-5. Rebuild and rerun `Release` benchmark first
-6. Use the benchmark result to decide whether the change produced meaningful improvement, regression, or an unclear outcome
-7. Rerun profiler only if hotspot explanation or hotspot confirmation is needed
-8. Keep benchmark and profiler execution separate; do not run profiler while running benchmark
-9. Re-check whether the change preserved the intended design boundaries
-10. Decide whether the change is a keeper
-11. Update the required docs
-12. If the loop is closed, recommend a new thread for the next bottleneck
+3. Inspect the concrete implementation of every suspected hot helper before turning that suspicion into a proposed optimization
+4. Read enough surrounding producer-side, local, and downstream code to understand whether the suspected optimization surface is part of the real runtime path
+5. Compare the suspected direction against prior accepted and rejected experiments in `docs/performance`
+6. If the hit surface is still uncertain, explicitly frame the work as an experiment and define the proof metrics before coding
+7. Choose the benchmark cases and profiler cases that match that goal, using the current docs as the authoritative guide
+8. Make one focused code change
+9. Rebuild and rerun `Release` benchmark first
+10. Use the benchmark result to decide whether the change produced meaningful improvement, regression, or an unclear outcome
+11. Rerun profiler only if hotspot explanation or hotspot confirmation is needed
+12. Keep benchmark and profiler execution separate; do not run profiler while running benchmark
+13. Re-check whether the change preserved the intended design boundaries
+14. Decide whether the change is a keeper
+15. Update the required docs
+16. If the loop is closed, recommend a new thread for the next bottleneck
 
 Prefer one focused optimization per loop. Do not combine unrelated bottlenecks in one batch.
 
