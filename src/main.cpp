@@ -217,11 +217,24 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  max_memory_bytes=" << perf.max_memory_bytes << "\n";
     stream << "  max_inflight_bytes=" << perf.max_inflight_bytes << "\n";
     stream << "  max_queued_packets=" << perf.max_queued_packets << "\n";
+    stream << "  max_queued_bytes=" << perf.max_queued_bytes << "\n";
     stream << "  max_active_requests=" << perf.max_active_requests << "\n";
     stream << "  memory_pause_count=" << perf.memory_pause_count << "\n";
     stream << "  queue_full_pause_count=" << perf.queue_full_pause_count << "\n";
+    stream << "  queue_full_pause_capacity_reached_count="
+           << perf.queue_full_pause_capacity_reached_count << "\n";
+    stream << "  queue_full_pause_try_enqueue_failure_count="
+           << perf.queue_full_pause_try_enqueue_failure_count << "\n";
     stream << "  window_boundary_pause_count=" << perf.window_boundary_pause_count << "\n";
     stream << "  gap_pause_count=" << perf.gap_pause_count << "\n";
+    stream << "  max_queue_paused_handles=" << perf.max_queue_paused_handles << "\n";
+    stream << "  max_memory_paused_handles=" << perf.max_memory_paused_handles << "\n";
+    stream << "  queue_full_resume_count=" << perf.queue_full_resume_count << "\n";
+    stream << "  memory_resume_count=" << perf.memory_resume_count << "\n";
+    stream << "  queue_resume_blocked_by_memory_count="
+           << perf.queue_resume_blocked_by_memory_count << "\n";
+    stream << "  queue_pause_overlap_memory_count="
+           << perf.queue_pause_overlap_memory_count << "\n";
     stream << "  windows_total=" << perf.windows_total << "\n";
     stream << "  ranges_total=" << perf.ranges_total << "\n";
     stream << "  ranges_stolen=" << perf.ranges_stolen << "\n";
@@ -229,6 +242,30 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  packets_enqueued_total=" << perf.packets_enqueued_total << "\n";
     stream << "  avg_packet_size_bytes=" << perf.average_packet_size_bytes << "\n";
     stream << "  max_packet_size_bytes=" << perf.max_packet_size_bytes << "\n";
+    stream << "  queue_full_pause_start_queued_packets_total="
+           << perf.queue_full_pause_start_queued_packets_total << "\n";
+    stream << "  queue_full_pause_start_queued_bytes_total="
+           << perf.queue_full_pause_start_queued_bytes_total << "\n";
+    stream << "  memory_pause_start_queued_packets_total="
+           << perf.memory_pause_start_queued_packets_total << "\n";
+    stream << "  memory_pause_start_queued_bytes_total="
+           << perf.memory_pause_start_queued_bytes_total << "\n";
+    stream << "  queue_full_pause_avg_ms=" << perf.queue_full_pause_avg_ms << "\n";
+    stream << "  queue_full_pause_max_ms=" << perf.queue_full_pause_max_ms << "\n";
+    stream << "  memory_pause_avg_ms=" << perf.memory_pause_avg_ms << "\n";
+    stream << "  memory_pause_max_ms=" << perf.memory_pause_max_ms << "\n";
+    stream << "  queue_resume_blocked_by_memory_avg_ms="
+           << perf.queue_resume_blocked_by_memory_avg_ms << "\n";
+    stream << "  queue_resume_blocked_by_memory_max_ms="
+           << perf.queue_resume_blocked_by_memory_max_ms << "\n";
+    stream << "  queue_full_pause_start_queued_packets_avg="
+           << perf.queue_full_pause_start_queued_packets_avg << "\n";
+    stream << "  queue_full_pause_start_queued_bytes_avg="
+           << perf.queue_full_pause_start_queued_bytes_avg << "\n";
+    stream << "  memory_pause_start_queued_packets_avg="
+           << perf.memory_pause_start_queued_packets_avg << "\n";
+    stream << "  memory_pause_start_queued_bytes_avg="
+           << perf.memory_pause_start_queued_bytes_avg << "\n";
     stream << "  flush_count=" << perf.flush_count << "\n";
     stream << "  flush_time_ms_total=" << perf.flush_time_ms_total << "\n";
     stream << "  metadata_save_count=" << perf.metadata_save_count << "\n";
@@ -242,9 +279,25 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  file_write_sample_count=" << perf.file_write.sample_count << "\n";
     stream << "  file_write_avg_us=" << perf.file_write.avg_us << "\n";
     stream << "  file_write_max_us=" << perf.file_write.max_us << "\n";
+    stream << "  metadata_snapshot_sample_count=" << perf.metadata_snapshot.sample_count << "\n";
+    stream << "  metadata_snapshot_avg_us=" << perf.metadata_snapshot.avg_us << "\n";
+    stream << "  metadata_snapshot_max_us=" << perf.metadata_snapshot.max_us << "\n";
+    stream << "  crc_sample_read_sample_count=" << perf.crc_sample_read.sample_count << "\n";
+    stream << "  crc_sample_read_avg_us=" << perf.crc_sample_read.avg_us << "\n";
+    stream << "  crc_sample_read_max_us=" << perf.crc_sample_read.max_us << "\n";
+    stream << "  flush_pending_write_sample_count=" << perf.flush_pending_write.sample_count << "\n";
+    stream << "  flush_pending_write_avg_us=" << perf.flush_pending_write.avg_us << "\n";
+    stream << "  flush_pending_write_max_us=" << perf.flush_pending_write.max_us << "\n";
     stream << "  file_write_calls_total=" << perf.file_write_calls_total << "\n";
     stream << "  staged_write_flush_count=" << perf.staged_write_flush_count << "\n";
     stream << "  staged_write_bytes_total=" << perf.staged_write_bytes_total << "\n";
+    stream << "  direct_append_packets_total=" << perf.direct_append_packets_total << "\n";
+    stream << "  out_of_order_insert_packets_total=" << perf.out_of_order_insert_packets_total << "\n";
+    stream << "  drained_ordered_packets_total=" << perf.drained_ordered_packets_total << "\n";
+    stream << "  out_of_order_queue_peak_packets=" << perf.out_of_order_queue_peak_packets << "\n";
+    stream << "  out_of_order_queue_peak_bytes=" << perf.out_of_order_queue_peak_bytes << "\n";
+    stream << "  crc_sample_blocks_total=" << perf.crc_sample_blocks_total << "\n";
+    stream << "  crc_sample_bytes_total=" << perf.crc_sample_bytes_total << "\n";
     if (!result.ok()) {
         stream << "  error=" << result.error.message() << "\n";
     }

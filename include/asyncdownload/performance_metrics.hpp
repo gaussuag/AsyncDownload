@@ -55,6 +55,7 @@ struct ResourcePeakMetrics {
     SizeField max_memory_bytes{0};
     IntField max_inflight_bytes{0};
     SizeField max_queued_packets{0};
+    IntField max_queued_bytes{0};
     SizeField max_active_requests{0};
 };
 
@@ -62,11 +63,21 @@ template <typename SizeField>
 struct PauseMetrics {
     SizeField memory_pause_count{0};
     SizeField queue_full_pause_count{0};
+    SizeField queue_full_pause_capacity_reached_count{0};
+    SizeField queue_full_pause_try_enqueue_failure_count{0};
     SizeField window_boundary_pause_count{0};
     SizeField gap_pause_count{0};
+    SizeField max_queue_paused_handles{0};
+    SizeField max_memory_paused_handles{0};
+    SizeField queue_full_resume_count{0};
+    SizeField memory_resume_count{0};
+    SizeField queue_resume_blocked_by_memory_count{0};
+    SizeField queue_pause_overlap_memory_count{0};
+    SizeField queue_full_pause_start_queued_packets_total{0};
+    SizeField memory_pause_start_queued_packets_total{0};
 };
 
-template <typename SizeField>
+template <typename SizeField, typename IntField>
 struct TransferCountMetrics {
     SizeField windows_total{0};
     SizeField ranges_stolen{0};
@@ -77,6 +88,13 @@ struct TransferCountMetrics {
     SizeField metadata_save_count{0};
     SizeField file_write_calls_total{0};
     SizeField staged_write_flush_count{0};
+    SizeField direct_append_packets_total{0};
+    SizeField out_of_order_insert_packets_total{0};
+    SizeField drained_ordered_packets_total{0};
+    SizeField out_of_order_queue_peak_packets{0};
+    SizeField crc_sample_blocks_total{0};
+    IntField queue_full_pause_start_queued_bytes_total{0};
+    IntField memory_pause_start_queued_bytes_total{0};
 };
 
 template <typename IntField>
@@ -84,6 +102,8 @@ struct DurationCountMetrics {
     IntField flush_time_ms_total{0};
     IntField metadata_save_time_ms_total{0};
     IntField staged_write_bytes_total{0};
+    IntField out_of_order_queue_peak_bytes{0};
+    IntField crc_sample_bytes_total{0};
 };
 
 template <typename CountField, typename TimeField>
@@ -105,6 +125,16 @@ struct RuntimeLatencyMetrics {
     LatencyRuntimeSampleMetrics<CountField, TimeField> handle_data_packet{};
     LatencyRuntimeSampleMetrics<CountField, TimeField> append_bytes{};
     LatencyRuntimeSampleMetrics<CountField, TimeField> file_write{};
+    LatencyRuntimeSampleMetrics<CountField, TimeField> metadata_snapshot{};
+    LatencyRuntimeSampleMetrics<CountField, TimeField> crc_sample_read{};
+    LatencyRuntimeSampleMetrics<CountField, TimeField> flush_pending_write{};
+};
+
+template <typename CountField, typename TimeField>
+struct RuntimePauseDurationMetrics {
+    LatencyRuntimeSampleMetrics<CountField, TimeField> queue_full_pause_duration{};
+    LatencyRuntimeSampleMetrics<CountField, TimeField> memory_pause_duration{};
+    LatencyRuntimeSampleMetrics<CountField, TimeField> queue_resume_blocked_by_memory_duration{};
 };
 
 struct RuntimePerformanceMetrics
@@ -113,9 +143,11 @@ struct RuntimePerformanceMetrics
       PeakRateMetrics<double>,
       ResourcePeakMetrics<std::atomic<std::size_t>, std::atomic<std::int64_t>>,
       PauseMetrics<std::atomic<std::size_t>>,
-      TransferCountMetrics<std::atomic<std::size_t>>,
+      TransferCountMetrics<std::atomic<std::size_t>, std::atomic<std::int64_t>>,
       DurationCountMetrics<std::atomic<std::int64_t>> {
     RuntimeLatencyMetrics<std::atomic<std::size_t>, std::atomic<std::int64_t>> latency{};
+    RuntimePauseDurationMetrics<std::atomic<std::size_t>, std::atomic<std::int64_t>>
+        pause_duration{};
 };
 
 struct SummaryDirectPerformanceMetrics
@@ -124,7 +156,7 @@ struct SummaryDirectPerformanceMetrics
       PeakRateMetrics<double>,
       ResourcePeakMetrics<std::size_t, std::int64_t>,
       PauseMetrics<std::size_t>,
-      TransferCountMetrics<std::size_t>,
+      TransferCountMetrics<std::size_t, std::int64_t>,
       DurationCountMetrics<std::int64_t> {};
 
 template <typename T>
@@ -147,11 +179,28 @@ inline void copy_runtime_to_summary(SummaryDirectPerformanceMetrics& summary,
     summary.max_memory_bytes = load_value(runtime.max_memory_bytes);
     summary.max_inflight_bytes = load_value(runtime.max_inflight_bytes);
     summary.max_queued_packets = load_value(runtime.max_queued_packets);
+    summary.max_queued_bytes = load_value(runtime.max_queued_bytes);
     summary.max_active_requests = load_value(runtime.max_active_requests);
     summary.memory_pause_count = load_value(runtime.memory_pause_count);
     summary.queue_full_pause_count = load_value(runtime.queue_full_pause_count);
+    summary.queue_full_pause_capacity_reached_count =
+        load_value(runtime.queue_full_pause_capacity_reached_count);
+    summary.queue_full_pause_try_enqueue_failure_count =
+        load_value(runtime.queue_full_pause_try_enqueue_failure_count);
     summary.window_boundary_pause_count = load_value(runtime.window_boundary_pause_count);
     summary.gap_pause_count = load_value(runtime.gap_pause_count);
+    summary.max_queue_paused_handles = load_value(runtime.max_queue_paused_handles);
+    summary.max_memory_paused_handles = load_value(runtime.max_memory_paused_handles);
+    summary.queue_full_resume_count = load_value(runtime.queue_full_resume_count);
+    summary.memory_resume_count = load_value(runtime.memory_resume_count);
+    summary.queue_resume_blocked_by_memory_count =
+        load_value(runtime.queue_resume_blocked_by_memory_count);
+    summary.queue_pause_overlap_memory_count =
+        load_value(runtime.queue_pause_overlap_memory_count);
+    summary.queue_full_pause_start_queued_packets_total =
+        load_value(runtime.queue_full_pause_start_queued_packets_total);
+    summary.memory_pause_start_queued_packets_total =
+        load_value(runtime.memory_pause_start_queued_packets_total);
     summary.windows_total = load_value(runtime.windows_total);
     summary.ranges_stolen = load_value(runtime.ranges_stolen);
     summary.write_callback_calls = load_value(runtime.write_callback_calls);
@@ -164,6 +213,17 @@ inline void copy_runtime_to_summary(SummaryDirectPerformanceMetrics& summary,
     summary.file_write_calls_total = load_value(runtime.file_write_calls_total);
     summary.staged_write_flush_count = load_value(runtime.staged_write_flush_count);
     summary.staged_write_bytes_total = load_value(runtime.staged_write_bytes_total);
+    summary.direct_append_packets_total = load_value(runtime.direct_append_packets_total);
+    summary.out_of_order_insert_packets_total = load_value(runtime.out_of_order_insert_packets_total);
+    summary.drained_ordered_packets_total = load_value(runtime.drained_ordered_packets_total);
+    summary.out_of_order_queue_peak_packets = load_value(runtime.out_of_order_queue_peak_packets);
+    summary.out_of_order_queue_peak_bytes = load_value(runtime.out_of_order_queue_peak_bytes);
+    summary.crc_sample_blocks_total = load_value(runtime.crc_sample_blocks_total);
+    summary.crc_sample_bytes_total = load_value(runtime.crc_sample_bytes_total);
+    summary.queue_full_pause_start_queued_bytes_total =
+        load_value(runtime.queue_full_pause_start_queued_bytes_total);
+    summary.memory_pause_start_queued_bytes_total =
+        load_value(runtime.memory_pause_start_queued_bytes_total);
 }
 
 template <typename CountField, typename FloatField, typename RuntimeCountField, typename RuntimeTimeField>

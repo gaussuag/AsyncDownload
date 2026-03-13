@@ -166,6 +166,14 @@ void PersistenceThread::handle_packet(core::DataPacket packet) {
 
     // 只有真正开始处理这个 packet 时，它才算离开“网络未落盘积压”集合。
     session_.queued_packets.fetch_sub(1, std::memory_order_relaxed);
+    if (packet.kind == core::PacketKind::data) {
+        const auto queued_bytes = session_.queued_bytes.fetch_sub(
+            static_cast<std::int64_t>(packet.accounted_bytes), std::memory_order_relaxed) -
+            static_cast<std::int64_t>(packet.accounted_bytes);
+        if (queued_bytes < 0) {
+            session_.queued_bytes.store(0, std::memory_order_relaxed);
+        }
+    }
 
     if (packet.kind == core::PacketKind::range_complete) {
         handle_range_complete(packet.range_id);
@@ -208,6 +216,8 @@ void PersistenceThread::handle_data_packet(core::DataPacket packet) {
             return;
         }
 
+        session_.performance_metrics.direct_append_packets_total.fetch_add(
+            1, std::memory_order_relaxed);
         range->persisted_offset += static_cast<std::int64_t>(packet.size());
         update_finished_blocks(*range);
         drain_ordered_packets(*range, sample_timing);
@@ -217,6 +227,14 @@ void PersistenceThread::handle_data_packet(core::DataPacket packet) {
         packet.accounted_bytes += core::kMapNodeOverheadBytes;
         const auto queued_memory = core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
         update_peak(session_.performance_metrics.max_memory_bytes, queued_memory);
+        ++current_out_of_order_packets_;
+        current_out_of_order_bytes_ += static_cast<std::int64_t>(packet.accounted_bytes);
+        session_.performance_metrics.out_of_order_insert_packets_total.fetch_add(
+            1, std::memory_order_relaxed);
+        update_peak(session_.performance_metrics.out_of_order_queue_peak_packets,
+            current_out_of_order_packets_);
+        update_peak(session_.performance_metrics.out_of_order_queue_peak_bytes,
+            current_out_of_order_bytes_);
         range->out_of_order_queue.emplace(packet.offset, std::move(packet));
         update_gap_flag(*range);
     }
@@ -356,7 +374,11 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
 std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
                                                const std::span<const std::uint8_t> bytes,
                                                const bool sample_timing) {
+    const auto flush_pending = pending_flush_.valid() &&
+        pending_flush_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
     const auto write_started_at = sample_timing ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
+    const auto flush_pending_started_at = flush_pending ? std::chrono::steady_clock::now() :
         std::chrono::steady_clock::time_point{};
     const auto write_error = file_writer_.write(offset, bytes);
     session_.performance_metrics.file_write_calls_total.fetch_add(
@@ -366,6 +388,12 @@ std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
             session_.performance_metrics.latency.file_write.total_time_ns,
             session_.performance_metrics.latency.file_write.max_time_ns,
             elapsed_ns(write_started_at));
+    }
+    if (flush_pending) {
+        record_latency_sample(session_.performance_metrics.latency.flush_pending_write.sample_count,
+            session_.performance_metrics.latency.flush_pending_write.total_time_ns,
+            session_.performance_metrics.latency.flush_pending_write.max_time_ns,
+            elapsed_ns(flush_pending_started_at));
     }
     return write_error;
 }
@@ -425,6 +453,11 @@ void PersistenceThread::drain_ordered_packets(core::RangeContext& range, const b
 
         auto packet = std::move(next->second);
         range.out_of_order_queue.erase(next);
+        if (current_out_of_order_packets_ > 0) {
+            --current_out_of_order_packets_;
+        }
+        current_out_of_order_bytes_ = std::max<std::int64_t>(0,
+            current_out_of_order_bytes_ - static_cast<std::int64_t>(packet.accounted_bytes));
 
         const auto append_error = append_bytes(range, packet.offset, packet.payload, sample_timing);
         release_packet_memory(packet);
@@ -433,6 +466,8 @@ void PersistenceThread::drain_ordered_packets(core::RangeContext& range, const b
             return;
         }
 
+        session_.performance_metrics.drained_ordered_packets_total.fetch_add(
+            1, std::memory_order_relaxed);
         range.persisted_offset += static_cast<std::int64_t>(packet.size());
         update_finished_blocks(range);
     }
@@ -473,7 +508,12 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
 
     // Flush 和 metadata 保存都放到线程池异步做，Persistence 线程继续串行消费
     // 数据包，避免把网络到磁盘这条主链卡死在 FlushFileBuffers 上。
+    const auto snapshot_started_at = std::chrono::steady_clock::now();
     auto snapshot = build_metadata_state();
+    record_latency_sample(session_.performance_metrics.latency.metadata_snapshot.sample_count,
+        session_.performance_metrics.latency.metadata_snapshot.total_time_ns,
+        session_.performance_metrics.latency.metadata_snapshot.max_time_ns,
+        elapsed_ns(snapshot_started_at));
     bytes_since_flush_ = 0;
     last_flush_time_ = now;
 
@@ -596,8 +636,6 @@ PersistenceThread::build_crc_samples(const core::MetadataState& state) const {
     std::vector<core::BlockCrcSample> samples;
     const auto block_size = static_cast<std::int64_t>(state.block_size);
 
-    // CRC 采样的目标不是替代 VDL，而是为“VDL 之后已经 finished 的离散块”
-    // 提供恢复时的二次可信度判断。
     for (std::size_t index = 0; index < state.bitmap_states.size(); ++index) {
         if (state.bitmap_states[index] != static_cast<std::uint8_t>(core::BlockState::finished)) {
             continue;
@@ -611,11 +649,20 @@ PersistenceThread::build_crc_samples(const core::MetadataState& state) const {
         const auto length = static_cast<std::size_t>(std::min(block_size,
             state.total_size - offset));
         std::vector<std::byte> bytes;
+        const auto read_started_at = std::chrono::steady_clock::now();
         const auto read_error = file_writer_.read(offset, length, bytes);
+        record_latency_sample(session_.performance_metrics.latency.crc_sample_read.sample_count,
+            session_.performance_metrics.latency.crc_sample_read.total_time_ns,
+            session_.performance_metrics.latency.crc_sample_read.max_time_ns,
+            elapsed_ns(read_started_at));
         if (read_error) {
             continue;
         }
 
+        session_.performance_metrics.crc_sample_blocks_total.fetch_add(
+            1, std::memory_order_relaxed);
+        session_.performance_metrics.crc_sample_bytes_total.fetch_add(
+            static_cast<std::int64_t>(length), std::memory_order_relaxed);
         samples.push_back(core::BlockCrcSample{offset, core::crc32(bytes), length});
     }
 

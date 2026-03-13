@@ -29,6 +29,7 @@ void enqueue_data_packet(
     static_cast<void>(current_bytes);
     queue.enqueue(std::move(packet));
     session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    session.queued_bytes.fetch_add(static_cast<std::int64_t>(accounted), std::memory_order_relaxed);
 }
 
 bool wait_for_condition(const std::function<bool()>& predicate,
@@ -161,6 +162,70 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     static_cast<void>(removed);
 }
 
+TEST(PersistenceThreadTest, TracksQueuedBytesAcrossQueueIngressAndDequeue) {
+    asyncdownload::core::global_memory_accounting().reset();
+
+    const auto temp_root =
+        std::filesystem::temp_directory_path() / "asyncdownload_queue_bytes_tracking_test";
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    asyncdownload::DownloadOptions options{};
+    options.block_size = 4096;
+    options.io_alignment = 4096;
+    options.max_gap_bytes = 4096;
+    options.flush_threshold_bytes = 4096;
+    options.flush_interval = std::chrono::milliseconds(10);
+
+    asyncdownload::core::SessionState session{};
+    session.paths.output_path = temp_root / "output.bin";
+    session.paths.temporary_path = temp_root / "output.bin.part";
+    session.paths.metadata_path = temp_root / "output.bin.config.json";
+    session.url = "http://127.0.0.1/test.bin";
+    session.options = options;
+    session.total_size = 4096;
+    session.accept_ranges = true;
+
+    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    asyncdownload::core::AtomicBlockBitmap bitmap(
+        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+    asyncdownload::storage::FileWriter writer;
+    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
+    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread persistence(
+        session, queue, bitmap, writer, store, workers);
+
+    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
+    persistence.register_range(&range);
+    persistence.start();
+
+    asyncdownload::core::DataPacket packet{};
+    packet.kind = asyncdownload::core::PacketKind::data;
+    packet.range_id = 0;
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x7A);
+    enqueue_data_packet(queue, session, std::move(packet));
+
+    EXPECT_GT(session.queued_bytes.load(std::memory_order_relaxed), 0);
+    EXPECT_TRUE(wait_for_condition([&session]() {
+        return session.persisted_bytes.load(std::memory_order_acquire) == 4096 &&
+            session.queued_bytes.load(std::memory_order_acquire) == 0;
+    }, std::chrono::milliseconds(1000)));
+
+    persistence.stop();
+    persistence.join();
+    writer.close();
+
+    EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+}
+
 TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     asyncdownload::core::global_memory_accounting().reset();
 
@@ -216,6 +281,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     writer.close();
 
     EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(session.performance_metrics.latency.handle_data_packet.sample_count.load(
         std::memory_order_relaxed), 1U);
     EXPECT_GT(session.performance_metrics.latency.handle_data_packet.total_time_ns.load(
@@ -233,6 +299,26 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     EXPECT_EQ(session.performance_metrics.staged_write_flush_count.load(
         std::memory_order_relaxed), 0U);
     EXPECT_EQ(session.performance_metrics.staged_write_bytes_total.load(
+        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.performance_metrics.direct_append_packets_total.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.out_of_order_insert_packets_total.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.drained_ordered_packets_total.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_packets.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_bytes.load(
+        std::memory_order_relaxed), 0);
+    EXPECT_GE(session.performance_metrics.latency.metadata_snapshot.sample_count.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.latency.crc_sample_read.sample_count.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.latency.flush_pending_write.sample_count.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.crc_sample_blocks_total.load(
+        std::memory_order_relaxed), 0U);
+    EXPECT_EQ(session.performance_metrics.crc_sample_bytes_total.load(
         std::memory_order_relaxed), 0);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
@@ -315,9 +401,20 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     writer.close();
 
     EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(bitmap.load(0), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(1), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(2), asyncdownload::core::BlockState::finished);
+    EXPECT_EQ(session.performance_metrics.direct_append_packets_total.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.out_of_order_insert_packets_total.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.drained_ordered_packets_total.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_packets.load(
+        std::memory_order_relaxed), 1U);
+    EXPECT_GT(session.performance_metrics.out_of_order_queue_peak_bytes.load(
+        std::memory_order_relaxed), 0);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);

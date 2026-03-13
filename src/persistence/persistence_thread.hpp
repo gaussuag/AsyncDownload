@@ -103,6 +103,8 @@ private:
     std::future<std::error_code> pending_flush_;
     std::chrono::steady_clock::time_point last_flush_time_{std::chrono::steady_clock::now()};
     std::size_t bytes_since_flush_ = 0;
+    std::size_t current_out_of_order_packets_ = 0;
+    std::int64_t current_out_of_order_bytes_ = 0;
     mutable std::mutex error_mutex_;
     std::error_code error_;
     bool stopping_ = false;

@@ -71,9 +71,22 @@ struct PerformanceSummary : performance::SummaryDirectPerformanceMetrics {
     double average_disk_bytes_per_second = 0.0;
     std::size_t ranges_total = 0;
     double average_packet_size_bytes = 0.0;
+    double queue_full_pause_avg_ms = 0.0;
+    double queue_full_pause_max_ms = 0.0;
+    double memory_pause_avg_ms = 0.0;
+    double memory_pause_max_ms = 0.0;
+    double queue_resume_blocked_by_memory_avg_ms = 0.0;
+    double queue_resume_blocked_by_memory_max_ms = 0.0;
+    double queue_full_pause_start_queued_packets_avg = 0.0;
+    double queue_full_pause_start_queued_bytes_avg = 0.0;
+    double memory_pause_start_queued_packets_avg = 0.0;
+    double memory_pause_start_queued_bytes_avg = 0.0;
     performance::LatencySummarySampleMetrics<std::size_t, double> handle_data_packet{};
     performance::LatencySummarySampleMetrics<std::size_t, double> append_bytes{};
     performance::LatencySummarySampleMetrics<std::size_t, double> file_write{};
+    performance::LatencySummarySampleMetrics<std::size_t, double> metadata_snapshot{};
+    performance::LatencySummarySampleMetrics<std::size_t, double> crc_sample_read{};
+    performance::LatencySummarySampleMetrics<std::size_t, double> flush_pending_write{};
 };
 
 struct DownloadRequest {

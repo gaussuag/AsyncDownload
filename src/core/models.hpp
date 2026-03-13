@@ -165,6 +165,10 @@ struct SessionState {
     std::atomic<std::int64_t> vdl_offset{0};
     // queued_packets 用于进度和背压观测，表示还有多少包在持久化链路里等待处理。
     std::atomic<std::size_t> queued_packets{0};
+    // queued_bytes 表示 network -> persistence 队列里按 accounted_bytes 统计的积压体量。
+    std::atomic<std::int64_t> queued_bytes{0};
+    std::atomic<std::size_t> queue_paused_handles{0};
+    std::atomic<std::size_t> memory_paused_handles{0};
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
     ProgressCallback progress_callback{};

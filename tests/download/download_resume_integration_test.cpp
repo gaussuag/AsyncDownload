@@ -131,20 +131,41 @@ std::filesystem::path get_workspace_root() {
 }
 
 std::filesystem::path get_cli_path() {
-    const auto from_test_bin =
-        get_test_executable_path().parent_path().parent_path().parent_path() /
-        "src" / "Debug" / "AsyncDownload.exe";
+    const auto test_executable = get_test_executable_path();
+    const auto configuration = test_executable.parent_path().filename();
+    const auto build_root = test_executable.parent_path().parent_path().parent_path();
+    const auto from_test_bin = build_root / "src" / configuration / "AsyncDownload.exe";
     if (std::filesystem::exists(from_test_bin)) {
         return from_test_bin;
     }
 
-    const auto from_workspace = get_workspace_root() / "build" / "src" / "Debug" /
+    const auto from_workspace = get_workspace_root() / "build" / "src" / configuration /
         "AsyncDownload.exe";
     if (std::filesystem::exists(from_workspace)) {
         return from_workspace;
     }
 
-    return from_test_bin;
+    const auto release_fallback = get_workspace_root() / "build" / "src" / "Release" /
+        "AsyncDownload.exe";
+    if (std::filesystem::exists(release_fallback)) {
+        return release_fallback;
+    }
+
+    const auto debug_fallback = get_workspace_root() / "build" / "src" / "Debug" /
+        "AsyncDownload.exe";
+    if (std::filesystem::exists(debug_fallback)) {
+        return debug_fallback;
+    }
+
+    return from_workspace;
+}
+
+std::filesystem::path make_unique_temp_root(const std::string_view prefix) {
+    const auto ticks = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return std::filesystem::temp_directory_path() /
+        (std::string(prefix) + "_" + std::to_string(GetCurrentProcessId()) + "_" +
+            std::to_string(ticks));
 }
 
 DWORD g_last_start_process_error = 0;
@@ -491,8 +512,7 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     GTEST_SKIP() << "This integration test currently uses Windows process control.";
 #else
     const auto workspace_root = get_workspace_root();
-    const auto temp_root =
-        std::filesystem::temp_directory_path() / "asyncdownload_cli_config_integration";
+    const auto temp_root = make_unique_temp_root("asyncdownload_cli_config_integration");
     std::error_code ec;
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -503,7 +523,9 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     const auto output_file = temp_root / "downloaded.bin";
     const auto summary_file = temp_root / "summary.txt";
     const auto config_file = temp_root / "download_options.json";
+    const auto cli_path = get_cli_path();
     write_test_file(source_file, 8 * 1024 * 1024);
+    ASSERT_TRUE(std::filesystem::exists(cli_path));
 
     {
         std::ofstream stream(config_file, std::ios::binary | std::ios::trunc);
@@ -529,22 +551,19 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     ASSERT_FALSE(port_line.empty());
 
     ChildProcess cli;
-    const auto cli_path = get_cli_path();
-    ASSERT_TRUE(std::filesystem::exists(cli_path));
     const auto url = std::string("http://127.0.0.1:") + port_line + "/source.bin";
     const auto cli_command = quote_arg(cli_path.wstring()) + L" " +
         quote_arg(std::wstring(url.begin(), url.end())) + L" " +
         quote_arg(output_file.wstring()) + L" --config " +
         quote_arg(config_file.wstring()) + L" --summary-file " +
         quote_arg(summary_file.wstring());
-    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, true));
+    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, false));
     ASSERT_EQ(cli.wait(20000), WAIT_OBJECT_0);
-    const auto output = read_all_from_pipe(cli.stdout_read);
     const auto exit_code = cli.exit_code();
     cli.close();
     stop_child(server, 0);
 
-    ASSERT_EQ(exit_code, 0U) << output;
+    ASSERT_EQ(exit_code, 0U);
     ASSERT_TRUE(std::filesystem::exists(output_file));
     ASSERT_TRUE(files_equal(source_file, output_file));
 
@@ -800,8 +819,7 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     GTEST_SKIP() << "This integration test currently uses Windows process control.";
 #else
     const auto workspace_root = get_workspace_root();
-    const auto temp_root =
-        std::filesystem::temp_directory_path() / "asyncdownload_progress_snapshot_integration";
+    const auto temp_root = make_unique_temp_root("asyncdownload_progress_snapshot_integration");
     std::error_code ec;
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -816,7 +834,7 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     const auto script_path = workspace_root / "tests" / "support" / "range_server.py";
     const auto server_command = quote_arg(L"python") + L" " +
         quote_arg(script_path.wstring()) + L" " +
-        quote_arg(source_file.wstring()) + L" --port 0 --chunk-size 65536 --delay-ms 15";
+        quote_arg(source_file.wstring()) + L" --port 0 --chunk-size 65536 --delay-ms 0";
     ASSERT_TRUE(start_process(server, L"", server_command, workspace_root, true));
 
     const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
@@ -856,13 +874,38 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     EXPECT_GT(result.performance.max_memory_bytes, 0U);
     EXPECT_GT(result.performance.max_inflight_bytes, 0);
     EXPECT_GT(result.performance.max_queued_packets, 0U);
+    EXPECT_GT(result.performance.max_queued_bytes, 0);
     EXPECT_GT(result.performance.max_active_requests, 0U);
+    EXPECT_GE(result.performance.memory_pause_count, 0U);
+    EXPECT_GE(result.performance.queue_full_pause_count, 0U);
+    EXPECT_GE(result.performance.queue_full_pause_capacity_reached_count, 0U);
+    EXPECT_GE(result.performance.queue_full_pause_try_enqueue_failure_count, 0U);
+    EXPECT_GE(result.performance.max_queue_paused_handles, 0U);
+    EXPECT_GE(result.performance.max_memory_paused_handles, 0U);
+    EXPECT_GE(result.performance.queue_full_resume_count, 0U);
+    EXPECT_GE(result.performance.memory_resume_count, 0U);
     EXPECT_GT(result.performance.windows_total, 0U);
     EXPECT_GT(result.performance.ranges_total, 0U);
     EXPECT_GT(result.performance.write_callback_calls, 0U);
     EXPECT_GT(result.performance.packets_enqueued_total, 0U);
     EXPECT_GT(result.performance.average_packet_size_bytes, 0.0);
     EXPECT_GT(result.performance.max_packet_size_bytes, 0U);
+    EXPECT_GE(result.performance.queue_full_pause_start_queued_packets_total, 0U);
+    EXPECT_GE(result.performance.queue_full_pause_start_queued_bytes_total, 0);
+    EXPECT_GE(result.performance.memory_pause_start_queued_packets_total, 0U);
+    EXPECT_GE(result.performance.memory_pause_start_queued_bytes_total, 0);
+    EXPECT_GE(result.performance.queue_full_pause_avg_ms, 0.0);
+    EXPECT_GE(result.performance.queue_full_pause_max_ms, 0.0);
+    EXPECT_GE(result.performance.memory_pause_avg_ms, 0.0);
+    EXPECT_GE(result.performance.memory_pause_max_ms, 0.0);
+    EXPECT_GE(result.performance.queue_full_pause_start_queued_packets_avg, 0.0);
+    EXPECT_GE(result.performance.queue_full_pause_start_queued_bytes_avg, 0.0);
+    EXPECT_GE(result.performance.memory_pause_start_queued_packets_avg, 0.0);
+    EXPECT_GE(result.performance.memory_pause_start_queued_bytes_avg, 0.0);
+    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_count, 0U);
+    EXPECT_GE(result.performance.queue_pause_overlap_memory_count, 0U);
+    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_avg_ms, 0.0);
+    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_max_ms, 0.0);
     EXPECT_GE(result.performance.write_callback_calls,
         result.performance.packets_enqueued_total);
     EXPECT_GE(static_cast<double>(result.performance.max_packet_size_bytes),

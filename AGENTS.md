@@ -78,6 +78,14 @@ scripts\build.bat
 - Use `std::optional` instead of sentinel values
 - Use `[[nodiscard]]` for functions that must not be ignored
 
+### Third-Party Library Understanding Rule
+- When behavior, correctness, performance, capacity, allocation, retry, or failure handling depends on a third-party library, do not infer semantics only from API names, surface behavior, examples, or memory.
+- If the third-party library source code is available in the repository or can be inspected locally, read the relevant implementation before finalizing the conclusion or proposing a fix.
+- If the source code is not available, read the official documentation, contract, or vendor reference before finalizing the conclusion or proposing a fix.
+- Before writing a conclusion, identify the concrete condition that caused the observed behavior, such as the exact branch, return path, allocation rule, capacity rule, or documented contract boundary.
+- Do not treat results such as `false`, timeout, retry, queue full, or partial success as self-explanatory root causes until the underlying third-party rule has been verified from source or official documentation.
+- If only observation-level evidence is available, record it as an open question or intermediate finding first, then continue the analysis until the third-party usage or contract is understood.
+
 ### Error Handling
 - Return error codes (0 for success, non-zero for failure)
 - Use `std::error_code` for complex error handling

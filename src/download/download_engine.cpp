@@ -32,6 +32,7 @@ namespace asyncdownload::download {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using DataQueue = moodycamel::BlockingConcurrentQueue<core::DataPacket>;
 
 [[nodiscard]] double average_sampled_us(const std::size_t sample_count,
                                         const std::int64_t total_ns) noexcept {
@@ -45,12 +46,31 @@ using Clock = std::chrono::steady_clock;
     return static_cast<double>(std::max<std::int64_t>(0, max_ns)) / 1000.0;
 }
 
+[[nodiscard]] double average_sampled_ms(const std::size_t sample_count,
+                                        const std::int64_t total_ns) noexcept {
+    if (sample_count == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(total_ns) / static_cast<double>(sample_count) / 1000000.0;
+}
+
+[[nodiscard]] double sampled_max_ms(const std::int64_t max_ns) noexcept {
+    return static_cast<double>(std::max<std::int64_t>(0, max_ns)) / 1000000.0;
+}
+
+enum class QueuePauseTrigger {
+    none = 0,
+    capacity_reached = 1,
+    try_enqueue_failure = 2
+};
+
 struct TransferHandle {
     // TransferHandle 代表一个可复用的 easy handle 槽位。
     // 它既保存 libcurl 句柄，也保存当前绑定到哪个 range/window，以及暂停原因、
     // 响应码、速度等运行期状态。
     core::SessionState* session = nullptr;
-    moodycamel::BlockingConcurrentQueue<core::DataPacket>* data_queue = nullptr;
+    DataQueue* data_queue = nullptr;
+    DataQueue::producer_token_t* data_queue_producer = nullptr;
     CURL* easy = nullptr;
     core::RangeContext* range = nullptr;
     std::string range_header;
@@ -63,8 +83,15 @@ struct TransferHandle {
     bool in_multi = false;
     bool paused_by_memory = false;
     bool paused_by_gap = false;
+    bool paused_by_window_boundary = false;
+    bool queue_pause_active = false;
+    bool queue_pause_overlap_recorded = false;
     CURLcode curl_result = CURLE_OK;
     Clock::time_point request_started{};
+    Clock::time_point queue_pause_started_at{};
+    Clock::time_point memory_pause_started_at{};
+    Clock::time_point queue_resume_blocked_by_memory_started_at{};
+    QueuePauseTrigger last_queue_pause_trigger = QueuePauseTrigger::none;
     std::int64_t buffered_offset = 0;
     std::size_t buffered_accounted_bytes = 0;
     std::vector<std::uint8_t> buffered_payload;
@@ -103,6 +130,8 @@ void update_peak(std::atomic<T>& target, const T value) noexcept {
     }
 }
 
+void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept;
+
 void maybe_record_relative_time_ms(std::atomic<std::int64_t>& target,
                                    const core::SessionState& session,
                                    const Clock::time_point now) noexcept {
@@ -114,6 +143,174 @@ void maybe_record_relative_time_ms(std::atomic<std::int64_t>& target,
         elapsed_ms,
         std::memory_order_release,
         std::memory_order_relaxed);
+}
+
+[[nodiscard]] bool has_timestamp(const Clock::time_point timestamp) noexcept {
+    return timestamp.time_since_epoch().count() != 0;
+}
+
+template <typename CountField, typename TimeField>
+void record_sample_duration(std::atomic<CountField>& sample_count,
+                            std::atomic<TimeField>& total_time_ns,
+                            std::atomic<TimeField>& max_time_ns,
+                            const Clock::time_point started_at) noexcept {
+    if (!has_timestamp(started_at)) {
+        return;
+    }
+
+    const auto elapsed = std::max<std::int64_t>(0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - started_at).count());
+    sample_count.fetch_add(1, std::memory_order_relaxed);
+    total_time_ns.fetch_add(static_cast<TimeField>(elapsed), std::memory_order_relaxed);
+    update_peak(max_time_ns, static_cast<TimeField>(elapsed));
+}
+
+void update_transfer_pause_state(TransferHandle& transfer) noexcept {
+    if (transfer.range == nullptr) {
+        return;
+    }
+
+    transfer.range->pause_for_memory.store(transfer.paused_by_memory, std::memory_order_release);
+    if (transfer.paused_by_memory ||
+        transfer.paused_by_gap ||
+        transfer.paused_by_window_boundary ||
+        transfer.queue_pause_active) {
+        mark_range_status(*transfer.range, core::RangeStatus::paused);
+        return;
+    }
+
+    mark_range_status(*transfer.range, core::RangeStatus::downloading);
+}
+
+void clear_queue_resume_blocked_by_memory(TransferHandle& transfer,
+                                          const bool record_sample) noexcept {
+    if (!has_timestamp(transfer.queue_resume_blocked_by_memory_started_at)) {
+        return;
+    }
+
+    if (record_sample) {
+        record_sample_duration(
+            transfer.session->performance_metrics.pause_duration
+                .queue_resume_blocked_by_memory_duration.sample_count,
+            transfer.session->performance_metrics.pause_duration
+                .queue_resume_blocked_by_memory_duration.total_time_ns,
+            transfer.session->performance_metrics.pause_duration
+                .queue_resume_blocked_by_memory_duration.max_time_ns,
+            transfer.queue_resume_blocked_by_memory_started_at);
+    }
+
+    transfer.queue_resume_blocked_by_memory_started_at = {};
+}
+
+void start_queue_pause(TransferHandle& transfer) noexcept {
+    if (transfer.range == nullptr) {
+        return;
+    }
+
+    transfer.paused_by_window_boundary = false;
+    if (!transfer.queue_pause_active) {
+        transfer.queue_pause_active = true;
+        transfer.queue_pause_started_at = Clock::now();
+        transfer.queue_pause_overlap_recorded = false;
+        transfer.session->performance_metrics.queue_full_pause_count.fetch_add(
+            1, std::memory_order_relaxed);
+        if (transfer.last_queue_pause_trigger == QueuePauseTrigger::capacity_reached) {
+            transfer.session->performance_metrics.queue_full_pause_capacity_reached_count.fetch_add(
+                1, std::memory_order_relaxed);
+        } else if (transfer.last_queue_pause_trigger == QueuePauseTrigger::try_enqueue_failure) {
+            transfer.session->performance_metrics
+                .queue_full_pause_try_enqueue_failure_count.fetch_add(
+                    1, std::memory_order_relaxed);
+        }
+        transfer.session->performance_metrics.queue_full_pause_start_queued_packets_total.fetch_add(
+            transfer.session->queued_packets.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        transfer.session->performance_metrics.queue_full_pause_start_queued_bytes_total.fetch_add(
+            transfer.session->queued_bytes.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        const auto paused_handles = transfer.session->queue_paused_handles.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        update_peak(transfer.session->performance_metrics.max_queue_paused_handles, paused_handles);
+    }
+
+    update_transfer_pause_state(transfer);
+}
+
+void finish_queue_pause(TransferHandle& transfer, const bool resumed) noexcept {
+    if (!transfer.queue_pause_active) {
+        return;
+    }
+
+    transfer.queue_pause_active = false;
+    if (transfer.session->queue_paused_handles.load(std::memory_order_relaxed) > 0) {
+        transfer.session->queue_paused_handles.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (resumed) {
+        transfer.session->performance_metrics.queue_full_resume_count.fetch_add(
+            1, std::memory_order_relaxed);
+        record_sample_duration(
+            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.sample_count,
+            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.total_time_ns,
+            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.max_time_ns,
+            transfer.queue_pause_started_at);
+    }
+    clear_queue_resume_blocked_by_memory(transfer, resumed);
+    transfer.queue_pause_started_at = {};
+    transfer.queue_pause_overlap_recorded = false;
+    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
+    update_transfer_pause_state(transfer);
+}
+
+void start_memory_pause(TransferHandle& transfer) noexcept {
+    if (transfer.range == nullptr) {
+        return;
+    }
+
+    if (!transfer.paused_by_memory) {
+        transfer.paused_by_memory = true;
+        transfer.memory_pause_started_at = Clock::now();
+        transfer.session->performance_metrics.memory_pause_count.fetch_add(
+            1, std::memory_order_relaxed);
+        transfer.session->performance_metrics.memory_pause_start_queued_packets_total.fetch_add(
+            transfer.session->queued_packets.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        transfer.session->performance_metrics.memory_pause_start_queued_bytes_total.fetch_add(
+            transfer.session->queued_bytes.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        const auto paused_handles = transfer.session->memory_paused_handles.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        update_peak(transfer.session->performance_metrics.max_memory_paused_handles, paused_handles);
+        if (transfer.queue_pause_active && !transfer.queue_pause_overlap_recorded) {
+            transfer.queue_pause_overlap_recorded = true;
+            transfer.session->performance_metrics.queue_pause_overlap_memory_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    update_transfer_pause_state(transfer);
+}
+
+void finish_memory_pause(TransferHandle& transfer, const bool resumed) noexcept {
+    if (!transfer.paused_by_memory) {
+        return;
+    }
+
+    transfer.paused_by_memory = false;
+    if (transfer.session->memory_paused_handles.load(std::memory_order_relaxed) > 0) {
+        transfer.session->memory_paused_handles.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (resumed) {
+        transfer.session->performance_metrics.memory_resume_count.fetch_add(
+            1, std::memory_order_relaxed);
+        record_sample_duration(
+            transfer.session->performance_metrics.pause_duration.memory_pause_duration.sample_count,
+            transfer.session->performance_metrics.pause_duration.memory_pause_duration.total_time_ns,
+            transfer.session->performance_metrics.pause_duration.memory_pause_duration.max_time_ns,
+            transfer.memory_pause_started_at);
+    }
+    transfer.memory_pause_started_at = {};
+    update_transfer_pause_state(transfer);
 }
 
 void update_progress_rates(core::SessionState& session,
@@ -208,6 +405,8 @@ void invoke_progress(core::SessionState& session,
     update_peak(session.performance_metrics.max_memory_bytes, snapshot.memory_bytes);
     update_peak(session.performance_metrics.max_inflight_bytes, snapshot.inflight_bytes);
     update_peak(session.performance_metrics.max_queued_packets, snapshot.queued_packets);
+    update_peak(session.performance_metrics.max_queued_bytes,
+        session.queued_bytes.load(std::memory_order_relaxed));
     update_peak(session.performance_metrics.max_active_requests, snapshot.active_requests);
     update_progress_rates(session, snapshot);
 
@@ -361,7 +560,8 @@ void rollback_inflight_window(TransferHandle& transfer) noexcept {
     }
 }
 
-void enqueue_control_packet(moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue,
+void enqueue_control_packet(DataQueue& data_queue,
+                            DataQueue::producer_token_t& data_queue_producer,
                             core::SessionState& session,
                             const core::PacketKind kind,
                             const std::size_t range_id) {
@@ -370,7 +570,7 @@ void enqueue_control_packet(moodycamel::BlockingConcurrentQueue<core::DataPacket
     core::DataPacket packet{};
     packet.kind = kind;
     packet.range_id = range_id;
-    data_queue.enqueue(std::move(packet));
+    data_queue.enqueue(data_queue_producer, std::move(packet));
     const auto queued = session.queued_packets.fetch_add(1, std::memory_order_relaxed) + 1;
     update_peak(session.performance_metrics.max_queued_packets, queued);
 }
@@ -464,16 +664,27 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     packet.accounted_bytes = transfer.buffered_accounted_bytes;
     update_peak(transfer.session->performance_metrics.max_packet_size_bytes, packet.payload.size());
 
-    if (!transfer.data_queue->try_enqueue(std::move(packet))) {
+    if (!transfer.data_queue->try_enqueue(*transfer.data_queue_producer, std::move(packet))) {
+        if (transfer.session->queued_packets.load(std::memory_order_relaxed) >=
+            transfer.session->options.queue_capacity_packets) {
+            transfer.last_queue_pause_trigger = QueuePauseTrigger::capacity_reached;
+        } else {
+            transfer.last_queue_pause_trigger = QueuePauseTrigger::try_enqueue_failure;
+        }
         transfer.buffered_payload = std::move(packet.payload);
         return false;
     }
 
+    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     transfer.session->performance_metrics.packets_enqueued_total.fetch_add(
         1, std::memory_order_relaxed);
     const auto queued = transfer.session->queued_packets.fetch_add(
         1, std::memory_order_relaxed) + 1;
+    const auto queued_bytes = transfer.session->queued_bytes.fetch_add(
+        static_cast<std::int64_t>(packet.accounted_bytes), std::memory_order_relaxed) +
+        static_cast<std::int64_t>(packet.accounted_bytes);
     update_peak(transfer.session->performance_metrics.max_queued_packets, queued);
+    update_peak(transfer.session->performance_metrics.max_queued_bytes, queued_bytes);
     const auto downloaded = transfer.session->downloaded_bytes.fetch_add(
         static_cast<std::int64_t>(packet_size), std::memory_order_relaxed) +
         static_cast<std::int64_t>(packet_size);
@@ -524,8 +735,15 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     transfer.speed_bytes_per_second = 0.0;
     transfer.paused_by_memory = false;
     transfer.paused_by_gap = false;
+    transfer.paused_by_window_boundary = false;
+    transfer.queue_pause_active = false;
+    transfer.queue_pause_overlap_recorded = false;
     transfer.curl_result = CURLE_OK;
     transfer.request_started = Clock::now();
+    transfer.queue_pause_started_at = {};
+    transfer.memory_pause_started_at = {};
+    transfer.queue_resume_blocked_by_memory_started_at = {};
+    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     transfer.range_header.clear();
     reset_transfer_buffer(transfer);
     if (transfer.buffered_payload.capacity() < kAggregatedPacketBytes) {
@@ -560,25 +778,18 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         const auto remaining = current->request_end - current->next_offset + 1;
         if (remaining <= 0) {
             if (!current->buffered_payload.empty() && !flush_transfer_buffer(*current)) {
-                if (!current->paused_by_memory) {
-                    current->session->performance_metrics.queue_full_pause_count.fetch_add(1,
-                        std::memory_order_relaxed);
-                }
-                current->paused_by_memory = true;
-                current->range->pause_for_memory.store(true, std::memory_order_release);
-                mark_range_status(*current->range, core::RangeStatus::paused);
+                start_queue_pause(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
 
             // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
             // 就暂停接收，避免把后续字节算进错误的区间。
-            if (!current->paused_by_memory) {
+            if (!current->paused_by_window_boundary) {
                 current->session->performance_metrics.window_boundary_pause_count.fetch_add(1,
                     std::memory_order_relaxed);
             }
-            current->paused_by_memory = true;
-            current->range->pause_for_memory.store(true, std::memory_order_release);
-            mark_range_status(*current->range, core::RangeStatus::paused);
+            current->paused_by_window_boundary = true;
+            update_transfer_pause_state(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
 
@@ -592,13 +803,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         if (!current->buffered_payload.empty() &&
             current->buffered_payload.size() + allowed > kAggregatedPacketBytes &&
             !flush_transfer_buffer(*current)) {
-            if (!current->paused_by_memory) {
-                current->session->performance_metrics.queue_full_pause_count.fetch_add(1,
-                    std::memory_order_relaxed);
-            }
-            current->paused_by_memory = true;
-            current->range->pause_for_memory.store(true, std::memory_order_release);
-            mark_range_status(*current->range, core::RangeStatus::paused);
+            start_queue_pause(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
 
@@ -612,13 +817,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
                 current->session->options.backpressure_high_bytes)) {
             // 这里不阻塞等待队列腾空间，而是立刻 pause 当前 easy handle，
             // 把“什么时候恢复”交回给事件循环中的统一背压逻辑。
-            if (!current->paused_by_memory) {
-                current->session->performance_metrics.memory_pause_count.fetch_add(
-                    1, std::memory_order_relaxed);
-            }
-            current->paused_by_memory = true;
-            current->range->pause_for_memory.store(true, std::memory_order_release);
-            mark_range_status(*current->range, core::RangeStatus::paused);
+            start_memory_pause(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
 
@@ -661,29 +860,65 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
 }
 
 void resume_paused_transfers(std::vector<TransferHandle>& handles,
+                             const std::size_t queue_capacity_packets,
                              const std::size_t low_watermark) noexcept {
-    if (core::global_memory_accounting().current_bytes() > low_watermark) {
-        return;
-    }
+    const auto current_bytes = core::global_memory_accounting().current_bytes();
 
     // 只有内存真正回落到低水位以下才统一恢复，避免高低水位附近的抖动导致
-    // handle 在 pause/continue 之间来回震荡。
+    // handle 在 pause/continue 之间来回震荡。queue-full pause 也继续沿用这条
+    // 统一恢复门槛，只是在这里额外把“queue 已可恢复但被 memory 挡住”的时间记下来。
     for (auto& handle : handles) {
-        if (!handle.in_multi || !handle.paused_by_memory) {
+        if (!handle.in_multi) {
             continue;
         }
 
-        handle.paused_by_memory = false;
+        auto queue_can_resume = false;
+        const auto queue_ready = handle.queue_pause_active &&
+            handle.session->queued_packets.load(std::memory_order_relaxed) < queue_capacity_packets;
+        if (handle.queue_pause_active) {
+            if (!queue_ready) {
+                clear_queue_resume_blocked_by_memory(handle, true);
+            } else if (current_bytes > low_watermark) {
+                if (!has_timestamp(handle.queue_resume_blocked_by_memory_started_at)) {
+                    handle.queue_resume_blocked_by_memory_started_at = Clock::now();
+                    handle.session->performance_metrics.queue_resume_blocked_by_memory_count.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                continue;
+            } else {
+                queue_can_resume = true;
+            }
+        }
+
+        if (handle.paused_by_memory && current_bytes > low_watermark) {
+            continue;
+        }
+
+        auto resumed_any = false;
+        if (handle.paused_by_memory) {
+            finish_memory_pause(handle, true);
+            resumed_any = true;
+        }
+        if (queue_can_resume) {
+            finish_queue_pause(handle, true);
+            resumed_any = true;
+        }
+
         if (handle.range != nullptr) {
-            handle.range->pause_for_memory.store(false, std::memory_order_release);
-            if (handle.range->pause_for_gap.load(std::memory_order_acquire)) {
+            if (handle.range->pause_for_gap.load(std::memory_order_acquire) ||
+                handle.queue_pause_active ||
+                handle.paused_by_memory ||
+                handle.paused_by_window_boundary) {
+                update_transfer_pause_state(handle);
                 continue;
             }
 
-            mark_range_status(*handle.range, core::RangeStatus::downloading);
+            update_transfer_pause_state(handle);
         }
 
-        curl_easy_pause(handle.easy, CURLPAUSE_CONT);
+        if (resumed_any) {
+            curl_easy_pause(handle.easy, CURLPAUSE_CONT);
+        }
     }
 }
 
@@ -700,12 +935,14 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
             handle.session->performance_metrics.gap_pause_count.fetch_add(
                 1, std::memory_order_relaxed);
             handle.paused_by_gap = true;
-            mark_range_status(*handle.range, core::RangeStatus::paused);
+            update_transfer_pause_state(handle);
             curl_easy_pause(handle.easy, CURLPAUSE_RECV);
         } else if (!pause_for_gap && handle.paused_by_gap) {
             handle.paused_by_gap = false;
-            if (!handle.paused_by_memory) {
-                mark_range_status(*handle.range, core::RangeStatus::downloading);
+            if (!handle.paused_by_memory &&
+                !handle.queue_pause_active &&
+                !handle.paused_by_window_boundary) {
+                update_transfer_pause_state(handle);
                 curl_easy_pause(handle.easy, CURLPAUSE_CONT);
             }
         }
@@ -723,7 +960,8 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     // 内存红线被踩中后，不是把所有连接一刀切暂停，而是优先暂停当前最快的那部分，
     // 让整体积压回落得更快。
     for (auto& handle : handles) {
-        if (!handle.in_multi || handle.paused_by_memory || handle.range == nullptr) {
+        if (!handle.in_multi || handle.paused_by_memory || handle.range == nullptr ||
+            handle.paused_by_window_boundary) {
             continue;
         }
 
@@ -742,13 +980,7 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     const auto pause_count = std::max<std::size_t>(1, (active.size() + 4) / 5);
     for (std::size_t index = 0; index < pause_count && index < active.size(); ++index) {
         auto* handle = active[index];
-        if (!handle->paused_by_memory) {
-            handle->session->performance_metrics.memory_pause_count.fetch_add(
-                1, std::memory_order_relaxed);
-        }
-        handle->paused_by_memory = true;
-        handle->range->pause_for_memory.store(true, std::memory_order_release);
-        mark_range_status(*handle->range, core::RangeStatus::paused);
+        start_memory_pause(*handle);
         curl_easy_pause(handle->easy, CURLPAUSE_RECV);
     }
 }
@@ -789,8 +1021,11 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
         return make_error_code(DownloadErrc::http_transfer_failed);
     }
 
-    transfer.range->pause_for_memory.store(false, std::memory_order_release);
     transfer.range->pause_for_gap.store(false, std::memory_order_release);
+    finish_queue_pause(transfer, false);
+    finish_memory_pause(transfer, false);
+    transfer.paused_by_window_boundary = false;
+    update_transfer_pause_state(transfer);
 
     const auto next_start = transfer.range->current_offset.load(std::memory_order_acquire);
     const auto end = transfer.range->end_offset.load(std::memory_order_acquire);
@@ -802,7 +1037,10 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     } else if (!transfer.range->completion_notified.exchange(true, std::memory_order_acq_rel)) {
         // 真正的 finished 由 Persistence 线程在 flush tail 后确认；
         // Orchestrator 这里只负责发一个“网络阶段已完成”的控制消息。
-        enqueue_control_packet(data_queue, session, core::PacketKind::range_complete,
+        enqueue_control_packet(data_queue,
+            *transfer.data_queue_producer,
+            session,
+            core::PacketKind::range_complete,
             transfer.range->range_id);
     }
 
@@ -810,6 +1048,13 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_memory = false;
+    transfer.paused_by_window_boundary = false;
+    transfer.queue_pause_active = false;
+    transfer.queue_pause_overlap_recorded = false;
+    transfer.queue_pause_started_at = {};
+    transfer.memory_pause_started_at = {};
+    transfer.queue_resume_blocked_by_memory_started_at = {};
+    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     reset_transfer_buffer(transfer);
     return {};
 }
@@ -820,12 +1065,22 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
         transfer.in_multi = false;
     }
 
+    finish_queue_pause(transfer, false);
+    finish_memory_pause(transfer, false);
+    transfer.paused_by_window_boundary = false;
     // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
     // 不销毁底层 easy 对象本身。
     transfer.range = nullptr;
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_memory = false;
+    transfer.paused_by_window_boundary = false;
+    transfer.queue_pause_active = false;
+    transfer.queue_pause_overlap_recorded = false;
+    transfer.queue_pause_started_at = {};
+    transfer.memory_pause_started_at = {};
+    transfer.queue_resume_blocked_by_memory_started_at = {};
+    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     reset_transfer_buffer(transfer);
 }
 
@@ -901,12 +1156,58 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
             static_cast<double>(summary.packets_enqueued_total);
     }
     summary.ranges_total = ranges_total;
+    summary.queue_full_pause_avg_ms = average_sampled_ms(
+        session.performance_metrics.pause_duration.queue_full_pause_duration.sample_count.load(
+            std::memory_order_relaxed),
+        session.performance_metrics.pause_duration.queue_full_pause_duration.total_time_ns.load(
+            std::memory_order_relaxed));
+    summary.queue_full_pause_max_ms = sampled_max_ms(
+        session.performance_metrics.pause_duration.queue_full_pause_duration.max_time_ns.load(
+            std::memory_order_relaxed));
+    summary.memory_pause_avg_ms = average_sampled_ms(
+        session.performance_metrics.pause_duration.memory_pause_duration.sample_count.load(
+            std::memory_order_relaxed),
+        session.performance_metrics.pause_duration.memory_pause_duration.total_time_ns.load(
+            std::memory_order_relaxed));
+    summary.memory_pause_max_ms = sampled_max_ms(
+        session.performance_metrics.pause_duration.memory_pause_duration.max_time_ns.load(
+            std::memory_order_relaxed));
+    summary.queue_resume_blocked_by_memory_avg_ms = average_sampled_ms(
+        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
+            .sample_count.load(std::memory_order_relaxed),
+        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
+            .total_time_ns.load(std::memory_order_relaxed));
+    summary.queue_resume_blocked_by_memory_max_ms = sampled_max_ms(
+        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
+            .max_time_ns.load(std::memory_order_relaxed));
+    if (summary.queue_full_pause_count > 0) {
+        summary.queue_full_pause_start_queued_packets_avg =
+            static_cast<double>(summary.queue_full_pause_start_queued_packets_total) /
+            static_cast<double>(summary.queue_full_pause_count);
+        summary.queue_full_pause_start_queued_bytes_avg =
+            static_cast<double>(summary.queue_full_pause_start_queued_bytes_total) /
+            static_cast<double>(summary.queue_full_pause_count);
+    }
+    if (summary.memory_pause_count > 0) {
+        summary.memory_pause_start_queued_packets_avg =
+            static_cast<double>(summary.memory_pause_start_queued_packets_total) /
+            static_cast<double>(summary.memory_pause_count);
+        summary.memory_pause_start_queued_bytes_avg =
+            static_cast<double>(summary.memory_pause_start_queued_bytes_total) /
+            static_cast<double>(summary.memory_pause_count);
+    }
     performance::summarize_latency_sample(summary.handle_data_packet,
         session.performance_metrics.latency.handle_data_packet);
     performance::summarize_latency_sample(summary.append_bytes,
         session.performance_metrics.latency.append_bytes);
     performance::summarize_latency_sample(summary.file_write,
         session.performance_metrics.latency.file_write);
+    performance::summarize_latency_sample(summary.metadata_snapshot,
+        session.performance_metrics.latency.metadata_snapshot);
+    performance::summarize_latency_sample(summary.crc_sample_read,
+        session.performance_metrics.latency.crc_sample_read);
+    performance::summarize_latency_sample(summary.flush_pending_write,
+        session.performance_metrics.latency.flush_pending_write);
     return summary;
 }
 
@@ -1101,8 +1402,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         // 网络层只负责产出 DataPacket；真正写盘、重排、flush 和 metadata 更新
         // 全都交给独占的 PersistenceThread。
-        moodycamel::BlockingConcurrentQueue<core::DataPacket> data_queue(
-            session.options.queue_capacity_packets);
+        constexpr std::size_t kQueueExplicitProducers = 1;
+        constexpr std::size_t kQueueImplicitProducers = 1;
+        DataQueue data_queue(
+            session.options.queue_capacity_packets,
+            kQueueExplicitProducers,
+            kQueueImplicitProducers);
+        DataQueue::producer_token_t network_queue_producer(data_queue);
         BS::thread_pool<> workers(std::max<std::size_t>(1, session.options.max_connections));
         persistence::PersistenceThread persistence(session,
             data_queue,
@@ -1137,6 +1443,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         for (auto& handle : handles) {
             handle.session = &session;
             handle.data_queue = &data_queue;
+            handle.data_queue_producer = &network_queue_producer;
             handle.easy = curl_easy_init();
             if (handle.easy == nullptr) {
                 failure = make_error_code(DownloadErrc::http_init_failed);
@@ -1187,6 +1494,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                         // 通知 Persistence，这里补发 completion control packet。
                         if (!range->completion_notified.exchange(true, std::memory_order_acq_rel)) {
                             enqueue_control_packet(data_queue,
+                                network_queue_producer,
                                 session,
                                 core::PacketKind::range_complete,
                                 range->range_id);
@@ -1211,7 +1519,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             // write callback 里直接操作其他 handle，保持控制流简单。
             apply_gap_pauses(handles);
             apply_memory_backpressure(handles, session.options.backpressure_high_bytes);
-            resume_paused_transfers(handles, session.options.backpressure_low_bytes);
+            resume_paused_transfers(handles,
+                session.options.queue_capacity_packets,
+                session.options.backpressure_low_bytes);
             update_peak(session.performance_metrics.max_active_requests,
                 static_cast<std::size_t>(std::count_if(handles.begin(),
                     handles.end(),

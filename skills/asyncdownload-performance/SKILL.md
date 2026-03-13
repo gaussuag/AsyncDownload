@@ -116,6 +116,53 @@ When doing that:
 - define the concrete metrics that would prove the path was actually hit
 - treat the result as hypothesis testing, not as implicit evidence that the direction is already well-founded
 
+## Open-Question Closure Rule
+
+When a benchmark, profiler run, or new diagnostic metric exposes a high-value unanswered question, do two things in sequence:
+
+1. Record the open question, current evidence, and why it matters in `docs/performance` as soon as the question is discovered, so the thread can survive context compression.
+2. Continue the analysis until that question is either closed or explicitly downgraded before writing final conclusions for the iteration.
+
+Do not stop at "we found the next thing to investigate" if the answer is still reachable from code, third-party source, or a small follow-up experiment in the same loop.
+
+If you need to preserve intermediate state before the closure work is finished, label it explicitly as:
+- observed behavior
+- open question
+- next closure step
+
+Do not upgrade that intermediate record into a root-cause conclusion yet.
+
+## Layered Conclusion Rule
+
+Write performance conclusions in layers. Do not collapse them into one sentence unless the causal chain is already closed.
+
+Use this ladder:
+- observation: what the benchmark, profiler, or metric directly showed
+- code-path conclusion: which local code path emitted or consumed that signal
+- mechanism conclusion: what concrete implementation rule, contract, or failure condition explains the path behavior
+- root-cause conclusion: why the system behaved that way and what should be changed next
+
+Before using words such as "坐实", "证明", "根因", or "解释了为什么", make sure the conclusion has reached at least the mechanism layer.
+
+If the chain is only closed through observation plus code-path reading, keep the wording at the "strong signal" level and leave the root-cause wording for the follow-up update.
+
+## Third-Party Failure-Path Rule
+
+When a suspected bottleneck, queue boundary, allocation failure, or retry behavior depends on a third-party abstraction, inspect the third-party implementation or official contract before finalizing the conclusion.
+
+This applies especially when the observed behavior involves:
+- `false` returns from container or queue APIs
+- no-allocation fast paths
+- hidden producer or consumer bookkeeping
+- preallocation semantics
+- concurrency primitives whose public names sound stronger than their actual guarantees
+
+Do not treat "the API returned false" as a sufficient explanation.
+
+Close the loop by identifying the concrete condition that produced that return, block, or early exit. Then update `docs/performance` so the final iteration record contains both:
+- the preserved intermediate question
+- the later mechanism-level answer
+
 ## Prior Experiment Rule
 
 Before proposing a new optimization stage, compare it against prior accepted and rejected experiments in `docs/performance`.

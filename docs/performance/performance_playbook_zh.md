@@ -140,6 +140,22 @@
 - 想理解某个具体优化方案为什么这样设计
 - 想复用同类方案文档的写法
 
+### 3.8 queue/backpressure 诊断指标方案
+
+- [queue_backpressure_instrumentation_plan_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/queue_backpressure_instrumentation_plan_zh.md)
+
+职责：
+
+- 固定下一阶段 queue/backpressure 诊断指标的字段、口径和接入点
+- 说明如何区分 queue-full pause、memory backpressure 与二者重叠恢复链
+- 为后续按字节预算或拆分 pause/resume 语义提供观测前提
+
+何时看它：
+
+- 想新增 queue/backpressure 相关指标
+- 想判断下一轮是否应升级到 queue/backpressure 语义改造
+- 想确认诊断线程应该补哪些导出字段和验证 case
+
 ## 4. 新 agent 的推荐阅读顺序
 
 如果一个新的 agent 要接手性能优化任务，建议按下面顺序阅读：
@@ -153,6 +169,10 @@
 
 如果当前任务与某个已存在方案直接相关，再补读对应方案文档。
 
+如果当前任务是 queue-full pause、memory backpressure 或 budget 语义诊断，应在第 2 步后补读：
+
+- [queue_backpressure_instrumentation_plan_zh.md](/D:/git_repository/coding_with_agents/AsyncDownload/docs/performance/queue_backpressure_instrumentation_plan_zh.md)
+
 ## 5. 当前目录的表述逻辑
 
 这个目录里的文档应保持下面的逻辑分工：
@@ -163,6 +183,7 @@
 - profiler 基线：给热点行为结构
 - 线程初始化文档：给当前 thread 的起点和默认边界
 - 方案文档：给某个具体优化的设计说明
+- 诊断指标方案：给下一轮观测字段、采集口径和接入点
 - Playbook：给地图、上下文和维护规则
 
 如果某份文档开始同时承担多个职责，应优先收敛，而不是继续叠加内容。
