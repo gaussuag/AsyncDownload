@@ -54,14 +54,22 @@ template <typename SizeField, typename IntField>
 struct ResourcePeakMetrics {
     SizeField max_memory_bytes{0};
     IntField max_inflight_bytes{0};
+    IntField max_active_window_bytes{0};
+    IntField max_active_buffered_accounted_bytes{0};
     SizeField max_queued_packets{0};
     IntField max_queued_bytes{0};
+    IntField max_queued_payload_bytes{0};
+    IntField max_post_queue_inflight_bytes{0};
     SizeField max_active_requests{0};
 };
 
 template <typename SizeField>
 struct PauseMetrics {
     SizeField memory_pause_count{0};
+    SizeField memory_high_watermark_episode_count{0};
+    SizeField memory_low_watermark_recovery_count{0};
+    SizeField memory_pause_pre_high_watermark_count{0};
+    SizeField memory_pause_at_or_above_high_watermark_count{0};
     SizeField queue_full_pause_count{0};
     SizeField queue_full_pause_capacity_reached_count{0};
     SizeField queue_full_pause_try_enqueue_failure_count{0};
@@ -87,14 +95,45 @@ struct TransferCountMetrics {
     SizeField flush_count{0};
     SizeField metadata_save_count{0};
     SizeField file_write_calls_total{0};
+    SizeField aligned_write_calls_total{0};
+    SizeField tail_write_calls_total{0};
     SizeField staged_write_flush_count{0};
     SizeField direct_append_packets_total{0};
     SizeField out_of_order_insert_packets_total{0};
     SizeField drained_ordered_packets_total{0};
     SizeField out_of_order_queue_peak_packets{0};
     SizeField crc_sample_blocks_total{0};
+    SizeField memory_high_watermark_start_active_requests_total{0};
+    SizeField memory_low_watermark_resume_active_requests_total{0};
     IntField queue_full_pause_start_queued_bytes_total{0};
+    IntField queue_full_pause_start_queued_payload_bytes_total{0};
+    IntField queue_full_pause_start_inflight_bytes_total{0};
+    IntField queue_full_pause_start_memory_bytes_total{0};
+    IntField aligned_write_bytes_total{0};
+    IntField tail_write_bytes_total{0};
     IntField memory_pause_start_queued_bytes_total{0};
+    IntField memory_pause_start_queued_payload_bytes_total{0};
+    IntField memory_pause_start_inflight_bytes_total{0};
+    IntField memory_pause_start_memory_bytes_total{0};
+    IntField memory_pause_start_high_watermark_gap_bytes_total{0};
+    IntField memory_pause_start_incoming_bytes_total{0};
+    IntField memory_pause_start_delta_accounted_bytes_total{0};
+    IntField memory_pause_start_current_handle_buffered_payload_bytes_total{0};
+    IntField memory_pause_start_current_handle_buffered_accounted_bytes_total{0};
+    IntField memory_pause_start_projected_handle_buffered_payload_bytes_total{0};
+    IntField memory_pause_start_projected_handle_buffered_accounted_bytes_total{0};
+    IntField memory_pause_start_active_buffered_accounted_bytes_total{0};
+    IntField memory_high_watermark_start_active_window_bytes_total{0};
+    IntField memory_high_watermark_start_queued_payload_bytes_total{0};
+    IntField memory_high_watermark_start_inflight_bytes_total{0};
+    IntField memory_high_watermark_start_memory_bytes_total{0};
+    IntField memory_low_watermark_resume_active_window_bytes_total{0};
+    IntField memory_low_watermark_resume_queued_payload_bytes_total{0};
+    IntField memory_low_watermark_resume_inflight_bytes_total{0};
+    IntField memory_low_watermark_resume_memory_bytes_total{0};
+    IntField memory_watermark_drain_queued_payload_bytes_total{0};
+    IntField memory_watermark_drain_inflight_bytes_total{0};
+    IntField memory_watermark_drain_memory_bytes_total{0};
 };
 
 template <typename IntField>
@@ -178,10 +217,24 @@ inline void copy_runtime_to_summary(SummaryDirectPerformanceMetrics& summary,
     summary.peak_disk_bytes_per_second = load_value(runtime.peak_disk_bytes_per_second);
     summary.max_memory_bytes = load_value(runtime.max_memory_bytes);
     summary.max_inflight_bytes = load_value(runtime.max_inflight_bytes);
+    summary.max_active_window_bytes = load_value(runtime.max_active_window_bytes);
+    summary.max_active_buffered_accounted_bytes =
+        load_value(runtime.max_active_buffered_accounted_bytes);
     summary.max_queued_packets = load_value(runtime.max_queued_packets);
     summary.max_queued_bytes = load_value(runtime.max_queued_bytes);
+    summary.max_queued_payload_bytes = load_value(runtime.max_queued_payload_bytes);
+    summary.max_post_queue_inflight_bytes =
+        load_value(runtime.max_post_queue_inflight_bytes);
     summary.max_active_requests = load_value(runtime.max_active_requests);
     summary.memory_pause_count = load_value(runtime.memory_pause_count);
+    summary.memory_high_watermark_episode_count =
+        load_value(runtime.memory_high_watermark_episode_count);
+    summary.memory_low_watermark_recovery_count =
+        load_value(runtime.memory_low_watermark_recovery_count);
+    summary.memory_pause_pre_high_watermark_count =
+        load_value(runtime.memory_pause_pre_high_watermark_count);
+    summary.memory_pause_at_or_above_high_watermark_count =
+        load_value(runtime.memory_pause_at_or_above_high_watermark_count);
     summary.queue_full_pause_count = load_value(runtime.queue_full_pause_count);
     summary.queue_full_pause_capacity_reached_count =
         load_value(runtime.queue_full_pause_capacity_reached_count);
@@ -211,6 +264,8 @@ inline void copy_runtime_to_summary(SummaryDirectPerformanceMetrics& summary,
     summary.metadata_save_count = load_value(runtime.metadata_save_count);
     summary.metadata_save_time_ms_total = load_value(runtime.metadata_save_time_ms_total);
     summary.file_write_calls_total = load_value(runtime.file_write_calls_total);
+    summary.aligned_write_calls_total = load_value(runtime.aligned_write_calls_total);
+    summary.tail_write_calls_total = load_value(runtime.tail_write_calls_total);
     summary.staged_write_flush_count = load_value(runtime.staged_write_flush_count);
     summary.staged_write_bytes_total = load_value(runtime.staged_write_bytes_total);
     summary.direct_append_packets_total = load_value(runtime.direct_append_packets_total);
@@ -219,11 +274,69 @@ inline void copy_runtime_to_summary(SummaryDirectPerformanceMetrics& summary,
     summary.out_of_order_queue_peak_packets = load_value(runtime.out_of_order_queue_peak_packets);
     summary.out_of_order_queue_peak_bytes = load_value(runtime.out_of_order_queue_peak_bytes);
     summary.crc_sample_blocks_total = load_value(runtime.crc_sample_blocks_total);
+    summary.memory_high_watermark_start_active_requests_total =
+        load_value(runtime.memory_high_watermark_start_active_requests_total);
+    summary.memory_low_watermark_resume_active_requests_total =
+        load_value(runtime.memory_low_watermark_resume_active_requests_total);
     summary.crc_sample_bytes_total = load_value(runtime.crc_sample_bytes_total);
     summary.queue_full_pause_start_queued_bytes_total =
         load_value(runtime.queue_full_pause_start_queued_bytes_total);
+    summary.queue_full_pause_start_queued_payload_bytes_total =
+        load_value(runtime.queue_full_pause_start_queued_payload_bytes_total);
+    summary.queue_full_pause_start_inflight_bytes_total =
+        load_value(runtime.queue_full_pause_start_inflight_bytes_total);
+    summary.queue_full_pause_start_memory_bytes_total =
+        load_value(runtime.queue_full_pause_start_memory_bytes_total);
+    summary.aligned_write_bytes_total =
+        load_value(runtime.aligned_write_bytes_total);
+    summary.tail_write_bytes_total =
+        load_value(runtime.tail_write_bytes_total);
     summary.memory_pause_start_queued_bytes_total =
         load_value(runtime.memory_pause_start_queued_bytes_total);
+    summary.memory_pause_start_queued_payload_bytes_total =
+        load_value(runtime.memory_pause_start_queued_payload_bytes_total);
+    summary.memory_pause_start_inflight_bytes_total =
+        load_value(runtime.memory_pause_start_inflight_bytes_total);
+    summary.memory_pause_start_memory_bytes_total =
+        load_value(runtime.memory_pause_start_memory_bytes_total);
+    summary.memory_pause_start_high_watermark_gap_bytes_total =
+        load_value(runtime.memory_pause_start_high_watermark_gap_bytes_total);
+    summary.memory_pause_start_incoming_bytes_total =
+        load_value(runtime.memory_pause_start_incoming_bytes_total);
+    summary.memory_pause_start_delta_accounted_bytes_total =
+        load_value(runtime.memory_pause_start_delta_accounted_bytes_total);
+    summary.memory_pause_start_current_handle_buffered_payload_bytes_total =
+        load_value(runtime.memory_pause_start_current_handle_buffered_payload_bytes_total);
+    summary.memory_pause_start_current_handle_buffered_accounted_bytes_total =
+        load_value(runtime.memory_pause_start_current_handle_buffered_accounted_bytes_total);
+    summary.memory_pause_start_projected_handle_buffered_payload_bytes_total =
+        load_value(runtime.memory_pause_start_projected_handle_buffered_payload_bytes_total);
+    summary.memory_pause_start_projected_handle_buffered_accounted_bytes_total =
+        load_value(runtime.memory_pause_start_projected_handle_buffered_accounted_bytes_total);
+    summary.memory_pause_start_active_buffered_accounted_bytes_total =
+        load_value(runtime.memory_pause_start_active_buffered_accounted_bytes_total);
+    summary.memory_high_watermark_start_active_window_bytes_total =
+        load_value(runtime.memory_high_watermark_start_active_window_bytes_total);
+    summary.memory_high_watermark_start_queued_payload_bytes_total =
+        load_value(runtime.memory_high_watermark_start_queued_payload_bytes_total);
+    summary.memory_high_watermark_start_inflight_bytes_total =
+        load_value(runtime.memory_high_watermark_start_inflight_bytes_total);
+    summary.memory_high_watermark_start_memory_bytes_total =
+        load_value(runtime.memory_high_watermark_start_memory_bytes_total);
+    summary.memory_low_watermark_resume_active_window_bytes_total =
+        load_value(runtime.memory_low_watermark_resume_active_window_bytes_total);
+    summary.memory_low_watermark_resume_queued_payload_bytes_total =
+        load_value(runtime.memory_low_watermark_resume_queued_payload_bytes_total);
+    summary.memory_low_watermark_resume_inflight_bytes_total =
+        load_value(runtime.memory_low_watermark_resume_inflight_bytes_total);
+    summary.memory_low_watermark_resume_memory_bytes_total =
+        load_value(runtime.memory_low_watermark_resume_memory_bytes_total);
+    summary.memory_watermark_drain_queued_payload_bytes_total =
+        load_value(runtime.memory_watermark_drain_queued_payload_bytes_total);
+    summary.memory_watermark_drain_inflight_bytes_total =
+        load_value(runtime.memory_watermark_drain_inflight_bytes_total);
+    summary.memory_watermark_drain_memory_bytes_total =
+        load_value(runtime.memory_watermark_drain_memory_bytes_total);
 }
 
 template <typename CountField, typename FloatField, typename RuntimeCountField, typename RuntimeTimeField>

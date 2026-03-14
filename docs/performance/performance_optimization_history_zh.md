@@ -1075,3 +1075,993 @@ profiler 信号是积极的。最终采用的 profiler 结果目录为：
 
 - 为什么多个 case 的真实 queue 峰值仍然稳定停在 `~64MiB`
 - queue-full pause 的恢复门槛是否仍然过于容易形成高频 churn
+
+## 12. 优化迭代 009：Queue resume 语义探索（未采纳）
+
+### 12.1 背景
+
+在 [20260313_215204_new-data-queue-regression-v2-codex-rerun](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260313_215204_new-data-queue-regression-v2-codex-rerun/report.md) 里，explicit producer 预分配修正之后又出现了一个更细的问题：
+
+1. 多个主 case 的吞吐和 `queue_full_pause_count` 相比 `2026-03-11` 正式基线已经明显改善。
+2. 但 `max_queued_packets` / `max_queued_bytes` 仍然大多稳定停在 `~1000 / ~64-66MiB`。
+3. `queue_backpressure_stress` 的
+   `queue_resume_blocked_by_memory_count_median = 4`，
+   `queue_resume_blocked_by_memory_avg_ms_median = 120.745`，
+   而 `memory_pause_count_median = 0`。
+
+这说明当前更值得确认的问题，不再是“explicit producer 是否正确”，而是：
+
+- `resume_paused_transfers()` 里的 queue resume 语义是不是本身还过于保守
+- 当前低水位恢复门槛，是否同时承担了一个隐含的运行态预算控制职责
+
+因此这轮不再改第三方 queue 用法，而是对 queue resume 行为做 3 次小范围探索。
+
+### 12.2 探索内容
+
+这轮围绕 [download_engine.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/download/download_engine.cpp) 的 `resume_paused_transfers()` 做了 3 个候选实验：
+
+1. 实验 A：把 queue pause 的恢复门槛从 `backpressure_low_bytes` 提前到 `backpressure_high_bytes`
+2. 实验 B：保留原来的 memory low-watermark 条件，但给 queue pause 自身加一段 packet drain hysteresis 后再恢复
+3. 实验 C：保留原来的恢复门槛，只限制每次事件循环最多恢复一个 queue-paused handle
+
+3 个实验都只在本地代码里改动，最终都没有保留进工作树。
+
+### 12.3 验证结果
+
+每个实验都按同一顺序做了基础验证：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+
+随后分别跑了 5 次重复的定向 benchmark：
+
+- 实验 A：
+  - `build/benchmarks/20260313_235111_queue-resume-high-watermark-exp1`
+- 实验 B：
+  - `build/benchmarks/20260313_235420_queue-resume-drain-hysteresis-exp2`
+- 实验 C：
+  - `build/benchmarks/20260313_235652_queue-resume-one-handle-exp3`
+
+几条最关键的结果如下。
+
+#### 12.3.1 实验 A：提前到 high-watermark 恢复（拒绝）
+
+观测层：
+
+- `baseline_default`
+  - `queue_full_pause_count_median: 150,744 -> 4`
+  - `max_memory_bytes_median: 65.6MiB -> 129.8MiB`
+  - `avg_network_speed_mb_s_median: 702.20 -> 664.07`
+- `deep_buffer_candidate`
+  - `queue_full_pause_count_median: 139,933 -> 0`
+  - `max_memory_bytes_median: 63.2MiB -> 154.8MiB`
+  - `avg_network_speed_mb_s_median: 647.10 -> 575.60`
+- `queue_backpressure_stress`
+  - `avg_network_speed_mb_s_median: 752.12 -> 649.33`
+  - 中位 pause 仍是 `4`
+
+代码路径层：
+
+- 改动命中的正是 `resume_paused_transfers()` 中 queue pause 的恢复条件
+
+机制层结论：
+
+- queue pause 提前恢复，确实能把大量微小 queue pause 合并掉
+- 但这些 pause 并没有“免费消失”，而是被转换成了更高的 inflight 和 memory 峰值
+
+因此实验 A 不采纳。
+
+#### 12.3.2 实验 B：queue drain hysteresis 后再恢复（拒绝）
+
+观测层：
+
+- `baseline_default`
+  - `queue_full_pause_count_median: 150,744 -> 4`
+  - `max_memory_bytes_median: 65.6MiB -> 129.6MiB`
+  - `avg_network_speed_mb_s_median: 702.20 -> 666.23`
+- `deep_buffer_candidate`
+  - `queue_full_pause_count_median: 139,933 -> 0`
+  - `max_memory_bytes_median: 63.2MiB -> 161.2MiB`
+  - `avg_network_speed_mb_s_median: 647.10 -> 563.88`
+- `queue_backpressure_stress`
+  - `avg_network_speed_mb_s_median: 752.12 -> 654.73`
+  - 中位 pause 仍是 `4`
+
+机制层结论：
+
+- 给 queue pause 自身增加 hysteresis，同样能减少恢复抖动
+- 但它依然把系统推进到更高的运行态积压区间
+- 说明当前高频 queue pause 不只是“恢复太快”的问题，它还在和全局 inflight/memory 预算耦合
+
+因此实验 B 不采纳。
+
+#### 12.3.3 实验 C：每轮最多恢复一个 queue handle（拒绝）
+
+观测层：
+
+- `baseline_default`
+  - `avg_network_speed_mb_s_median: 702.20 -> 672.80`
+  - `max_memory_bytes_median: 65.6MiB -> 129.9MiB`
+- `balanced_candidate`
+  - `avg_network_speed_mb_s_median: 671.70 -> 499.51`
+- `deep_buffer_candidate`
+  - `avg_network_speed_mb_s_median: 647.10 -> 468.86`
+  - `max_memory_bytes_median: 63.2MiB -> 256.0MiB`
+- `queue_backpressure_stress`
+  - `avg_network_speed_mb_s_median: 752.12 -> 593.97`
+
+机制层结论：
+
+- 单次只恢复一个 handle 并没有带来更平滑的 keeper 形态
+- 它反而让某些 case 同时出现更差的吞吐和更高的积压峰值
+- 因此问题也不主要在“同时恢复太多 handle”本身
+
+因此实验 C 不采纳。
+
+### 12.4 这轮探索的最终结论
+
+这 3 轮 reject 实验合起来，给出了一个比“恢复门槛太保守”更强的系统信号：
+
+1. 当前 queue pause 的恢复条件，不只是一个 pause/resume 语义开关。
+2. 它还实际承担着一个隐藏的运行态 inflight/memory 预算控制职责。
+3. 因此，简单放宽 queue resume 条件，或者只在恢复节奏上做小抖动修饰，都只是在把 queue pause churn 转换成更高的 memory/inflight 峰值，并不稳定地产生 keeper 收益。
+
+换句话说，这轮已经足以把“继续直接改 queue resume 语义”降级：
+
+- 这不是一个低风险、低耦合的下一刀
+- 当前更值得优先闭环的，是 `~64-66MiB` 真实运行态峰值到底由哪条预算链共同形成
+
+### 12.5 下一步建议
+
+下一轮更值得优先做的，不是继续改 resume 语义，而是先回答下面两个问题：
+
+1. `scheduler_window_bytes * max_connections`、`downloaded_bytes - persisted_bytes`、`queued_bytes` 三者之间，当前到底是哪条预算先形成了 `~64-66MiB` 上限
+2. 若要继续改 queue/backpressure 行为，是否应该先把“预算语义”与“恢复语义”拆开，而不是直接调低/调高当前 low-watermark 门槛
+
+## 13. 优化迭代 010：Budget chain 观测补强（采纳）
+
+### 13.1 背景
+
+在前一轮 queue/backpressure 语义探索全部 reject 之后，当前最需要闭环的问题已经变成：
+
+1. `scheduler_window_bytes * max_connections` 是否真的在形成当前运行态上限。
+2. `downloaded_bytes - persisted_bytes` 里，到底有多少字节仍然堆在 network -> persistence queue 里，多少已经离开 queue 但还没落盘。
+3. queue pause / memory pause 开始时，真实触发点更接近哪一层预算。
+
+之前已有的 direct 指标里：
+
+- `max_inflight_bytes` 只能看到总积压
+- `max_queued_bytes` 是 accounted memory 口径
+- `queue_full_pause_start_queued_bytes_*` 也还是 accounted memory 口径
+
+它们不足以直接回答：
+
+- 当前 inflight 是否几乎全部还停在 queue 里
+- `scheduler_window_bytes * max_connections` 与实际峰值的距离
+- pause 开始时是 queue payload、总 inflight 还是 memory watermark 先撞顶
+
+### 13.2 本轮新增观测
+
+本轮新增了 3 组指标。
+
+第一组是峰值预算拆解：
+
+- `max_active_window_bytes`
+- `max_queued_payload_bytes`
+- `max_post_queue_inflight_bytes`
+
+其中：
+
+- `max_active_window_bytes` 用当前活跃 handle 的 window 长度求和，直接观察 scheduler 侧同时派发的请求预算
+- `max_queued_payload_bytes` 用 payload 字节口径统计 queue 内真实积压，避免与 accounted memory 混口径
+- `max_post_queue_inflight_bytes` 用 `max(0, inflight_bytes - queued_payload_bytes)` 估计“已离开 queue 但尚未持久化”的区间
+
+第二组是 pause 起点快照：
+
+- `queue_full_pause_start_queued_payload_bytes_total`
+- `queue_full_pause_start_inflight_bytes_total`
+- `queue_full_pause_start_memory_bytes_total`
+- `memory_pause_start_queued_payload_bytes_total`
+- `memory_pause_start_inflight_bytes_total`
+- `memory_pause_start_memory_bytes_total`
+
+第三组是对应的平均值 summary：
+
+- `queue_full_pause_start_queued_payload_bytes_avg`
+- `queue_full_pause_start_inflight_bytes_avg`
+- `queue_full_pause_start_memory_bytes_avg`
+- `memory_pause_start_queued_payload_bytes_avg`
+- `memory_pause_start_inflight_bytes_avg`
+- `memory_pause_start_memory_bytes_avg`
+
+为了让 payload 口径闭环，本轮还补了运行态状态：
+
+- [models.hpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/core/models.hpp)
+  里的 `queued_payload_bytes`
+
+并在 enqueue / dequeue 两侧同时维护它。
+
+### 13.3 涉及代码
+
+主要改动文件：
+
+- [performance_metrics.hpp](/D:/git_repository/coding_with_agents/AsyncDownload/include/asyncdownload/performance_metrics.hpp)
+- [types.hpp](/D:/git_repository/coding_with_agents/AsyncDownload/include/asyncdownload/types.hpp)
+- [models.hpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/core/models.hpp)
+- [download_engine.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/download/download_engine.cpp)
+- [persistence_thread.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/persistence/persistence_thread.cpp)
+- [main.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/main.cpp)
+- [performance_common.py](/D:/git_repository/coding_with_agents/AsyncDownload/scripts/performance/performance_common.py)
+- [download_resume_integration_test.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/tests/download/download_resume_integration_test.cpp)
+
+### 13.4 验证结果
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+随后跑了一轮定向 smoke benchmark：
+
+- `build/benchmarks/20260314_100841_budget-chain-instrumentation-smoke`
+
+使用 case：
+
+- `baseline_default`
+- `balanced_candidate`
+- `memory_guard`
+- `deep_buffer_candidate`
+- `queue_backpressure_stress`
+
+每个 case 重复 `5` 次。
+
+### 13.5 这轮观测直接给出的新信号
+
+#### 13.5.1 `scheduler_window_bytes * max_connections` 不是当前主上限
+
+新的 `max_active_window_bytes` 直接把 scheduler 预算显式化之后，可以看到：
+
+- `baseline_default`
+  - `max_active_window_bytes_median = 16MiB`
+  - `max_inflight_bytes_median = 129.17MiB`
+- `deep_buffer_candidate`
+  - `max_active_window_bytes_median = 64MiB`
+  - `max_inflight_bytes_median = 149.58MiB`
+- `queue_backpressure_stress`
+  - `max_active_window_bytes_median = 16MiB`
+  - `max_inflight_bytes_median = 63.89MiB`
+
+也就是说，当前主 case 的运行态峰值已经明显高于“活跃 window 总预算”本身。
+
+这说明：
+
+- `scheduler_window_bytes * max_connections` 仍然重要
+- 但它不是现在最先撞上的那条硬上限
+
+#### 13.5.2 `inflight` 几乎全部还停在 queue 里
+
+这轮最强的新信号来自：
+
+- `max_queued_payload_bytes`
+- `max_post_queue_inflight_bytes`
+
+几个代表 case 的中位值都很一致：
+
+- `baseline_default`
+  - `max_inflight_bytes_median = 135,449,718`
+  - `max_queued_payload_bytes_median = 135,380,388`
+  - `max_post_queue_inflight_bytes_median = 80,973`
+- `deep_buffer_candidate`
+  - `max_inflight_bytes_median = 156,848,299`
+  - `max_queued_payload_bytes_median = 156,729,947`
+  - `max_post_queue_inflight_bytes_median = 126,240`
+- `queue_backpressure_stress`
+  - `max_inflight_bytes_median = 66,989,176`
+  - `max_queued_payload_bytes_median = 66,912,256`
+  - `max_post_queue_inflight_bytes_median = 80,973`
+
+按比例看，`max_queued_payload_bytes / max_inflight_bytes` 在这几个 case 都接近 `0.999`，而
+`max_post_queue_inflight_bytes / max_inflight_bytes` 只有约 `0.0006 ~ 0.0034`。
+
+这基本可以把“有一大块 inflight 是离开 queue 后才卡住”的猜测先降级。
+
+当前更强的机制信号是：
+
+- 大部分 inflight 积压就是 queue 自身
+- queue 外但尚未持久化的那一层非常薄
+
+#### 13.5.3 pause 起点也基本对齐到 queue payload
+
+pause 起点快照进一步强化了上面的判断。
+
+`baseline_default` 的 queue pause 起点中位平均值：
+
+- `queue_full_pause_start_queued_payload_bytes_avg_median = 135,380,388`
+- `queue_full_pause_start_inflight_bytes_avg_median = 135,449,718`
+- `queue_full_pause_start_memory_bytes_avg_median = 135,822,052`
+
+`queue_backpressure_stress` 的 memory pause 起点中位平均值：
+
+- `memory_pause_start_queued_payload_bytes_avg_median = 66,887,679`
+- `memory_pause_start_inflight_bytes_avg_median = 66,962,702`
+- `memory_pause_start_memory_bytes_avg_median = 67,093,504`
+
+这说明当前 pause 进入点附近，3 个层次几乎贴在一起：
+
+- queue payload
+- 总 inflight
+- 当前 memory
+
+换句话说，pause 触发时系统里几乎没有一个“很厚的 queue 外 inflight 区间”。
+
+#### 13.5.4 `queue_backpressure_stress` 在这轮 smoke 里更像纯 memory watermark case
+
+这轮 `queue_backpressure_stress` 的中位形态是：
+
+- `queue_full_pause_count_median = 0`
+- `memory_pause_count_median = 4`
+- `queue_resume_blocked_by_memory_count_median = 0`
+
+并且 memory pause 起点稳定在约 `67MiB`。
+
+因此在这轮 smoke 环境里，这个 case 更像：
+
+- queue 已经不是主 pause 触发源
+- 当前直接撞上的主要是 memory watermark
+
+这和 `2026-03-13` 那轮里“queue pause + memory 恢复放大”的形态不完全一样，应该先作为新的观测事实保留。
+
+#### 13.5.5 `deep_buffer_candidate` 出现了明显的双峰形态
+
+`deep_buffer_candidate` 的 raw run 里出现了两个很清晰的簇：
+
+- 一组：
+  - `memory_pause_count = 0`
+  - `max_memory ≈ 132 ~ 150MiB`
+  - `avg_network_speed ≈ 719 ~ 722 MB/s`
+- 另一组：
+  - `memory_pause_count = 16`
+  - `max_memory ≈ 256MiB`
+  - `avg_network_speed ≈ 486 ~ 495 MB/s`
+
+这说明这个 case 现在不是简单的“更深 queue 更快”或“更深 queue 更慢”，而是：
+
+- 一旦运行态跨过某个 memory 区间，就会掉进明显更差的一种模式
+
+这是这轮额外暴露出来的高价值开放问题。
+
+### 13.6 需要谨慎解读的地方
+
+这轮 smoke 里，`baseline_default` / `balanced_candidate` / `memory_guard`
+的 `queue_full_pause_capacity_reached_count_median` 都非零，而
+`queue_full_pause_try_enqueue_failure_count_median = 0`。
+
+这里不能直接写成“现在 pause 已经完全变成逻辑 packet cap 触发”。
+
+原因是：
+
+- `start_queue_pause()` 仍然只会在 enqueue 失败后进入
+- `capacity_reached` 只是当前本地分类分支：失败发生时，`queued_packets >= queue_capacity_packets`
+
+所以更准确的表述应是：
+
+- 在这轮 smoke 里，enqueue failure 发生时，queue 深度已经高于我们配置的 packet cap
+- 这个现象与 `2026-03-13` rerun 里的“更早的 try_enqueue failure”不同
+- 但它还不是新的最终根因结论
+
+这一步应先保留为新观测，而不是直接覆盖上一轮已经写明的第三方 queue 机制结论。
+
+### 13.7 当前更收敛的结论
+
+这轮 instrumentation 之后，可以先把当前链路拆解收敛到下面几层：
+
+1. `scheduler_window_bytes * max_connections` 不是当前主 case 的首个硬上限。
+2. 当前大部分 `inflight` 几乎就是 queue payload 本身，而不是 queue 外滞留。
+3. queue pause 和 memory pause 的进入点，基本都发生在“queue payload 已经接近总 inflight / memory”的阶段。
+4. 因此下一步如果还要继续拆 budget chain，优先级应该放在：
+   - queue payload 为什么能涨到当前这个量级
+   - memory watermark 为什么在某些 case 上形成分叉运行态
+   - `deep_buffer_candidate` 的双峰模式到底由什么切换出来
+
+换句话说，下一步最值得优先追的，不再是“queue 外还有没有一大段隐形 inflight”，因为这轮观测已经基本把那条路径降级了。
+
+## 14. 优化迭代 011：Memory pause 触发分层闭环（采纳）
+
+### 14.1 背景
+
+在上一轮已经确认：
+
+- `deep_buffer_candidate` 存在明显双峰
+- 慢簇会伴随 `memory_pause_count > 0`
+- 但新加的 `memory_high_watermark_episode_count` / `memory_low_watermark_recovery_count`
+  在 `deep_buffer_candidate` 里没有亮起来
+
+这意味着还存在一个机制层空洞：
+
+- 如果慢簇真的是“已经越过 high watermark，再进入 memory backpressure episode”，
+  那么 episode 指标不应持续为 `0`
+- 反过来，如果 episode 指标始终不亮，就说明当前 `memory_pause` 很可能在更早的地方已经被触发
+
+### 14.2 本轮补充内容
+
+为此，这轮又补了一组更小但更直接的触发分层指标：
+
+- `memory_pause_pre_high_watermark_count`
+- `memory_pause_at_or_above_high_watermark_count`
+- `memory_pause_start_high_watermark_gap_bytes_total`
+- `memory_pause_start_high_watermark_gap_bytes_avg`
+
+接入点保持在最小范围：
+
+- 仍然只在 [download_engine.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/download/download_engine.cpp)
+  的 `start_memory_pause()` 里判断
+- 判断条件直接用当前 `memory_bytes` 与 `backpressure_high_bytes` 比较
+
+同时继续保留上一轮新增的 episode 级指标：
+
+- `memory_high_watermark_episode_count`
+- `memory_low_watermark_recovery_count`
+
+这样可以把 memory backpressure 分成两类：
+
+1. **pre-high pause**
+   - 还没真正站上 high watermark，就因为下一包会越线而提前 pause
+2. **at/above-high pause**
+   - 已经在 high watermark 上方，再由事件循环里的 memory backpressure 路径处理
+
+### 14.3 机制闭环
+
+为了避免只凭现象命名，这轮补读了本地实现：
+
+- [memory_accounting.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/core/memory_accounting.cpp)
+
+关键规则在 `should_pause_for_backpressure()`：
+
+- `incoming_bytes == 0` 时不 pause
+- `current_bytes == 0` 时不 pause
+- 否则只要 `current_bytes + incoming_bytes > high_watermark` 就返回 `true`
+
+这条规则解释了为什么会出现：
+
+- `memory_pause_count > 0`
+- 但 `memory_high_watermark_episode_count = 0`
+
+因为当前 write callback 的 memory pause 可以在“当前 memory 仍略低于 high watermark”时，就由于**下一次 incoming packet 会越线**而提前触发。
+
+### 14.4 验证结果
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+随后对 `deep_buffer_candidate` 单独跑了两轮 `12` 次重复 benchmark：
+
+- `build/benchmarks/20260314_102246_deep-buffer-memory-watermark-episode`
+- `build/benchmarks/20260314_102600_deep-buffer-memory-pause-trigger-split`
+
+最终以第二轮分层触发指标为主做结论。
+
+### 14.5 新结论
+
+#### 14.5.1 慢簇是 pre-high pause，不是越线后的 high-watermark episode
+
+在 [20260314_102600_deep-buffer-memory-pause-trigger-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_102600_deep-buffer-memory-pause-trigger-split/aggregated_cases.csv) 里：
+
+- `memory_high_watermark_episode_count_median = 0`
+- `memory_low_watermark_recovery_count_median = 0`
+- `memory_pause_at_or_above_high_watermark_count_median = 0`
+
+而 raw run 里所有慢簇都满足：
+
+- `memory_pause_count = 16`
+- `memory_pause_pre_high_watermark_count = 16`
+- `memory_pause_at_or_above_high_watermark_count = 0`
+
+这已经足以把机制层闭环到：
+
+- 慢簇不是“系统先超过 high watermark，然后再靠 episode drain 回到 low watermark”
+- 慢簇是 write callback 里**预防 incoming packet 越线**的 memory pause 连续命中
+
+#### 14.5.2 触发点离 high watermark 很近
+
+慢簇里：
+
+- `memory_pause_start_memory_bytes_avg ≈ 268,421,356 ~ 268,423,118`
+- `backpressure_high_bytes = 268,435,456`
+- `memory_pause_start_high_watermark_gap_bytes_avg ≈ 12,338 ~ 14,100`
+
+这说明 pre-high pause 触发时，系统离 high watermark 只差大约 `12-14 KiB`。
+
+也就是说，当前不是“早早就被 conservative memory policy 打断”，而是：
+
+- 运行态已经把 queue payload 推到了几乎贴线的位置
+- 下一包再进来就会越线
+- 因此 callback 在最后这几 KiB 处开始频繁触发 memory pause
+
+#### 14.5.3 双峰切换点已经从“low watermark 恢复太慢”降级到“是否进入 pre-high pause 串”
+
+在这轮 `12` 次里，形态很清晰：
+
+- 快簇：
+  - `~687-735 MB/s`
+  - `memory_pause_count = 0`
+  - `max_memory ≈ 119-145 MiB`
+- 慢簇：
+  - `~468-586 MB/s`
+  - `memory_pause_count = 16`
+  - `memory_pause_pre_high_watermark_count = 16`
+  - `max_memory ≈ 256 MiB`
+
+因此当前更准确的说法应变成：
+
+- `deep_buffer_candidate` 的主要模式切换点，不是“是否进入 high-watermark 之后的事件循环 episode”
+- 而是“运行态是否会把 queue payload 推到 high watermark 附近，并开始反复命中 pre-high pause”
+
+### 14.6 对下一步的影响
+
+这轮之后，下一步优先级应进一步收敛：
+
+1. 不再优先假设问题在 `apply_memory_backpressure()` 或 low-watermark 恢复本身。
+2. 优先追问：为什么同一组配置里，有些 run 会把 queue payload 推到 `~256MiB` 附近，而另一些 run 稳定停在 `~120-145MiB`。
+3. 更具体地说，应继续拆：
+   - packet 进入 queue 的节奏
+   - flush / persist 消费回落的节奏
+   - callback 侧 memory headroom 被吃光前的最后一段增长轨迹
+
+换句话说，下一轮最该继续补的，不是“high watermark 之后发生了什么”，而是“为什么某些 run 能在 high watermark 之前一路冲到只剩 `~12-14 KiB` headroom”。
+
+## 15. 优化迭代 012：Callback pre-high headroom / local-buffer 分层闭环（采纳）
+
+这一轮的目标不是直接改背压语义，而是继续回答上轮遗留的问题：
+
+- `deep_buffer_candidate` 的 pre-high pause 到底是被单次 incoming chunk 打出来的，还是被多个 handle 的本地聚合 buffer 叠出来的。
+- callback 本地 buffer 在整个 budget 链里到底是主积压，还是只是在最后几 KiB 里充当触发器。
+
+这轮最终采纳的指标包括：
+
+- `max_active_buffered_accounted_bytes`
+- `memory_pause_start_incoming_bytes_*`
+- `memory_pause_start_delta_accounted_bytes_*`
+- `memory_pause_start_current_handle_buffered_payload_bytes_*`
+- `memory_pause_start_current_handle_buffered_accounted_bytes_*`
+- `memory_pause_start_projected_handle_buffered_payload_bytes_*`
+- `memory_pause_start_projected_handle_buffered_accounted_bytes_*`
+- `memory_pause_start_active_buffered_accounted_bytes_*`
+
+中途曾短暂尝试过 `active_buffered_payload` 聚合口径，但该口径在 flush / move 路径上不稳定，不能作为最终结论依据。对应目录：
+
+- `build/benchmarks/20260314_103729_deep-buffer-buffered-headroom-split`
+- `build/benchmarks/20260314_103907_deep-buffer-buffered-headroom-split-rerun`
+- `build/benchmarks/20260314_104258_deep-buffer-buffered-headroom-split-v2`
+
+最终以 [20260314_104712_deep-buffer-buffered-accounted-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_104712_deep-buffer-buffered-accounted-split/aggregated_cases.csv) 为准做结论。
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+### 15.1 新结论
+
+#### 15.1.1 pre-high 慢簇不是“单次大包”，而是“多 handle 本地 partial packet 叠加后的最后一跳”
+
+在最终采纳的 benchmark 里，唯一命中 memory pause 的慢 run 是 repeat `3`：
+
+- `avg_network_speed_mb_s = 598.83`
+- `memory_pause_count = 16`
+- `memory_pause_pre_high_watermark_count = 16`
+- `memory_pause_start_high_watermark_gap_bytes_avg = 11,906`
+- `memory_pause_start_incoming_bytes_avg = 16,384`
+- `memory_pause_start_delta_accounted_bytes_avg = 16,384`
+- `memory_pause_start_current_handle_buffered_payload_bytes_avg = 35,840`
+- `memory_pause_start_projected_handle_buffered_payload_bytes_avg = 52,224`
+- `memory_pause_start_active_buffered_accounted_bytes_avg = 574,464`
+
+这组数据说明：
+
+- 触发 pre-high pause 的最后一跳只是一笔常规的 `~16 KiB` callback incoming
+- 当前 handle 在触发前通常已经本地攒了 `~35 KiB`
+- projected 后会变成 `~52 KiB`，离单 packet `64 KiB` 聚合上限并不远
+- 同时，其它活跃 handle 的本地 partial packet 也在一起占用约 `~560 KiB` accounted 空间
+
+因此这轮可以把机制层结论推进到：
+
+- pre-high pause 不是“某个异常大 chunk 把系统一下打爆”
+- 而是 queue payload 已经逼近 high watermark 时，多个 handle 的本地 partial packet 再叠上最后一个 `~16 KiB` incoming，把 callback admission 推过红线
+
+#### 15.1.2 callback 本地 buffer 不是主积压体量，但它确实是最后的触发器
+
+同一轮里，所有 run 的 `max_active_buffered_accounted_bytes` 只在 `951,296 ~ 1,049,600` 之间波动。
+
+这和 `16` 个连接、每个连接一个 `~64 KiB` 聚合 packet 的上界是同一量级。
+
+这说明：
+
+- callback 本地聚合 buffer 本身只是一层 `~1 MiB` 量级的小预算
+- 真正占据绝大多数 inflight / memory 的仍然是 queue payload 本体
+- 但当 queue payload 已经把系统推到离 high watermark 只剩十几 KiB 时，这层 `~1 MiB` 级的 local buffer 会决定“最后一个 incoming 能不能进来”
+
+也就是说，callback local buffer 在当前机制里不是主积压来源，但确实是 pre-high pause 的最后触发器。
+
+#### 15.1.3 同时暴露了第二类“无 memory pause 也会变慢”的运行态
+
+这轮还有几次慢 run 完全没有命中 memory pause：
+
+- repeat `12`
+  - `avg_network_speed_mb_s = 533.06`
+  - `memory_pause_count = 0`
+  - `max_queued_packets = 3,581`
+  - `max_queued_payload_bytes = 230,572,934`
+- repeat `8`
+  - `avg_network_speed_mb_s = 562.64`
+  - `memory_pause_count = 0`
+  - `max_queued_payload_bytes = 126,140,718`
+  - `handle_data_packet_avg_us = 202.07`
+  - `append_bytes_avg_us = 201.32`
+  - `file_write_avg_us = 112.36`
+
+这说明当前至少还存在两类慢态：
+
+- 一类是已经闭环的 pre-high pause 慢态
+- 另一类不是由 memory pause 直接触发
+  - 有时表现为 queue payload 自己长到 `~230 MiB`
+  - 有时表现为 `handle_data_packet / append / file_write` 整体时延同步抬高
+
+因此 callback 侧新指标已经解释了“为什么会进入 pre-high pause 串”，但还没有解释所有吞吐双峰。
+
+### 15.2 对下一步的影响
+
+下一步优先级应继续收敛，但要分成两条：
+
+1. 已闭环主线：
+   - pre-high pause 的最后触发条件已经足够清楚
+   - 后续不必再把它假设成“单个异常大 incoming chunk”问题
+2. 新的主开放问题：
+   - 为什么有些 run 在完全没有 memory pause 的情况下，queue payload 仍会长到 `~230 MiB`
+   - 为什么另一些慢 run 会表现成 `handle_data_packet / append / file_write` 同步变慢
+
+这意味着下一轮最值得补的，不再是 callback 本地 buffer 的口径，而是：
+
+- queue payload 增长到 `~230 MiB` 时，persistence 侧到底发生了什么节奏变化
+- 无 pause 慢 run 里，`handle_data_packet` 和 `file_write` 的时延抬升是 OS / 文件写入波动，还是当前实现里的另一个队列化路径
+
+## 16. 优化迭代 013：Persistence write-shape / flush contention 拆解（部分采纳）
+
+这一轮的目标是把上一轮遗留的“无 memory pause 也会变慢”继续压缩到 persistence 直写路径内部。
+
+这轮最终保留的是写形态观测，不保留实验代码。新增并采纳的指标包括：
+
+- `aligned_write_calls_total`
+- `aligned_write_bytes_total`
+- `tail_write_calls_total`
+- `tail_write_bytes_total`
+- `average_aligned_write_size_bytes`
+- `average_tail_write_size_bytes`
+
+对应采纳 benchmark：
+
+- [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/aggregated_cases.csv)
+
+对应 reject benchmark：
+
+- [20260314_111437_deep-buffer-flush-backlog-gate-exp1](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111437_deep-buffer-flush-backlog-gate-exp1/aggregated_cases.csv)
+- [20260314_111653_deep-buffer-split-filewriter-handles-exp2](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111653_deep-buffer-split-filewriter-handles-exp2/aggregated_cases.csv)
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+### 16.1 新结论
+
+#### 16.1.1 写入大小形态不是当前慢态分叉的主因
+
+在采纳数据 [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/raw_runs.csv) 里：
+
+- `aligned_write_calls_total` 稳定在 `16,414 ~ 16,433`
+- `tail_write_calls_total` 稳定在 `13,354 ~ 14,560`
+- `average_aligned_write_size_bytes` 稳定在 `~61.8 KiB`
+- `average_tail_write_size_bytes` 恒定为 `4,096`
+
+即使是无 `memory_pause` 的较慢 run，例如 repeat `7`：
+
+- `avg_network_speed_mb_s = 620.98`
+- `memory_pause_count = 0`
+- `max_queued_payload_bytes = 252,444,066`
+- `average_aligned_write_size_bytes = 61,826.97`
+- `average_tail_write_size_bytes = 4,096`
+
+它的 write shape 仍然与快 run 基本同构。
+
+这说明：
+
+- 当前慢态不是因为“写成了更多更碎的小块”
+- `tail flush` 4KiB 写入本身一直存在，但它没有解释吞吐双峰
+
+#### 16.1.2 更强的信号来自 pending flush 期间的写入退化
+
+同一组采纳数据里，慢 run 与快 run 的 `flush_pending_write_avg_us` 和 `flush_time_ms_total` 呈现明显分层：
+
+- pre-high memory pause 慢 run
+  - repeat `4`: `481.66 MB/s`，`flush_pending_write_avg_us = 40.08`，`flush_time_ms_total = 721`
+  - repeat `12`: `534.45 MB/s`，`flush_pending_write_avg_us = 40.69`，`flush_time_ms_total = 761`
+- 无 pause 但 queue payload 很高的慢 run
+  - repeat `7`: `620.98 MB/s`，`memory_pause_count = 0`，`max_queued_payload_bytes = 252,444,066`
+  - 同时 `flush_pending_write_avg_us = 27.33`，`flush_time_ms_total = 306`
+- 快 run
+  - repeat `8`: `746.90 MB/s`，`flush_pending_write_avg_us = 22.71`，`flush_time_ms_total = 193`
+  - repeat `3`: `743.11 MB/s`，`flush_pending_write_avg_us = 22.79`，`flush_time_ms_total = 208`
+
+结合 [persistence_thread.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/persistence/persistence_thread.cpp) 里的 `maybe_schedule_flush()` 和 [file_writer.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/storage/file_writer.cpp) 里的 `write()` / `flush()` 共用同一把锁，可以把当前结论推进到机制层强信号：
+
+- 真正拖慢 persistence 主链的，更像是 pending flush 期间的写入阻塞
+- 慢态分叉更接近 flush 持锁时间与直写路径的串行化，而不是写入批次形态本身
+
+#### 16.1.3 两个尝试性改法都不是 keeper
+
+实验一：`queue backlog` 高时延后 threshold flush
+
+- 目录：[20260314_111437_deep-buffer-flush-backlog-gate-exp1](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111437_deep-buffer-flush-backlog-gate-exp1/aggregated_cases.csv)
+- 结果：`flush_count` 仍然固定在 `3`
+- 中位吞吐从 `721.41 MB/s` 降到 `699.22 MB/s`
+- 还出现了 `memory_pause_count = 32` 的 run
+
+这说明当前主问题不是“threshold flush 发起得太早”，而是“flush 一旦运行，后面的写路径会怎样被拖慢”。
+
+实验二：Windows 下拆分 `FileWriter` 的写句柄与 flush/read 句柄
+
+- 目录：[20260314_111653_deep-buffer-split-filewriter-handles-exp2](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111653_deep-buffer-split-filewriter-handles-exp2/aggregated_cases.csv)
+- 中位吞吐从 `721.41 MB/s` 掉到 `593.20 MB/s`
+- `flush_pending_write_avg_us` 没有下降到更优区间
+- 新增了多次无 `memory_pause` 的重慢 run，例如 repeat `11 = 411.41 MB/s`
+
+这说明“简单拆用户态句柄”并没有消除当前 slow mode，至少在现有 Windows I/O 语义下不是 keeper 方向。
+
+### 16.2 对下一步的影响
+
+下一轮如果继续做 keeper 级优化，优先级应改成：
+
+1. 把 `flush` 对主写链的阻塞语义当成主问题，而不是继续拆 write shape。
+2. 不再重复尝试“微调 threshold flush 触发条件”或“简单拆句柄”这两类方向，除非能明确说明实现语义为什么不同。
+3. 若继续改 flush 路径，应先正面讨论 durability / metadata cadence 的设计边界，因为更激进的优化很可能会触及恢复语义，而不只是热路径局部优化。
+
+## 17. 优化迭代 014：Incremental CRC sample cache 探索（未采纳）
+
+### 17.1 背景
+
+在上一轮已经确认：
+
+- `pending_flush` 期间的写路径阻塞比 write shape 本身更像主卡点
+- 但把 `flush_time_ms_total`、`metadata_save_time_ms_total`、`crc_sample_read_*` 合起来看时，CRC 采样读取本身也不是小数
+
+以 [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/raw_runs.csv) 为例：
+
+- 快 run 的 `crc_sample_read` 估算总时长通常也在 `~165-180ms`
+- 慢 run 则可能连同 `FlushFileBuffers` 一起把 pending flush 窗口推到 `~800-1000ms`
+
+而 [persistence_thread.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/persistence/persistence_thread.cpp) 里的 `build_crc_samples()` 每次 flush 都会从 snapshot 位图重新遍历 `VDL` 之后的 `finished` block，并重新读盘做 CRC。
+
+因此这轮想验证的问题是：
+
+- “重复 CRC 采样读”是否是当前 pending flush 的高占比重复工作
+- 如果把这部分改成增量缓存，能否形成 keeper 级吞吐改善
+
+### 17.2 实验内容
+
+实验代码做了两件事：
+
+1. 给 `build_crc_samples()` 增加基于 offset 的增量缓存，只对新出现的 `finished` block 做实际读盘和 CRC 计算。
+2. 额外导出 `crc_sample_reused_blocks_total` / `crc_sample_reused_bytes_total`，确认这条缓存路径有没有真正命中。
+
+同时补了一个定向单测，证明在同一 `VDL` 之后的 `finished` block 跨多轮 flush 时确实可以命中 reuse。
+
+最终实验代码没有保留在工作树中。
+
+### 17.3 验证结果
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+- `AsyncDownload_tests.exe --gtest_filter=PersistenceThreadTest.ReusesCrcSamplesAcrossFlushes`
+
+随后对 `deep_buffer_candidate` 做了两轮 `12` 次重复 benchmark：
+
+- [20260314_120417_deep-buffer-incremental-crc-cache-exp1](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_120417_deep-buffer-incremental-crc-cache-exp1/aggregated_cases.csv)
+- [20260314_120554_deep-buffer-incremental-crc-cache-exp1-rerun](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_120554_deep-buffer-incremental-crc-cache-exp1-rerun/aggregated_cases.csv)
+
+### 17.4 新结论
+
+#### 17.4.1 增量 CRC cache 确实命中了真实重复工作
+
+这轮不是“假设命中”，而是有明确运行数据：
+
+- 第一轮里，所有 run 的 `crc_sample_reused_blocks_total` 都在 `~1131-1227`
+- `crc_sample_blocks_total` 则从上一轮常见的 `~5800-8000` 降到了 `~3900-4900`
+
+这说明：
+
+- `build_crc_samples()` 里确实存在大量跨 flush 的重复 CRC 重读
+- 增量 cache 在实现层是有效命中的，不是空转逻辑
+
+#### 17.4.2 但它没有把 `deep_buffer_candidate` 收敛成 keeper 形态
+
+尽管 CRC 读盘量明显下降，benchmark 结果仍然不稳定：
+
+- 第一轮：
+  - 中位吞吐 `703.54 MB/s`
+  - 仍出现 `451.10 MB/s`、`458.17 MB/s` 两个无 `memory_pause` 的重慢 run
+- 第二轮 rerun：
+  - 中位吞吐 `700.66 MB/s`
+  - 又出现 `440.43 MB/s` 的无 `memory_pause` 重慢 run
+
+而上一轮作为对照的 [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/aggregated_cases.csv) 中位吞吐是 `721.41 MB/s`。
+
+这说明：
+
+- CRC repeated read 是真实成本
+- 但把它缓存掉之后，`deep_buffer_candidate` 仍会进入另一类无 pause 慢态
+- 所以它不是当前 keeper 级根因
+
+#### 17.4.3 当前更像“次级成本被削弱了，但主阻塞还在”
+
+从 slow run 结构看：
+
+- 某些 run 的 `crc_sample_read` 总量确实下降了
+- 但 `flush_pending_write_avg_us` 和 `flush_time_ms_total` 仍然能形成明显的慢态分叉
+- 特别是 rerun 里的重慢 run `repeat 5 = 440.43 MB/s`，仍然是在 `memory_pause_count = 0` 的情况下出现
+
+因此更稳妥的机制层结论应是：
+
+- 重复 CRC 读盘是 pending flush 窗口里的真实次级成本
+- 但当前主链继续被卡住，更强信号仍然在 `FlushFileBuffers` / pending-flush 阻塞这一层
+
+### 17.5 为什么不采纳
+
+这轮之所以 reject，不是因为实验没命中，而是因为：
+
+1. 它命中了真实重复工作，但 benchmark 结果没有形成 keeper 级收益。
+2. 两轮 `12` 次 rerun 都出现了新的无 `memory_pause` 重慢 run，说明这条路无法稳定收敛当前双峰。
+3. 当前更像是“减少了一个可见成本项”，但没有改变主阻塞的决定性结构。
+
+因此这轮不保留实现代码，只保留文档结论。
+
+### 17.6 对下一步的影响
+
+下一步如果继续追 flush 主线，应把优先级继续收窄为：
+
+1. 把 `FlushFileBuffers` 与 pending-flush 阻塞当成主解释面。
+2. 不再把“简单的 incremental CRC cache”当成新的 keeper 候选，除非能明确说明还有别的机制差异。
+3. 若后续要继续动 flush / metadata / CRC 语义，必须先明确恢复语义愿意接受的 tradeoff，而不是只从热路径局部出发。
+
+## 18. 优化迭代 015：Dedicated CRC read handle 探索（未采纳）
+
+### 18.1 背景
+
+在增量 CRC cache 被 reject 之后，flush 主线里还剩一个可疑点：
+
+- `build_crc_samples()` 的读盘与 `write()` / `flush()` 仍共用同一个 `FileWriter` 句柄和同一把互斥锁
+- 之前 reject 的“拆 FileWriter 写/flush 句柄”实验同时改了写和 flush 语义，无法单独回答“只把 CRC read 拆出去会不会有帮助”
+
+因此这轮只做一个更窄的实验：
+
+- 保持 `write()` 与 `flush()` 仍走原来的主句柄
+- 仅在 Windows 下为 `read()` 额外打开一个只读句柄，试图把 CRC sample read 从主写句柄的锁竞争里拆开
+
+### 18.2 验证结果
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+随后对 `deep_buffer_candidate` 做了 12 次定向 benchmark：
+
+- [20260314_175014_deep-buffer-dedicated-read-handle-exp1](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_175014_deep-buffer-dedicated-read-handle-exp1/aggregated_cases.csv)
+
+对照上一轮采纳基线 [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/aggregated_cases.csv)：
+
+- 基线中位吞吐：`721.41 MB/s`
+- 实验中位吞吐：`662.44 MB/s`
+- 基线均值：`662.31 MB/s`
+- 实验均值：`606.61 MB/s`
+
+并且实验里出现了更差的重慢 run：
+
+- repeat `9 = 361.97 MB/s`，`memory_pause_count = 16`，`flush_pending_write_avg_us = 44.51`
+- repeat `1 = 398.13 MB/s`，`memory_pause_count = 0`，`flush_time_ms_total = 349`
+- repeat `8 = 409.93 MB/s`，`memory_pause_count = 16`，`flush_pending_write_avg_us = 45.30`
+
+### 18.3 结论
+
+这轮给出的信号很直接：
+
+1. 只把 CRC read 拆到独立只读句柄，并没有把当前 slow mode 消掉。
+2. `flush_pending_write_avg_us` 仍然能抬到比基线更差的区间，说明主阻塞并不在“CRC read 与主句柄共用”这一条简单解释上。
+3. 在现有 Windows I/O 语义下，这条路不仅没形成 keeper 收益，反而引入了更坏的尾部结果。
+
+因此这轮实验不采纳，代码已撤回，只保留 reject 结论。
+
+### 18.4 对下一步的影响
+
+后续如果还要重访 “read / flush / write 句柄分离” 方向，必须先能说明：
+
+- 为什么新的实现语义不同于此前 reject 的“拆 FileWriter 写/flush 句柄”
+- 为什么它不只是另一种“简单拆句柄”
+
+在没有新机制差异前，不应重复进入这条路线。
+
+## 19. 优化迭代 016：Compact metadata JSON 探索（未采纳）
+
+### 19.1 背景
+
+在继续阅读 [metadata_store.cpp](/D:/git_repository/coding_with_agents/AsyncDownload/src/metadata/metadata_store.cpp) 之后，可以看到：
+
+- 每次 flush 结束后都会写一份 JSON metadata
+- 当前序列化使用 `value.dump(2)`，也就是格式化输出
+
+这条改动不触碰 durability / recovery 语义，只会减少 metadata 文件体积和文本格式化开销，因此是一个低风险、低侵入的实验候选。
+
+### 19.2 实验内容
+
+实验只做一处修改：
+
+- 把 `MetadataStore::save()` 中的 `value.dump(2)` 改成 `value.dump()`
+
+也就是保留相同 JSON 字段与保存顺序，只去掉缩进格式化。
+
+### 19.3 验证结果
+
+基础验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+
+随后对 `deep_buffer_candidate` 做了 12 次定向 benchmark：
+
+- [20260314_175523_deep-buffer-compact-metadata-json-exp1](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_175523_deep-buffer-compact-metadata-json-exp1/aggregated_cases.csv)
+
+对照上一轮采纳基线 [20260314_111232_deep-buffer-write-shape-split](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260314_111232_deep-buffer-write-shape-split/aggregated_cases.csv)：
+
+- 基线中位吞吐：`721.41 MB/s`
+- 实验中位吞吐：`706.46 MB/s`
+- 基线均值：`662.31 MB/s`
+- 实验均值：`613.72 MB/s`
+
+实验仍然出现了新的重慢 run：
+
+- repeat `3 = 401.25 MB/s`，`memory_pause_count = 0`，`flush_time_ms_total = 216`
+- repeat `12 = 412.90 MB/s`，`memory_pause_count = 16`，`flush_time_ms_total = 818`
+- repeat `10 = 485.08 MB/s`，`memory_pause_count = 16`，`flush_time_ms_total = 728`
+
+同时 metadata 保存时长没有形成决定性变化：
+
+- 基线慢 run 里 `metadata_save_time_ms_total` 已多在 `62-88ms`
+- 这轮慢 run 里仍在 `64-81ms` 区间
+
+### 19.4 结论
+
+这说明：
+
+1. metadata pretty-print 不是当前 `deep_buffer_candidate` 的决定性成本项。
+2. 去掉缩进只能略微减少 metadata 自身开销，但不会改变 `FlushFileBuffers` / pending-flush 阻塞所主导的运行态。
+3. 当前双峰慢态在无 pause 和 pre-high pause 两条支路上都仍然存在。
+
+因此这轮实验不采纳，代码已撤回，只保留 reject 结论。
+
+### 19.5 对下一步的影响
+
+当前还值得继续追的方向已经越来越集中到：
+
+1. `FlushFileBuffers` 本身的持锁阻塞语义
+2. flush 后 metadata/CRC 这整段 pending-flush 窗口如何与主写链并存
+
+而“简单缩小 metadata 文件体积”这条路，在没有别的机制差异前不值得再重复。

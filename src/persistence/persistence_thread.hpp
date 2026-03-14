@@ -66,7 +66,8 @@ private:
                                                bool sample_timing);
     [[nodiscard]] std::error_code write_bytes(std::int64_t offset,
                                               std::span<const std::uint8_t> bytes,
-                                              bool sample_timing);
+                                              bool sample_timing,
+                                              bool tail_write);
     // 强制把当前 range 的尾部残留刷到磁盘。
     [[nodiscard]] std::error_code flush_tail(core::RangeContext& range, bool sample_timing);
     // 根据 persisted_offset 推进位图 finished 状态。

@@ -216,10 +216,23 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  resume_reused_bytes=" << perf.resume_reused_bytes << "\n";
     stream << "  max_memory_bytes=" << perf.max_memory_bytes << "\n";
     stream << "  max_inflight_bytes=" << perf.max_inflight_bytes << "\n";
+    stream << "  max_active_window_bytes=" << perf.max_active_window_bytes << "\n";
+    stream << "  max_active_buffered_accounted_bytes="
+           << perf.max_active_buffered_accounted_bytes << "\n";
     stream << "  max_queued_packets=" << perf.max_queued_packets << "\n";
     stream << "  max_queued_bytes=" << perf.max_queued_bytes << "\n";
+    stream << "  max_queued_payload_bytes=" << perf.max_queued_payload_bytes << "\n";
+    stream << "  max_post_queue_inflight_bytes=" << perf.max_post_queue_inflight_bytes << "\n";
     stream << "  max_active_requests=" << perf.max_active_requests << "\n";
     stream << "  memory_pause_count=" << perf.memory_pause_count << "\n";
+    stream << "  memory_high_watermark_episode_count="
+           << perf.memory_high_watermark_episode_count << "\n";
+    stream << "  memory_low_watermark_recovery_count="
+           << perf.memory_low_watermark_recovery_count << "\n";
+    stream << "  memory_pause_pre_high_watermark_count="
+           << perf.memory_pause_pre_high_watermark_count << "\n";
+    stream << "  memory_pause_at_or_above_high_watermark_count="
+           << perf.memory_pause_at_or_above_high_watermark_count << "\n";
     stream << "  queue_full_pause_count=" << perf.queue_full_pause_count << "\n";
     stream << "  queue_full_pause_capacity_reached_count="
            << perf.queue_full_pause_capacity_reached_count << "\n";
@@ -242,14 +255,75 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  packets_enqueued_total=" << perf.packets_enqueued_total << "\n";
     stream << "  avg_packet_size_bytes=" << perf.average_packet_size_bytes << "\n";
     stream << "  max_packet_size_bytes=" << perf.max_packet_size_bytes << "\n";
+    stream << "  aligned_write_calls_total=" << perf.aligned_write_calls_total << "\n";
+    stream << "  aligned_write_bytes_total=" << perf.aligned_write_bytes_total << "\n";
+    stream << "  tail_write_calls_total=" << perf.tail_write_calls_total << "\n";
+    stream << "  tail_write_bytes_total=" << perf.tail_write_bytes_total << "\n";
+    stream << "  average_aligned_write_size_bytes=" << perf.average_aligned_write_size_bytes
+           << "\n";
+    stream << "  average_tail_write_size_bytes=" << perf.average_tail_write_size_bytes << "\n";
     stream << "  queue_full_pause_start_queued_packets_total="
            << perf.queue_full_pause_start_queued_packets_total << "\n";
     stream << "  queue_full_pause_start_queued_bytes_total="
            << perf.queue_full_pause_start_queued_bytes_total << "\n";
+    stream << "  queue_full_pause_start_queued_payload_bytes_total="
+           << perf.queue_full_pause_start_queued_payload_bytes_total << "\n";
+    stream << "  queue_full_pause_start_inflight_bytes_total="
+           << perf.queue_full_pause_start_inflight_bytes_total << "\n";
+    stream << "  queue_full_pause_start_memory_bytes_total="
+           << perf.queue_full_pause_start_memory_bytes_total << "\n";
     stream << "  memory_pause_start_queued_packets_total="
            << perf.memory_pause_start_queued_packets_total << "\n";
     stream << "  memory_pause_start_queued_bytes_total="
            << perf.memory_pause_start_queued_bytes_total << "\n";
+    stream << "  memory_pause_start_queued_payload_bytes_total="
+           << perf.memory_pause_start_queued_payload_bytes_total << "\n";
+    stream << "  memory_pause_start_inflight_bytes_total="
+           << perf.memory_pause_start_inflight_bytes_total << "\n";
+    stream << "  memory_pause_start_memory_bytes_total="
+           << perf.memory_pause_start_memory_bytes_total << "\n";
+    stream << "  memory_pause_start_high_watermark_gap_bytes_total="
+           << perf.memory_pause_start_high_watermark_gap_bytes_total << "\n";
+    stream << "  memory_pause_start_incoming_bytes_total="
+           << perf.memory_pause_start_incoming_bytes_total << "\n";
+    stream << "  memory_pause_start_delta_accounted_bytes_total="
+           << perf.memory_pause_start_delta_accounted_bytes_total << "\n";
+    stream << "  memory_pause_start_current_handle_buffered_payload_bytes_total="
+           << perf.memory_pause_start_current_handle_buffered_payload_bytes_total << "\n";
+    stream << "  memory_pause_start_current_handle_buffered_accounted_bytes_total="
+           << perf.memory_pause_start_current_handle_buffered_accounted_bytes_total << "\n";
+    stream << "  memory_pause_start_projected_handle_buffered_payload_bytes_total="
+           << perf.memory_pause_start_projected_handle_buffered_payload_bytes_total << "\n";
+    stream << "  memory_pause_start_projected_handle_buffered_accounted_bytes_total="
+           << perf.memory_pause_start_projected_handle_buffered_accounted_bytes_total << "\n";
+    stream << "  memory_pause_start_active_buffered_accounted_bytes_total="
+           << perf.memory_pause_start_active_buffered_accounted_bytes_total << "\n";
+    stream << "  memory_high_watermark_start_active_requests_total="
+           << perf.memory_high_watermark_start_active_requests_total << "\n";
+    stream << "  memory_low_watermark_resume_active_requests_total="
+           << perf.memory_low_watermark_resume_active_requests_total << "\n";
+    stream << "  memory_high_watermark_start_active_window_bytes_total="
+           << perf.memory_high_watermark_start_active_window_bytes_total << "\n";
+    stream << "  memory_high_watermark_start_queued_payload_bytes_total="
+           << perf.memory_high_watermark_start_queued_payload_bytes_total << "\n";
+    stream << "  memory_high_watermark_start_inflight_bytes_total="
+           << perf.memory_high_watermark_start_inflight_bytes_total << "\n";
+    stream << "  memory_high_watermark_start_memory_bytes_total="
+           << perf.memory_high_watermark_start_memory_bytes_total << "\n";
+    stream << "  memory_low_watermark_resume_active_window_bytes_total="
+           << perf.memory_low_watermark_resume_active_window_bytes_total << "\n";
+    stream << "  memory_low_watermark_resume_queued_payload_bytes_total="
+           << perf.memory_low_watermark_resume_queued_payload_bytes_total << "\n";
+    stream << "  memory_low_watermark_resume_inflight_bytes_total="
+           << perf.memory_low_watermark_resume_inflight_bytes_total << "\n";
+    stream << "  memory_low_watermark_resume_memory_bytes_total="
+           << perf.memory_low_watermark_resume_memory_bytes_total << "\n";
+    stream << "  memory_watermark_drain_queued_payload_bytes_total="
+           << perf.memory_watermark_drain_queued_payload_bytes_total << "\n";
+    stream << "  memory_watermark_drain_inflight_bytes_total="
+           << perf.memory_watermark_drain_inflight_bytes_total << "\n";
+    stream << "  memory_watermark_drain_memory_bytes_total="
+           << perf.memory_watermark_drain_memory_bytes_total << "\n";
     stream << "  queue_full_pause_avg_ms=" << perf.queue_full_pause_avg_ms << "\n";
     stream << "  queue_full_pause_max_ms=" << perf.queue_full_pause_max_ms << "\n";
     stream << "  memory_pause_avg_ms=" << perf.memory_pause_avg_ms << "\n";
@@ -262,10 +336,64 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
            << perf.queue_full_pause_start_queued_packets_avg << "\n";
     stream << "  queue_full_pause_start_queued_bytes_avg="
            << perf.queue_full_pause_start_queued_bytes_avg << "\n";
+    stream << "  queue_full_pause_start_queued_payload_bytes_avg="
+           << perf.queue_full_pause_start_queued_payload_bytes_avg << "\n";
+    stream << "  queue_full_pause_start_inflight_bytes_avg="
+           << perf.queue_full_pause_start_inflight_bytes_avg << "\n";
+    stream << "  queue_full_pause_start_memory_bytes_avg="
+           << perf.queue_full_pause_start_memory_bytes_avg << "\n";
     stream << "  memory_pause_start_queued_packets_avg="
            << perf.memory_pause_start_queued_packets_avg << "\n";
     stream << "  memory_pause_start_queued_bytes_avg="
            << perf.memory_pause_start_queued_bytes_avg << "\n";
+    stream << "  memory_pause_start_queued_payload_bytes_avg="
+           << perf.memory_pause_start_queued_payload_bytes_avg << "\n";
+    stream << "  memory_pause_start_inflight_bytes_avg="
+           << perf.memory_pause_start_inflight_bytes_avg << "\n";
+    stream << "  memory_pause_start_memory_bytes_avg="
+           << perf.memory_pause_start_memory_bytes_avg << "\n";
+    stream << "  memory_pause_start_high_watermark_gap_bytes_avg="
+           << perf.memory_pause_start_high_watermark_gap_bytes_avg << "\n";
+    stream << "  memory_pause_start_incoming_bytes_avg="
+           << perf.memory_pause_start_incoming_bytes_avg << "\n";
+    stream << "  memory_pause_start_delta_accounted_bytes_avg="
+           << perf.memory_pause_start_delta_accounted_bytes_avg << "\n";
+    stream << "  memory_pause_start_current_handle_buffered_payload_bytes_avg="
+           << perf.memory_pause_start_current_handle_buffered_payload_bytes_avg << "\n";
+    stream << "  memory_pause_start_current_handle_buffered_accounted_bytes_avg="
+           << perf.memory_pause_start_current_handle_buffered_accounted_bytes_avg << "\n";
+    stream << "  memory_pause_start_projected_handle_buffered_payload_bytes_avg="
+           << perf.memory_pause_start_projected_handle_buffered_payload_bytes_avg << "\n";
+    stream << "  memory_pause_start_projected_handle_buffered_accounted_bytes_avg="
+           << perf.memory_pause_start_projected_handle_buffered_accounted_bytes_avg << "\n";
+    stream << "  memory_pause_start_active_buffered_accounted_bytes_avg="
+           << perf.memory_pause_start_active_buffered_accounted_bytes_avg << "\n";
+    stream << "  memory_high_watermark_start_active_requests_avg="
+           << perf.memory_high_watermark_start_active_requests_avg << "\n";
+    stream << "  memory_high_watermark_start_active_window_bytes_avg="
+           << perf.memory_high_watermark_start_active_window_bytes_avg << "\n";
+    stream << "  memory_high_watermark_start_queued_payload_bytes_avg="
+           << perf.memory_high_watermark_start_queued_payload_bytes_avg << "\n";
+    stream << "  memory_high_watermark_start_inflight_bytes_avg="
+           << perf.memory_high_watermark_start_inflight_bytes_avg << "\n";
+    stream << "  memory_high_watermark_start_memory_bytes_avg="
+           << perf.memory_high_watermark_start_memory_bytes_avg << "\n";
+    stream << "  memory_low_watermark_resume_active_requests_avg="
+           << perf.memory_low_watermark_resume_active_requests_avg << "\n";
+    stream << "  memory_low_watermark_resume_active_window_bytes_avg="
+           << perf.memory_low_watermark_resume_active_window_bytes_avg << "\n";
+    stream << "  memory_low_watermark_resume_queued_payload_bytes_avg="
+           << perf.memory_low_watermark_resume_queued_payload_bytes_avg << "\n";
+    stream << "  memory_low_watermark_resume_inflight_bytes_avg="
+           << perf.memory_low_watermark_resume_inflight_bytes_avg << "\n";
+    stream << "  memory_low_watermark_resume_memory_bytes_avg="
+           << perf.memory_low_watermark_resume_memory_bytes_avg << "\n";
+    stream << "  memory_watermark_drain_queued_payload_bytes_avg="
+           << perf.memory_watermark_drain_queued_payload_bytes_avg << "\n";
+    stream << "  memory_watermark_drain_inflight_bytes_avg="
+           << perf.memory_watermark_drain_inflight_bytes_avg << "\n";
+    stream << "  memory_watermark_drain_memory_bytes_avg="
+           << perf.memory_watermark_drain_memory_bytes_avg << "\n";
     stream << "  flush_count=" << perf.flush_count << "\n";
     stream << "  flush_time_ms_total=" << perf.flush_time_ms_total << "\n";
     stream << "  metadata_save_count=" << perf.metadata_save_count << "\n";

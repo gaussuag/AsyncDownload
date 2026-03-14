@@ -167,6 +167,8 @@ struct SessionState {
     std::atomic<std::size_t> queued_packets{0};
     // queued_bytes 表示 network -> persistence 队列里按 accounted_bytes 统计的积压体量。
     std::atomic<std::int64_t> queued_bytes{0};
+    std::atomic<std::int64_t> queued_payload_bytes{0};
+    std::atomic<std::int64_t> active_buffered_accounted_bytes{0};
     std::atomic<std::size_t> queue_paused_handles{0};
     std::atomic<std::size_t> memory_paused_handles{0};
     std::atomic<bool> cancel_requested{false};
@@ -181,6 +183,12 @@ struct SessionState {
     std::int64_t last_progress_persisted_bytes = 0;
     double last_network_bytes_per_second = 0.0;
     double last_disk_bytes_per_second = 0.0;
+    bool memory_watermark_episode_active = false;
+    std::size_t memory_watermark_episode_start_active_requests = 0;
+    std::int64_t memory_watermark_episode_start_active_window_bytes = 0;
+    std::int64_t memory_watermark_episode_start_queued_payload_bytes = 0;
+    std::int64_t memory_watermark_episode_start_inflight_bytes = 0;
+    std::int64_t memory_watermark_episode_start_memory_bytes = 0;
     performance::RuntimePerformanceMetrics performance_metrics{};
 };
 

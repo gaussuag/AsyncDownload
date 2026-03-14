@@ -40,10 +40,13 @@ void maybe_record_first_persist(core::SessionState& session) noexcept {
 }
 
 void update_inflight_peak(core::SessionState& session) noexcept {
-    const auto inflight = session.downloaded_bytes.load(std::memory_order_relaxed) -
-        session.persisted_bytes.load(std::memory_order_relaxed);
-    update_peak(session.performance_metrics.max_inflight_bytes,
-        std::max<std::int64_t>(0, inflight));
+    const auto inflight = std::max<std::int64_t>(0,
+        session.downloaded_bytes.load(std::memory_order_relaxed) -
+            session.persisted_bytes.load(std::memory_order_relaxed));
+    const auto queued_payload_bytes = session.queued_payload_bytes.load(std::memory_order_relaxed);
+    update_peak(session.performance_metrics.max_inflight_bytes, inflight);
+    update_peak(session.performance_metrics.max_post_queue_inflight_bytes,
+        std::max<std::int64_t>(0, inflight - queued_payload_bytes));
 }
 
 [[nodiscard]] std::int64_t elapsed_ns(const std::chrono::steady_clock::time_point started_at) noexcept {
@@ -173,6 +176,13 @@ void PersistenceThread::handle_packet(core::DataPacket packet) {
         if (queued_bytes < 0) {
             session_.queued_bytes.store(0, std::memory_order_relaxed);
         }
+        const auto queued_payload_bytes = session_.queued_payload_bytes.fetch_sub(
+            static_cast<std::int64_t>(packet.payload.size()), std::memory_order_relaxed) -
+            static_cast<std::int64_t>(packet.payload.size());
+        if (queued_payload_bytes < 0) {
+            session_.queued_payload_bytes.store(0, std::memory_order_relaxed);
+        }
+        update_inflight_peak(session_);
     }
 
     if (packet.kind == core::PacketKind::range_complete) {
@@ -348,7 +358,10 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
 
         // 真正的磁盘写入只发生在 Persistence 线程里，这样相邻 range 在扇区边界上
         // 不会出现并发 RMW 竞争。
-        const auto write_error = write_bytes(cursor, bytes.subspan(index, aligned_bytes), sample_timing);
+        const auto write_error = write_bytes(cursor,
+            bytes.subspan(index, aligned_bytes),
+            sample_timing,
+            false);
         if (write_error) {
             finish_sample();
             return write_error;
@@ -373,7 +386,8 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
 
 std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
                                                const std::span<const std::uint8_t> bytes,
-                                               const bool sample_timing) {
+                                               const bool sample_timing,
+                                               const bool tail_write) {
     const auto flush_pending = pending_flush_.valid() &&
         pending_flush_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
     const auto write_started_at = sample_timing ? std::chrono::steady_clock::now() :
@@ -383,6 +397,17 @@ std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
     const auto write_error = file_writer_.write(offset, bytes);
     session_.performance_metrics.file_write_calls_total.fetch_add(
         1, std::memory_order_relaxed);
+    if (tail_write) {
+        session_.performance_metrics.tail_write_calls_total.fetch_add(
+            1, std::memory_order_relaxed);
+        session_.performance_metrics.tail_write_bytes_total.fetch_add(
+            static_cast<std::int64_t>(bytes.size()), std::memory_order_relaxed);
+    } else {
+        session_.performance_metrics.aligned_write_calls_total.fetch_add(
+            1, std::memory_order_relaxed);
+        session_.performance_metrics.aligned_write_bytes_total.fetch_add(
+            static_cast<std::int64_t>(bytes.size()), std::memory_order_relaxed);
+    }
     if (sample_timing) {
         record_latency_sample(session_.performance_metrics.latency.file_write.sample_count,
             session_.performance_metrics.latency.file_write.total_time_ns,
@@ -414,7 +439,8 @@ std::error_code PersistenceThread::flush_tail(core::RangeContext& range, const b
     // 但磁盘上最后一个扇区还停留在内存里。
     const auto write_error = write_bytes(range.tail_buffer.offset,
         std::span<const std::uint8_t>(bytes.data(), write_size),
-        sample_timing);
+        sample_timing,
+        true);
     if (write_error) {
         return write_error;
     }

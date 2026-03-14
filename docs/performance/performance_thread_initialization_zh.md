@@ -38,11 +38,11 @@
 1. 当前正式 benchmark 基线仍然是 `regression_v2`，主回归观察顺序仍以 `baseline_default`、`balanced_candidate`、`memory_guard`、`scheduler_stress` 为先。
 2. queue/backpressure 生命周期指标已经补齐，当前不再缺“观测面”，而是缺“解释面”和“keeper 级闭环”。
 3. `BlockingConcurrentQueue` 已按 explicit producer + 预分配方式修正，第三方 queue 的使用方式错位已被收敛，这个修正应当保留。
-4. 但多组 case 的运行态 queue 峰值仍长期停在约 `~1000 packets / ~64-66 MiB`，说明当前约束并不只来自先前的 implicit producer/no-allocation 错位。
-5. `queue_backpressure_stress` 仍然表现出双层放大：
-   - queue pause 会先被 queue 写入边界触发
-   - 恢复阶段又可能继续被 memory low-watermark 延后
-6. 因此这条新 thread 的主要任务，不再是补指标，也不是直接追求新的峰值吞吐，而是把“真实 queue 峰值为什么停在这里”和“pause churn 为什么仍然高”继续闭环到可操作的优化结论。
+4. 最新 budget-chain 观测已经补到 `max_active_window_bytes`、`max_queued_payload_bytes`、`max_post_queue_inflight_bytes`，当前可以直接区分 scheduler window、queue payload 和 queue 外 inflight。
+5. 现阶段更强的新信号是：多个主 case 里 `inflight` 几乎与 `queued_payload` 重合，而 `post_queue_inflight` 只有几十到一百多 KiB，说明大部分积压本身就是 queue。
+6. 最新 callback 侧 headroom 分层验证表明，`deep_buffer_candidate` 的 pre-high 慢簇不是单次大 incoming chunk，而是 queue payload 已经贴近 high watermark 时，多个 handle 的本地 partial packet 再叠上最后一个 `~16 KiB` incoming 触发。
+7. 同一轮数据又暴露出第二类无 memory pause 慢态：有的 run 会在 `memory_pause_count = 0` 的情况下把 `max_queued_payload_bytes` 推到 `~230 MiB`，有的 run 则表现为 `handle_data_packet / append / file_write` 时延整体抬高。
+8. 当前 thread 的主要任务因此进一步收敛为：一边保留已闭环的 pre-high pause 机制结论，一边继续解释“无 pause 也会变慢”的剩余运行态。
 
 ## 4. 本线程默认主目标
 
@@ -108,11 +108,11 @@ python scripts/performance/profiler.py --url "http://127.0.0.1:4287/1gb_files.zi
 
 如果下一步继续进入实现，建议先围绕以下问题展开：
 
-1. `resume_paused_transfers()` 中，queue-ready 与 memory-ready 当前是否被同一个恢复门槛绑得过紧。
-2. `scheduler_window_bytes * max_connections`、`queued_bytes` 峰值和 `max_queued_packets` 之间，是否已经形成稳定的运行态预算上限。
-3. `deep_buffer_candidate` 与 `queue_backpressure_stress` 中，真实进入 pause 的时机更像“生产预算撞顶”还是“恢复路径太保守”。
-4. `memory_guard` 中的 `queue_resume_blocked_by_memory_*` 指标，是否已经足以证明 memory low-watermark 在放大 queue pause 生命周期。
-5. 若要提出新的 keeper 改法，它与之前被采纳或被降级的实验相比，具体差异到底是什么。
+1. `deep_buffer_candidate` 里，为什么有些 run 会在 `memory_pause_count = 0` 的情况下把 `max_queued_payload_bytes` 继续推到 `~230 MiB`，而另一些 run 会稳定停在 `~120-150 MiB`。
+2. `max_active_window_bytes`、`max_queued_payload_bytes`、`max_post_queue_inflight_bytes` 三者之间，当前究竟是谁先形成实际运行态上限。
+3. 已经闭环的 callback pre-high memory pause 之外，无 pause 慢 run 里的 `handle_data_packet / append / file_write` 时延抬升，目前更强地指向 pending flush 期间的写路径阻塞；若继续推进，应优先验证 flush 阻塞语义，而不是重复拆 write shape。
+4. `queue_backpressure_stress` 中，当前是已经演化成“纯 memory watermark case”，还是只是在当前 smoke 环境里暂时不再暴露 queue-resume 放大。
+5. 若要提出新的 keeper 改法，它与之前被采纳或被降级的实验相比，具体差异到底是什么，尤其要能说明为什么它不同于“延后 threshold flush”“简单拆 FileWriter 句柄”“dedicated CRC read handle”以及“简单 incremental CRC cache / compact metadata JSON”这几条已经 reject 的方向。
 
 ## 8. 初始化结论
 
@@ -122,5 +122,9 @@ python scripts/performance/profiler.py --url "http://127.0.0.1:4287/1gb_files.zi
 - 当前正式基线、历史结论和实现入口已固定
 - 默认主目标已明确为“先解释约束并收敛 stress-case pause churn”
 - 正式验证顺序已固定为 build -> test -> smoke benchmark -> 正式 benchmark -> profiler
+- 当前新补的 persistence write-shape 观测已确认：写入批次形态不是主分叉，flush/pending-flush 阻塞才是更强信号
+- “延后 threshold flush”与“拆 FileWriter 写/flush 句柄”均已作为 reject experiment 记录，不应在没有新机制差异前重复进入
+- 增量 CRC cache 已证明能命中真实重复读盘，但两轮 deep_buffer rerun 仍未形成 keeper 收益，因此也已降级为 reject experiment
+- “dedicated CRC read handle” 与 “compact metadata JSON” 也已完成定向验证并 reject；它们都没有改变当前双峰慢态，说明简单拆读句柄或缩小 metadata 文本体积都不是当前主卡点
 
 后续可以直接从这份初始化文档进入下一轮代码分析、keeper 设计和回归验证。
