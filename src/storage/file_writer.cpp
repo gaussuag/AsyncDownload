@@ -2,6 +2,7 @@
 
 #include "asyncdownload/error.hpp"
 
+#include <chrono>
 #include <fstream>
 
 #ifdef _WIN32
@@ -134,6 +135,7 @@ std::error_code FileWriter::open(const std::filesystem::path& path,
 #endif
 
     path_ = path;
+    io_metrics_ = {};
     // 句柄一旦成功打开，就立即尝试把逻辑容量扩到目标大小。
     // 这样后续随机写入时不会不断触发文件扩展路径。
     const auto preallocate_error = preallocate(total_size);
@@ -190,6 +192,7 @@ std::error_code FileWriter::write(const std::int64_t offset,
     // FileWriter 对外暴露的是线程安全接口，所以 write/read/flush/finalize 共用同一把锁，
     // 保证异步 flush 和正常写入不会在同一个文件句柄上交叉打架。
     std::scoped_lock lock(mutex_);
+    const auto started_at = std::chrono::steady_clock::now();
 
 #ifdef _WIN32
     // 这里显式使用系统页缓存，不走 NO_BUFFERING。对下载器来说，串行化的小批量
@@ -211,11 +214,17 @@ std::error_code FileWriter::write(const std::int64_t offset,
     }
 #endif
 
+    io_metrics_.write_bytes_total += static_cast<std::int64_t>(bytes.size());
+    io_metrics_.write_time_ns_total += std::max<std::int64_t>(0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_at).count());
+
     return {};
 }
 
 std::error_code FileWriter::flush() noexcept {
     std::scoped_lock lock(mutex_);
+    const auto started_at = std::chrono::steady_clock::now();
 
 #ifdef _WIN32
     // flush 的语义是把系统页缓存里的脏页尽量推进到稳定介质，
@@ -228,6 +237,10 @@ std::error_code FileWriter::flush() noexcept {
         return make_error_code(DownloadErrc::file_flush_failed);
     }
 #endif
+
+    io_metrics_.flush_time_ns_total += std::max<std::int64_t>(0,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_at).count());
 
     return {};
 }
@@ -290,6 +303,11 @@ std::error_code FileWriter::finalize(const std::filesystem::path& output_path,
 
     path_ = output_path;
     return {};
+}
+
+FileIoMetrics FileWriter::io_metrics() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return io_metrics_;
 }
 
 void FileWriter::close() noexcept {

@@ -32,7 +32,6 @@ from performance_common import (
     parse_case_list,
     perform_head_request,
     safe_pct_change,
-    total_pause_count,
     validate_execution_inputs,
     write_csv,
     write_json,
@@ -108,7 +107,6 @@ def aggregate_runs(
         resumed_values = [bool(run["resumed"]) for run in runs]
         row["all_resumed"] = all(resumed_values)
         row["any_resumed"] = any(resumed_values)
-        row["total_pause_count_median"] = total_pause_count(row, "_median")
         aggregated_rows.append(row)
         if baseline_key is not None and key == baseline_key:
             baseline_speed = row["avg_network_speed_mb_s_median"]
@@ -269,33 +267,36 @@ def render_markdown_report(
         lines.append("| --- | --- |")
         lines.append(f"| Avg Network MB/s | {format_float(float(baseline_row['avg_network_speed_mb_s_median']))} |")
         lines.append(f"| Avg Disk MB/s | {format_float(float(baseline_row['avg_disk_speed_mb_s_median']))} |")
-        lines.append(f"| Peak Network MB/s | {format_float(float(baseline_row['peak_network_speed_mb_s_median']))} |")
+        lines.append(f"| Time To First Byte Ms | {int(round(float(baseline_row['time_to_first_byte_ms_median'])))} |")
         lines.append(f"| Max Memory Bytes | {int(round(float(baseline_row['max_memory_bytes_median'])))} |")
         lines.append(f"| Max Inflight Bytes | {int(round(float(baseline_row['max_inflight_bytes_median'])))} |")
         lines.append(f"| Total Pause Count | {format_float(float(baseline_row['total_pause_count_median']))} |")
+        lines.append(f"| Wall Clock Duration Ms | {int(round(float(baseline_row['wall_clock_duration_ms_median'])))} |")
         lines.append("")
 
     if execution_mode == "benchmark_suite":
         lines.append("## Benchmark Suite Cases")
         lines.append("")
-        lines.append("| Case | Value | Purpose | Avg Network MB/s | Avg Disk MB/s | Gain vs Baseline | Max Memory Bytes | Total Pauses | Max Inflight Bytes |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| Case | Value | Purpose | Avg Network MB/s | Avg Disk MB/s | TTFB Ms | Gain vs Baseline | Max Memory Bytes | Total Pauses | Max Inflight Bytes | Wall Clock Ms |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for row in sorted(grouped_rows.get(benchmark_suite_name, []), key=lambda item: int(item["case_order"])):
             lines.append(
                 f"| {row['case_name']} | {row['display_value']} | {row['case_purpose']} | "
                 f"{format_float(float(row['avg_network_speed_mb_s_median']))} | "
                 f"{format_float(float(row['avg_disk_speed_mb_s_median']))} | "
+                f"{int(round(float(row['time_to_first_byte_ms_median'])))} | "
                 f"{format_pct(float(row['avg_network_speed_gain_vs_baseline_pct']))} | "
                 f"{int(round(float(row['max_memory_bytes_median'])))} | "
                 f"{format_float(float(row['total_pause_count_median']))} | "
-                f"{int(round(float(row['max_inflight_bytes_median'])))} |"
+                f"{int(round(float(row['max_inflight_bytes_median'])))} | "
+                f"{int(round(float(row['wall_clock_duration_ms_median'])))} |"
             )
         lines.append("")
     else:
         lines.append("## Best Cases")
         lines.append("")
-        lines.append("| Sweep | Case | Value | Avg Network MB/s | Max Memory Bytes | Total Pause Count | Max Inflight Bytes |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| Sweep | Case | Value | Avg Network MB/s | Avg Disk MB/s | TTFB Ms | Max Memory Bytes | Total Pause Count | Max Inflight Bytes | Wall Clock Ms |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for sweep_name in metadata["executed_sweeps"]:
             if sweep_name == "baseline":
                 continue
@@ -305,9 +306,12 @@ def render_markdown_report(
             lines.append(
                 f"| {sweep_name} | {row['case_name']} | {row['display_value']} | "
                 f"{format_float(float(row['avg_network_speed_mb_s_median']))} | "
+                f"{format_float(float(row['avg_disk_speed_mb_s_median']))} | "
+                f"{int(round(float(row['time_to_first_byte_ms_median'])))} | "
                 f"{int(round(float(row['max_memory_bytes_median'])))} | "
                 f"{format_float(float(row['total_pause_count_median']))} | "
-                f"{int(round(float(row['max_inflight_bytes_median'])))} |"
+                f"{int(round(float(row['max_inflight_bytes_median'])))} | "
+                f"{int(round(float(row['wall_clock_duration_ms_median'])))} |"
             )
         lines.append("")
 
@@ -340,17 +344,19 @@ def render_markdown_report(
             continue
         lines.append(f"### {sweep_name}")
         lines.append("")
-        lines.append("| Case | Value | Avg Network MB/s | Avg Disk MB/s | Gain vs Baseline | Max Memory Bytes | Total Pauses | Max Inflight Bytes |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append("| Case | Value | Avg Network MB/s | Avg Disk MB/s | TTFB Ms | Gain vs Baseline | Max Memory Bytes | Total Pauses | Max Inflight Bytes | Wall Clock Ms |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for row in sorted(rows, key=lambda item: int(item["case_order"])):
             lines.append(
                 f"| {row['case_name']} | {row['display_value']} | "
                 f"{format_float(float(row['avg_network_speed_mb_s_median']))} | "
                 f"{format_float(float(row['avg_disk_speed_mb_s_median']))} | "
+                f"{int(round(float(row['time_to_first_byte_ms_median'])))} | "
                 f"{format_pct(float(row['avg_network_speed_gain_vs_baseline_pct']))} | "
                 f"{int(round(float(row['max_memory_bytes_median'])))} | "
                 f"{format_float(float(row['total_pause_count_median']))} | "
-                f"{int(round(float(row['max_inflight_bytes_median'])))} |"
+                f"{int(round(float(row['max_inflight_bytes_median'])))} | "
+                f"{int(round(float(row['wall_clock_duration_ms_median'])))} |"
             )
         lines.append("")
 
@@ -504,8 +510,9 @@ def main() -> int:
                         f"duration_ms={row['wall_clock_duration_ms']} "
                         f"avg_net={row['avg_network_speed_mb_s']:.2f}MB/s "
                         f"avg_disk={row['avg_disk_speed_mb_s']:.2f}MB/s "
+                        f"ttfb_ms={int(row['time_to_first_byte_ms'])} "
                         f"memory={row['max_memory_bytes']} "
-                        f"pauses={int(total_pause_count(row))}"
+                        f"pauses={int(row['total_pause_count'])}"
                     )
                     final_row = row
                     if row["exit_code"] == 0 and row["status"] == "success":
@@ -583,7 +590,6 @@ def main() -> int:
         "overwrite_existing",
         "all_resumed",
         "any_resumed",
-        "total_pause_count_median",
         "avg_network_speed_gain_vs_baseline_pct",
     ]
     for field in SUMMARY_NUMERIC_FIELDS + ["wall_clock_duration_ms"]:

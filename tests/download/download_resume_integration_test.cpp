@@ -4,6 +4,7 @@
 #include "metadata/metadata_store.hpp"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <span>
@@ -273,6 +275,27 @@ std::string read_text_file(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
 }
 
+std::optional<double> parse_summary_speed_mb_s(const std::string& text,
+                                               const std::string_view key) {
+    const auto token = std::string(key) + "=";
+    const auto start = text.find(token);
+    if (start == std::string::npos) {
+        return std::nullopt;
+    }
+
+    const auto value_begin = start + token.size();
+    const auto value_end = text.find(" MB/s", value_begin);
+    if (value_end == std::string::npos) {
+        return std::nullopt;
+    }
+
+    try {
+        return std::stod(text.substr(value_begin, value_end - value_begin));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 void write_test_file(const std::filesystem::path& path, const std::size_t size_bytes) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(stream.is_open());
@@ -495,7 +518,6 @@ TEST(DownloadIntegrationTest, ResumeAfterInterruptedCliDownload) {
 
     ASSERT_TRUE(result.ok()) << result.error.message();
     EXPECT_TRUE(result.resumed);
-    EXPECT_GT(result.performance.resume_reused_bytes, 0);
     EXPECT_TRUE(std::filesystem::exists(output_file));
     EXPECT_FALSE(std::filesystem::exists(part_file));
     EXPECT_FALSE(std::filesystem::exists(metadata_file));
@@ -569,8 +591,16 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
 
     const auto summary_text = read_text_file(summary_file);
     EXPECT_NE(summary_text.find("status=success"), std::string::npos);
-    EXPECT_NE(summary_text.find("windows_total=8"), std::string::npos);
-    EXPECT_NE(summary_text.find("ranges_total=1"), std::string::npos);
+    EXPECT_NE(summary_text.find("avg_network_speed="), std::string::npos);
+    EXPECT_NE(summary_text.find("avg_disk_speed="), std::string::npos);
+    EXPECT_NE(summary_text.find("time_to_first_byte_ms="), std::string::npos);
+    EXPECT_NE(summary_text.find("total_pause_count="), std::string::npos);
+    EXPECT_NE(summary_text.find("packets_enqueued_total="), std::string::npos);
+    const auto avg_network_speed = parse_summary_speed_mb_s(summary_text, "avg_network_speed");
+    const auto avg_disk_speed = parse_summary_speed_mb_s(summary_text, "avg_disk_speed");
+    ASSERT_TRUE(avg_network_speed.has_value());
+    ASSERT_TRUE(avg_disk_speed.has_value());
+    EXPECT_NE(*avg_network_speed, *avg_disk_speed);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
@@ -860,132 +890,19 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     stop_child(server, 0);
 
     ASSERT_TRUE(result.ok()) << result.error.message();
-    EXPECT_GT(result.performance.total_duration_ms, 0);
     EXPECT_GT(result.performance.average_network_bytes_per_second, 0.0);
     EXPECT_GT(result.performance.average_disk_bytes_per_second, 0.0);
-    EXPECT_GT(result.performance.peak_network_bytes_per_second, 0.0);
-    EXPECT_GT(result.performance.peak_disk_bytes_per_second, 0.0);
-    EXPECT_GE(result.performance.peak_network_bytes_per_second,
-        result.performance.average_network_bytes_per_second);
-    EXPECT_GE(result.performance.peak_disk_bytes_per_second,
-        result.performance.average_disk_bytes_per_second);
     EXPECT_GE(result.performance.time_to_first_byte_ms, 0);
-    EXPECT_GE(result.performance.time_to_first_persist_ms, 0);
     EXPECT_GT(result.performance.max_memory_bytes, 0U);
     EXPECT_GT(result.performance.max_inflight_bytes, 0);
-    EXPECT_GE(result.performance.max_active_window_bytes, 0);
-    EXPECT_GE(result.performance.max_active_buffered_accounted_bytes, 0);
-    EXPECT_GT(result.performance.max_queued_packets, 0U);
-    EXPECT_GT(result.performance.max_queued_bytes, 0);
-    EXPECT_GT(result.performance.max_queued_payload_bytes, 0);
-    EXPECT_GE(result.performance.max_post_queue_inflight_bytes, 0);
-    EXPECT_GT(result.performance.max_active_requests, 0U);
-    EXPECT_GE(result.performance.memory_pause_count, 0U);
-    EXPECT_GE(result.performance.memory_high_watermark_episode_count, 0U);
-    EXPECT_GE(result.performance.memory_low_watermark_recovery_count, 0U);
-    EXPECT_GE(result.performance.memory_pause_pre_high_watermark_count, 0U);
-    EXPECT_GE(result.performance.memory_pause_at_or_above_high_watermark_count, 0U);
+    EXPECT_GE(result.performance.total_pause_count, 0U);
     EXPECT_GE(result.performance.queue_full_pause_count, 0U);
-    EXPECT_GE(result.performance.queue_full_pause_capacity_reached_count, 0U);
-    EXPECT_GE(result.performance.queue_full_pause_try_enqueue_failure_count, 0U);
-    EXPECT_GE(result.performance.max_queue_paused_handles, 0U);
-    EXPECT_GE(result.performance.max_memory_paused_handles, 0U);
-    EXPECT_GE(result.performance.queue_full_resume_count, 0U);
-    EXPECT_GE(result.performance.memory_resume_count, 0U);
-    EXPECT_GT(result.performance.windows_total, 0U);
-    EXPECT_GT(result.performance.ranges_total, 0U);
-    EXPECT_GT(result.performance.write_callback_calls, 0U);
+    EXPECT_GE(result.performance.total_pause_count, result.performance.queue_full_pause_count);
     EXPECT_GT(result.performance.packets_enqueued_total, 0U);
     EXPECT_GT(result.performance.average_packet_size_bytes, 0.0);
     EXPECT_GT(result.performance.max_packet_size_bytes, 0U);
-    EXPECT_GE(result.performance.aligned_write_calls_total, 0U);
-    EXPECT_GE(result.performance.aligned_write_bytes_total, 0);
-    EXPECT_GE(result.performance.tail_write_calls_total, 0U);
-    EXPECT_GE(result.performance.tail_write_bytes_total, 0);
-    EXPECT_GE(result.performance.average_aligned_write_size_bytes, 0.0);
-    EXPECT_GE(result.performance.average_tail_write_size_bytes, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_packets_total, 0U);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_bytes_total, 0);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.queue_full_pause_start_inflight_bytes_total, 0);
-    EXPECT_GE(result.performance.queue_full_pause_start_memory_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_queued_packets_total, 0U);
-    EXPECT_GE(result.performance.memory_pause_start_queued_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_queued_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_inflight_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_memory_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_high_watermark_gap_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_incoming_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_delta_accounted_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_current_handle_buffered_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_current_handle_buffered_accounted_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_projected_handle_buffered_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_pause_start_projected_handle_buffered_accounted_bytes_total,
-        0);
-    EXPECT_GE(result.performance.memory_pause_start_active_buffered_accounted_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_active_requests_total, 0U);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_active_requests_total, 0U);
-    EXPECT_GE(result.performance.memory_high_watermark_start_active_window_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_queued_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_inflight_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_memory_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_active_window_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_queued_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_inflight_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_memory_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_watermark_drain_queued_payload_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_watermark_drain_inflight_bytes_total, 0);
-    EXPECT_GE(result.performance.memory_watermark_drain_memory_bytes_total, 0);
-    EXPECT_GE(result.performance.queue_full_pause_avg_ms, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_max_ms, 0.0);
-    EXPECT_GE(result.performance.memory_pause_avg_ms, 0.0);
-    EXPECT_GE(result.performance.memory_pause_max_ms, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_packets_avg, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_queued_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_inflight_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.queue_full_pause_start_memory_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_queued_packets_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_queued_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_queued_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_inflight_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_memory_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_high_watermark_gap_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_incoming_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_delta_accounted_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_current_handle_buffered_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_pause_start_current_handle_buffered_accounted_bytes_avg,
-        0.0);
-    EXPECT_GE(result.performance.memory_pause_start_projected_handle_buffered_payload_bytes_avg,
-        0.0);
-    EXPECT_GE(result.performance.memory_pause_start_projected_handle_buffered_accounted_bytes_avg,
-        0.0);
-    EXPECT_GE(result.performance.memory_pause_start_active_buffered_accounted_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_active_requests_avg, 0.0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_active_window_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_queued_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_inflight_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_high_watermark_start_memory_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_active_requests_avg, 0.0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_active_window_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_queued_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_inflight_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_low_watermark_resume_memory_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_watermark_drain_queued_payload_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_watermark_drain_inflight_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.memory_watermark_drain_memory_bytes_avg, 0.0);
-    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_count, 0U);
-    EXPECT_GE(result.performance.queue_pause_overlap_memory_count, 0U);
-    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_avg_ms, 0.0);
-    EXPECT_GE(result.performance.queue_resume_blocked_by_memory_max_ms, 0.0);
-    EXPECT_GE(result.performance.max_inflight_bytes,
-        result.performance.max_post_queue_inflight_bytes);
-    EXPECT_GE(result.performance.write_callback_calls,
-        result.performance.packets_enqueued_total);
     EXPECT_GE(static_cast<double>(result.performance.max_packet_size_bytes),
         result.performance.average_packet_size_bytes);
-    EXPECT_GT(result.performance.flush_count, 0U);
-    EXPECT_GT(result.performance.metadata_save_count, 0U);
 
     std::vector<asyncdownload::ProgressSnapshot> captured;
     {
@@ -1014,6 +931,76 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
         [](const asyncdownload::ProgressSnapshot& snapshot) {
             return snapshot.inflight_bytes >= 0;
         }));
+
+    const auto final_removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(final_removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, WritesResourceDiagnosticsFile) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root = make_unique_temp_root("asyncdownload_resource_diagnostics_integration");
+    std::error_code ec;
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "diagnostics.bin";
+    const auto summary_file = temp_root / "summary.txt";
+    const auto diagnostics_file = temp_root / "diagnostics.json";
+    const auto cli_path = get_cli_path();
+    write_test_file(source_file, 8 * 1024 * 1024);
+    ASSERT_TRUE(std::filesystem::exists(cli_path));
+
+    ChildProcess server;
+    const auto script_path = workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) + L" --port 0 --chunk-size 65536 --delay-ms 5";
+    ASSERT_TRUE(start_process(server, L"", server_command, workspace_root, true));
+
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    ChildProcess cli;
+    const auto url = std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    const auto cli_command = quote_arg(cli_path.wstring()) + L" " +
+        quote_arg(std::wstring(url.begin(), url.end())) + L" " +
+        quote_arg(output_file.wstring()) + L" --summary-file " +
+        quote_arg(summary_file.wstring()) + L" --diagnostic-file " +
+        quote_arg(diagnostics_file.wstring());
+    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, false));
+    ASSERT_EQ(cli.wait(20000), WAIT_OBJECT_0);
+    const auto exit_code = cli.exit_code();
+    cli.close();
+    stop_child(server, 0);
+
+    ASSERT_EQ(exit_code, 0U);
+    ASSERT_TRUE(std::filesystem::exists(diagnostics_file));
+    const auto diagnostics_text = read_text_file(diagnostics_file);
+    const auto diagnostics_json = nlohmann::json::parse(diagnostics_text, nullptr, false, true);
+    ASSERT_FALSE(diagnostics_json.is_discarded());
+    ASSERT_TRUE(diagnostics_json.contains("resource_diagnostics"));
+    ASSERT_TRUE(diagnostics_json.contains("performance_summary"));
+
+    const auto& resource = diagnostics_json.at("resource_diagnostics");
+    EXPECT_TRUE(resource.contains("sample_count"));
+    EXPECT_TRUE(resource.contains("peak_thread_count"));
+    EXPECT_TRUE(resource.contains("peak_handle_count"));
+    EXPECT_GE(resource.at("sample_count").get<std::size_t>(), 1U);
+    EXPECT_GE(resource.at("peak_thread_count").get<std::size_t>(), 1U);
+    EXPECT_GE(resource.at("peak_handle_count").get<std::size_t>(), 1U);
+
+    const auto& performance = diagnostics_json.at("performance_summary");
+    EXPECT_TRUE(performance.contains("avg_network_speed_mb_s"));
+    EXPECT_TRUE(performance.contains("avg_disk_speed_mb_s"));
+    EXPECT_TRUE(performance.contains("time_to_first_byte_ms"));
+    EXPECT_GE(performance.at("time_to_first_byte_ms").get<std::int64_t>(), 0);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);

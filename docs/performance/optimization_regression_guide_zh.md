@@ -85,15 +85,25 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 
 ### 3.3 对比时必须看这些指标
 
-每个 case 至少看以下 5 个指标：
+每个 case 至少看以下 6 个正式主链指标：
 
 - `avg_network_speed_mb_s_median`
+- `avg_disk_speed_mb_s_median`
+- `time_to_first_byte_ms_median`
 - `max_memory_bytes_median`
 - `max_inflight_bytes_median`
 - `total_pause_count_median`
-- `wall_clock_duration_ms_median`
 
-如果只看吞吐，不看内存、inflight、pause，很容易把“堆积更多数据”误判成优化。
+正式辅助指标继续保留，但不参与主排序：
+
+- `queue_full_pause_count_median`
+- `packets_enqueued_total_median`
+- `avg_packet_size_bytes_median`
+- `max_packet_size_bytes_median`
+
+`wall_clock_duration_ms_median` 继续作为辅助时间指标保留在 benchmark 报表里。
+
+如果只看吞吐，不看首包时延、磁盘吞吐、内存、inflight、pause，很容易把“堆积更多数据”误判成优化。
 
 ### 3.4 benchmark 与 profiler 的执行顺序
 
@@ -295,3 +305,26 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 - `memory_guard` 与 `queue_backpressure_stress` 适合作为保守路径参考点。
 - `throughput_candidate`、`balanced_candidate`、`deep_buffer_candidate` 更适合作为“高并发路径修复进度”观察点。
 - `gap_tolerance_probe` 适合作为 gap 路径风险观察点。
+
+## 11. 诊断/验收层入口
+
+以下内容不进入 benchmark 主表，但应作为诊断/验收层保留：
+
+- 资源诊断：CPU、线程数、句柄数
+- 正确性/恢复诊断：CRC/VDL resume、断网中断后 resume
+- 长稳入口：独立的 `regression_v2` 长稳复测
+
+统一入口：
+
+```powershell
+python scripts\performance\acceptance.py all --url "http://127.0.0.1:4287/1gb_files.zip"
+```
+
+可单独执行：
+
+```powershell
+python scripts\performance\acceptance.py resource --url "http://127.0.0.1:4287/1gb_files.zip"
+python scripts\performance\acceptance.py resume-interruption
+python scripts\performance\acceptance.py crc-resume
+python scripts\performance\acceptance.py long-run --url "http://127.0.0.1:4287/1gb_files.zip" --repeats 10
+```

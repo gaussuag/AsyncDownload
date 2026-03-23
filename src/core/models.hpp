@@ -176,6 +176,8 @@ struct SessionState {
     ProgressCallback progress_callback{};
     // 整个任务的性能测量都以 task_started_at 为相对时间零点。
     std::chrono::steady_clock::time_point task_started_at{};
+    std::chrono::steady_clock::time_point first_network_byte_at{};
+    std::atomic<bool> first_network_byte_recorded{false};
     // 进度回调由 Orchestrator 线程统一采样，避免在网络回调或持久化线程里直接
     // 计算速度，减少跨线程统计带来的噪声。
     std::chrono::steady_clock::time_point last_progress_sample_at{};

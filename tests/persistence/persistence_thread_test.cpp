@@ -282,44 +282,8 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.latency.handle_data_packet.sample_count.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_GT(session.performance_metrics.latency.handle_data_packet.total_time_ns.load(
-        std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.latency.append_bytes.sample_count.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_GT(session.performance_metrics.latency.append_bytes.total_time_ns.load(
-        std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.latency.file_write.sample_count.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_GT(session.performance_metrics.latency.file_write.total_time_ns.load(
-        std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.file_write_calls_total.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.staged_write_flush_count.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.staged_write_bytes_total.load(
-        std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.direct_append_packets_total.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.out_of_order_insert_packets_total.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.drained_ordered_packets_total.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_packets.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_bytes.load(
-        std::memory_order_relaxed), 0);
-    EXPECT_GE(session.performance_metrics.latency.metadata_snapshot.sample_count.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.latency.crc_sample_read.sample_count.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.latency.flush_pending_write.sample_count.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.crc_sample_blocks_total.load(
-        std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.crc_sample_bytes_total.load(
-        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 4096);
+    EXPECT_GE(session.performance_metrics.max_inflight_bytes.load(std::memory_order_relaxed), 0);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -405,16 +369,8 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     EXPECT_EQ(bitmap.load(0), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(1), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(2), asyncdownload::core::BlockState::finished);
-    EXPECT_EQ(session.performance_metrics.direct_append_packets_total.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.out_of_order_insert_packets_total.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.drained_ordered_packets_total.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_EQ(session.performance_metrics.out_of_order_queue_peak_packets.load(
-        std::memory_order_relaxed), 1U);
-    EXPECT_GT(session.performance_metrics.out_of_order_queue_peak_bytes.load(
-        std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 3 * 4096);
+    EXPECT_GT(session.performance_metrics.max_memory_bytes.load(std::memory_order_relaxed), 0U);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);

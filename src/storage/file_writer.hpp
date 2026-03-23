@@ -10,6 +10,12 @@
 
 namespace asyncdownload::storage {
 
+struct FileIoMetrics {
+    std::int64_t write_bytes_total = 0;
+    std::int64_t write_time_ns_total = 0;
+    std::int64_t flush_time_ns_total = 0;
+};
+
 class FileWriter {
 public:
     FileWriter() = default;
@@ -36,6 +42,7 @@ public:
     // 把已完成的 .part 文件提升为正式文件。
     [[nodiscard]] std::error_code finalize(const std::filesystem::path& output_path,
                                            bool overwrite_existing) noexcept;
+    [[nodiscard]] FileIoMetrics io_metrics() const noexcept;
     // 幂等关闭底层句柄。
     void close() noexcept;
 
@@ -54,7 +61,8 @@ private:
     int handle_ = -1;
 #endif
     std::filesystem::path path_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
+    FileIoMetrics io_metrics_{};
 };
 
 } // namespace asyncdownload::storage

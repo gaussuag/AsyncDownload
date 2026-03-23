@@ -29,7 +29,6 @@ from performance_common import (
     parse_case_list,
     perform_head_request,
     resolve_repo_path,
-    total_pause_count,
     validate_execution_inputs,
     write_csv,
     write_json,
@@ -281,15 +280,16 @@ def render_profile_report(
 
     lines.append("## Run Summary")
     lines.append("")
-    lines.append("| Case | Repeat | Avg Network MB/s | Avg Disk MB/s | Queue Full Pauses | Gap Pauses | Max Memory Bytes | Trace | Exported CSVs |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| Case | Repeat | Avg Network MB/s | Avg Disk MB/s | TTFB Ms | Total Pauses | Queue Full Pauses | Max Memory Bytes | Trace | Exported CSVs |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for row in raw_rows:
         lines.append(
             f"| {row['case_name']} | {row['repeat_index']} | "
             f"{format_float(float(row['avg_network_speed_mb_s']))} | "
             f"{format_float(float(row['avg_disk_speed_mb_s']))} | "
+            f"{int(row['time_to_first_byte_ms'])} | "
+            f"{int(row['total_pause_count'])} | "
             f"{int(row['queue_full_pause_count'])} | "
-            f"{int(row['gap_pause_count'])} | "
             f"{int(row['max_memory_bytes'])} | "
             f"{row['trace_path']} | "
             f"{int(row['exported_files_count'])} |"
@@ -543,8 +543,7 @@ def main() -> int:
                 f"status={row['status']} "
                 f"trace_stop={row['wpr_stop_exit_code']} "
                 f"avg_net={row['avg_network_speed_mb_s']:.2f}MB/s "
-                f"avg_disk={row['avg_disk_speed_mb_s']:.2f}MB/s "
-                f"pauses={int(total_pause_count(row))} "
+                f"pauses={int(row['total_pause_count'])} "
                 f"exports={row['exported_files_count']}"
             )
 

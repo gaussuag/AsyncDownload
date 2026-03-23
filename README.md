@@ -68,7 +68,7 @@ build\tests\Debug\AsyncDownload_tests.exe
 ### 运行 CLI
 
 ```bat
-build\src\Debug\AsyncDownload.exe <url> <output> [connections] [--config <path>] [--pause-on-exit] [--summary-file <path>]
+build\src\Debug\AsyncDownload.exe <url> <output> [connections] [--config <path>] [--pause-on-exit] [--summary-file <path>] [--diagnostic-file <path>]
 ```
 
 示例：
@@ -76,6 +76,7 @@ build\src\Debug\AsyncDownload.exe <url> <output> [connections] [--config <path>]
 ```bat
 build\src\Debug\AsyncDownload.exe "https://example.com/file.bin" "build\src\Debug\file.bin" 4
 build\src\Debug\AsyncDownload.exe "https://example.com/file.bin" "build\src\Debug\file.bin" --config configs\download_options.template.json --summary-file build\src\Debug\summary.txt
+build\src\Debug\AsyncDownload.exe "https://example.com/file.bin" "build\src\Debug\file.bin" --summary-file build\src\Debug\summary.txt --diagnostic-file build\src\Debug\diagnostics.json
 ```
 
 ### 配置文件模板
@@ -118,12 +119,15 @@ CLI 当前会周期性输出这些信息：
 
 CLI 结束后还会输出一段 `Summary`，包含：
 
-- 总耗时、首包时间、首落盘时间
-- 平均/峰值网络与磁盘速度
-- 恢复复用字节数
-- 内存、inflight、队列峰值
-- pause 次数、window/range 数量
-- flush 和 metadata 保存统计
+- 正式主链指标：`avg_network_speed`、`avg_disk_speed`、`time_to_first_byte_ms`
+- 最大内存与最大 inflight
+- 总 pause 次数与 queue-full pause 次数
+- packet 形态指标：`packets_enqueued_total`、`avg_packet_size_bytes`、`max_packet_size_bytes`
+
+如果传入 `--diagnostic-file`，CLI 还会写出一份独立 JSON 诊断文件，当前包含：
+
+- 资源诊断：平均/峰值 CPU 占用、峰值线程数、峰值句柄数
+- 运行摘要与正式性能 summary 快照
 
 ## 恢复文件说明
 
@@ -201,7 +205,9 @@ build\tests\Debug\AsyncDownload_tests.exe
 build\tests\Debug\AsyncDownload_tests.exe --gtest_list_tests
 build\tests\Debug\AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.LoadsDownloadOptionsFromConfigFile
 build\tests\Debug\AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ResumeAfterInterruptedCliDownload
-build\src\Debug\AsyncDownload.exe "https://example.com/file.bin" "out.bin" --config configs\download_options.template.json --summary-file summary.txt
+build\tests\Debug\AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.WritesResourceDiagnosticsFile
+build\src\Debug\AsyncDownload.exe "https://example.com/file.bin" "out.bin" --config configs\download_options.template.json --summary-file summary.txt --diagnostic-file diagnostics.json
+python scripts\performance\acceptance.py all --url "http://127.0.0.1:4287/1gb_files.zip"
 ```
 
 如果你准备继续改代码，建议优先关注这些文件：

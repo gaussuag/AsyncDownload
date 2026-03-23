@@ -34,41 +34,11 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using DataQueue = moodycamel::BlockingConcurrentQueue<core::DataPacket>;
 
-[[nodiscard]] double average_sampled_us(const std::size_t sample_count,
-                                        const std::int64_t total_ns) noexcept {
-    if (sample_count == 0) {
-        return 0.0;
-    }
-    return static_cast<double>(total_ns) / static_cast<double>(sample_count) / 1000.0;
-}
-
-[[nodiscard]] double sampled_max_us(const std::int64_t max_ns) noexcept {
-    return static_cast<double>(std::max<std::int64_t>(0, max_ns)) / 1000.0;
-}
-
-[[nodiscard]] double average_sampled_ms(const std::size_t sample_count,
-                                        const std::int64_t total_ns) noexcept {
-    if (sample_count == 0) {
-        return 0.0;
-    }
-    return static_cast<double>(total_ns) / static_cast<double>(sample_count) / 1000000.0;
-}
-
-[[nodiscard]] double sampled_max_ms(const std::int64_t max_ns) noexcept {
-    return static_cast<double>(std::max<std::int64_t>(0, max_ns)) / 1000000.0;
-}
-
 [[nodiscard]] std::int64_t current_inflight_bytes(const core::SessionState& session) noexcept {
     return std::max<std::int64_t>(0,
         session.downloaded_bytes.load(std::memory_order_relaxed) -
             session.persisted_bytes.load(std::memory_order_relaxed));
 }
-
-enum class QueuePauseTrigger {
-    none = 0,
-    capacity_reached = 1,
-    try_enqueue_failure = 2
-};
 
 struct TransferHandle {
     // TransferHandle 代表一个可复用的 easy handle 槽位。
@@ -91,85 +61,13 @@ struct TransferHandle {
     bool paused_by_gap = false;
     bool paused_by_window_boundary = false;
     bool queue_pause_active = false;
-    bool queue_pause_overlap_recorded = false;
     CURLcode curl_result = CURLE_OK;
     Clock::time_point request_started{};
-    Clock::time_point queue_pause_started_at{};
-    Clock::time_point memory_pause_started_at{};
-    Clock::time_point queue_resume_blocked_by_memory_started_at{};
-    QueuePauseTrigger last_queue_pause_trigger = QueuePauseTrigger::none;
     std::int64_t buffered_offset = 0;
     std::size_t buffered_payload_bytes = 0;
     std::size_t buffered_accounted_bytes = 0;
     std::vector<std::uint8_t> buffered_payload;
 };
-
-struct RuntimeBudgetSnapshot {
-    std::size_t active_requests = 0;
-    std::int64_t active_window_bytes = 0;
-    std::int64_t active_buffered_accounted_bytes = 0;
-    std::int64_t queued_payload_bytes = 0;
-    std::int64_t inflight_bytes = 0;
-    std::int64_t memory_bytes = 0;
-};
-
-[[nodiscard]] RuntimeBudgetSnapshot collect_runtime_budget_snapshot(
-    const core::SessionState& session,
-    const std::vector<TransferHandle>& handles) noexcept {
-    RuntimeBudgetSnapshot snapshot{};
-    snapshot.active_buffered_accounted_bytes =
-        session.active_buffered_accounted_bytes.load(std::memory_order_relaxed);
-    snapshot.queued_payload_bytes = session.queued_payload_bytes.load(std::memory_order_relaxed);
-    snapshot.inflight_bytes = current_inflight_bytes(session);
-    snapshot.memory_bytes = static_cast<std::int64_t>(
-        core::global_memory_accounting().current_bytes());
-    for (const auto& handle : handles) {
-        if (!handle.in_multi) {
-            continue;
-        }
-        ++snapshot.active_requests;
-        if (handle.request_end >= handle.request_start) {
-            snapshot.active_window_bytes += handle.request_end - handle.request_start + 1;
-        }
-    }
-    return snapshot;
-}
-
-struct MemoryPauseStartSnapshot {
-    std::int64_t incoming_bytes = 0;
-    std::int64_t delta_accounted_bytes = 0;
-    std::int64_t current_handle_buffered_payload_bytes = 0;
-    std::int64_t current_handle_buffered_accounted_bytes = 0;
-    std::int64_t projected_handle_buffered_payload_bytes = 0;
-    std::int64_t projected_handle_buffered_accounted_bytes = 0;
-    std::int64_t active_buffered_accounted_bytes = 0;
-};
-
-[[nodiscard]] MemoryPauseStartSnapshot collect_memory_pause_start_snapshot(
-    const TransferHandle& transfer,
-    const std::size_t incoming_bytes,
-    const std::size_t projected_handle_buffered_payload_bytes,
-    const std::size_t projected_handle_buffered_accounted_bytes) noexcept {
-    MemoryPauseStartSnapshot snapshot{};
-    snapshot.incoming_bytes = static_cast<std::int64_t>(incoming_bytes);
-    snapshot.current_handle_buffered_payload_bytes =
-        static_cast<std::int64_t>(transfer.buffered_payload_bytes);
-    snapshot.current_handle_buffered_accounted_bytes =
-        static_cast<std::int64_t>(transfer.buffered_accounted_bytes);
-    snapshot.projected_handle_buffered_payload_bytes =
-        static_cast<std::int64_t>(projected_handle_buffered_payload_bytes);
-    snapshot.projected_handle_buffered_accounted_bytes =
-        static_cast<std::int64_t>(projected_handle_buffered_accounted_bytes);
-    snapshot.delta_accounted_bytes = std::max<std::int64_t>(
-        0,
-        snapshot.projected_handle_buffered_accounted_bytes -
-            snapshot.current_handle_buffered_accounted_bytes);
-    if (transfer.session != nullptr) {
-        snapshot.active_buffered_accounted_bytes =
-            transfer.session->active_buffered_accounted_bytes.load(std::memory_order_relaxed);
-    }
-    return snapshot;
-}
 
 class CurlGlobal {
 public:
@@ -206,58 +104,11 @@ void update_peak(std::atomic<T>& target, const T value) noexcept {
 
 void adjust_active_buffered_bytes(TransferHandle& transfer,
                                   const std::int64_t accounted_delta) noexcept {
-    if (transfer.session == nullptr) {
-        return;
-    }
-
-    if (accounted_delta > 0) {
-        const auto accounted_bytes = transfer.session->active_buffered_accounted_bytes.fetch_add(
-            accounted_delta,
-            std::memory_order_relaxed) + accounted_delta;
-        update_peak(transfer.session->performance_metrics.max_active_buffered_accounted_bytes,
-            accounted_bytes);
-    } else if (accounted_delta < 0) {
-        transfer.session->active_buffered_accounted_bytes.fetch_sub(
-            -accounted_delta,
-            std::memory_order_relaxed);
-    }
+    static_cast<void>(transfer);
+    static_cast<void>(accounted_delta);
 }
 
 void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept;
-
-void maybe_record_relative_time_ms(std::atomic<std::int64_t>& target,
-                                   const core::SessionState& session,
-                                   const Clock::time_point now) noexcept {
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - session.task_started_at).count();
-    auto unset = static_cast<std::int64_t>(-1);
-    const auto elapsed_ms = static_cast<std::int64_t>(std::max<std::int64_t>(0, elapsed));
-    target.compare_exchange_strong(unset,
-        elapsed_ms,
-        std::memory_order_release,
-        std::memory_order_relaxed);
-}
-
-[[nodiscard]] bool has_timestamp(const Clock::time_point timestamp) noexcept {
-    return timestamp.time_since_epoch().count() != 0;
-}
-
-template <typename CountField, typename TimeField>
-void record_sample_duration(std::atomic<CountField>& sample_count,
-                            std::atomic<TimeField>& total_time_ns,
-                            std::atomic<TimeField>& max_time_ns,
-                            const Clock::time_point started_at) noexcept {
-    if (!has_timestamp(started_at)) {
-        return;
-    }
-
-    const auto elapsed = std::max<std::int64_t>(0,
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - started_at).count());
-    sample_count.fetch_add(1, std::memory_order_relaxed);
-    total_time_ns.fetch_add(static_cast<TimeField>(elapsed), std::memory_order_relaxed);
-    update_peak(max_time_ns, static_cast<TimeField>(elapsed));
-}
 
 void update_transfer_pause_state(TransferHandle& transfer) noexcept {
     if (transfer.range == nullptr) {
@@ -276,93 +127,6 @@ void update_transfer_pause_state(TransferHandle& transfer) noexcept {
     mark_range_status(*transfer.range, core::RangeStatus::downloading);
 }
 
-void clear_queue_resume_blocked_by_memory(TransferHandle& transfer,
-                                          const bool record_sample) noexcept {
-    if (!has_timestamp(transfer.queue_resume_blocked_by_memory_started_at)) {
-        return;
-    }
-
-    if (record_sample) {
-        record_sample_duration(
-            transfer.session->performance_metrics.pause_duration
-                .queue_resume_blocked_by_memory_duration.sample_count,
-            transfer.session->performance_metrics.pause_duration
-                .queue_resume_blocked_by_memory_duration.total_time_ns,
-            transfer.session->performance_metrics.pause_duration
-                .queue_resume_blocked_by_memory_duration.max_time_ns,
-            transfer.queue_resume_blocked_by_memory_started_at);
-    }
-
-    transfer.queue_resume_blocked_by_memory_started_at = {};
-}
-
-void record_memory_high_watermark_episode_start(core::SessionState& session,
-                                                const std::vector<TransferHandle>& handles) noexcept {
-    if (session.memory_watermark_episode_active) {
-        return;
-    }
-
-    const auto snapshot = collect_runtime_budget_snapshot(session, handles);
-    session.memory_watermark_episode_active = true;
-    session.memory_watermark_episode_start_active_requests = snapshot.active_requests;
-    session.memory_watermark_episode_start_active_window_bytes = snapshot.active_window_bytes;
-    session.memory_watermark_episode_start_queued_payload_bytes = snapshot.queued_payload_bytes;
-    session.memory_watermark_episode_start_inflight_bytes = snapshot.inflight_bytes;
-    session.memory_watermark_episode_start_memory_bytes = snapshot.memory_bytes;
-    session.performance_metrics.memory_high_watermark_episode_count.fetch_add(
-        1, std::memory_order_relaxed);
-    session.performance_metrics.memory_high_watermark_start_active_requests_total.fetch_add(
-        snapshot.active_requests, std::memory_order_relaxed);
-    session.performance_metrics.memory_high_watermark_start_active_window_bytes_total.fetch_add(
-        snapshot.active_window_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_high_watermark_start_queued_payload_bytes_total.fetch_add(
-        snapshot.queued_payload_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_high_watermark_start_inflight_bytes_total.fetch_add(
-        snapshot.inflight_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_high_watermark_start_memory_bytes_total.fetch_add(
-        snapshot.memory_bytes, std::memory_order_relaxed);
-}
-
-void record_memory_low_watermark_recovery(core::SessionState& session,
-                                          const std::vector<TransferHandle>& handles) noexcept {
-    if (!session.memory_watermark_episode_active) {
-        return;
-    }
-
-    const auto snapshot = collect_runtime_budget_snapshot(session, handles);
-    session.memory_watermark_episode_active = false;
-    session.performance_metrics.memory_low_watermark_recovery_count.fetch_add(
-        1, std::memory_order_relaxed);
-    session.performance_metrics.memory_low_watermark_resume_active_requests_total.fetch_add(
-        snapshot.active_requests, std::memory_order_relaxed);
-    session.performance_metrics.memory_low_watermark_resume_active_window_bytes_total.fetch_add(
-        snapshot.active_window_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_low_watermark_resume_queued_payload_bytes_total.fetch_add(
-        snapshot.queued_payload_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_low_watermark_resume_inflight_bytes_total.fetch_add(
-        snapshot.inflight_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_low_watermark_resume_memory_bytes_total.fetch_add(
-        snapshot.memory_bytes, std::memory_order_relaxed);
-    session.performance_metrics.memory_watermark_drain_queued_payload_bytes_total.fetch_add(
-        std::max<std::int64_t>(0,
-            session.memory_watermark_episode_start_queued_payload_bytes -
-                snapshot.queued_payload_bytes),
-        std::memory_order_relaxed);
-    session.performance_metrics.memory_watermark_drain_inflight_bytes_total.fetch_add(
-        std::max<std::int64_t>(0,
-            session.memory_watermark_episode_start_inflight_bytes - snapshot.inflight_bytes),
-        std::memory_order_relaxed);
-    session.performance_metrics.memory_watermark_drain_memory_bytes_total.fetch_add(
-        std::max<std::int64_t>(0,
-            session.memory_watermark_episode_start_memory_bytes - snapshot.memory_bytes),
-        std::memory_order_relaxed);
-    session.memory_watermark_episode_start_active_requests = 0;
-    session.memory_watermark_episode_start_active_window_bytes = 0;
-    session.memory_watermark_episode_start_queued_payload_bytes = 0;
-    session.memory_watermark_episode_start_inflight_bytes = 0;
-    session.memory_watermark_episode_start_memory_bytes = 0;
-}
-
 void start_queue_pause(TransferHandle& transfer) noexcept {
     if (transfer.range == nullptr) {
         return;
@@ -371,174 +135,44 @@ void start_queue_pause(TransferHandle& transfer) noexcept {
     transfer.paused_by_window_boundary = false;
     if (!transfer.queue_pause_active) {
         transfer.queue_pause_active = true;
-        transfer.queue_pause_started_at = Clock::now();
-        transfer.queue_pause_overlap_recorded = false;
-        const auto inflight_bytes = current_inflight_bytes(*transfer.session);
-        const auto memory_bytes = static_cast<std::int64_t>(
-            core::global_memory_accounting().current_bytes());
+        transfer.session->performance_metrics.total_pause_count.fetch_add(
+            1, std::memory_order_relaxed);
         transfer.session->performance_metrics.queue_full_pause_count.fetch_add(
             1, std::memory_order_relaxed);
-        if (transfer.last_queue_pause_trigger == QueuePauseTrigger::capacity_reached) {
-            transfer.session->performance_metrics.queue_full_pause_capacity_reached_count.fetch_add(
-                1, std::memory_order_relaxed);
-        } else if (transfer.last_queue_pause_trigger == QueuePauseTrigger::try_enqueue_failure) {
-            transfer.session->performance_metrics
-                .queue_full_pause_try_enqueue_failure_count.fetch_add(
-                    1, std::memory_order_relaxed);
-        }
-        transfer.session->performance_metrics.queue_full_pause_start_queued_packets_total.fetch_add(
-            transfer.session->queued_packets.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics.queue_full_pause_start_queued_bytes_total.fetch_add(
-            transfer.session->queued_bytes.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .queue_full_pause_start_queued_payload_bytes_total.fetch_add(
-                transfer.session->queued_payload_bytes.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics.queue_full_pause_start_inflight_bytes_total.fetch_add(
-            inflight_bytes,
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics.queue_full_pause_start_memory_bytes_total.fetch_add(
-            memory_bytes,
-            std::memory_order_relaxed);
-        const auto paused_handles = transfer.session->queue_paused_handles.fetch_add(
-            1, std::memory_order_relaxed) + 1;
-        update_peak(transfer.session->performance_metrics.max_queue_paused_handles, paused_handles);
     }
 
     update_transfer_pause_state(transfer);
 }
 
-void finish_queue_pause(TransferHandle& transfer, const bool resumed) noexcept {
+void finish_queue_pause(TransferHandle& transfer) noexcept {
     if (!transfer.queue_pause_active) {
         return;
     }
 
     transfer.queue_pause_active = false;
-    if (transfer.session->queue_paused_handles.load(std::memory_order_relaxed) > 0) {
-        transfer.session->queue_paused_handles.fetch_sub(1, std::memory_order_relaxed);
-    }
-    if (resumed) {
-        transfer.session->performance_metrics.queue_full_resume_count.fetch_add(
-            1, std::memory_order_relaxed);
-        record_sample_duration(
-            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.sample_count,
-            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.total_time_ns,
-            transfer.session->performance_metrics.pause_duration.queue_full_pause_duration.max_time_ns,
-            transfer.queue_pause_started_at);
-    }
-    clear_queue_resume_blocked_by_memory(transfer, resumed);
-    transfer.queue_pause_started_at = {};
-    transfer.queue_pause_overlap_recorded = false;
-    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     update_transfer_pause_state(transfer);
 }
 
-void start_memory_pause(TransferHandle& transfer,
-                        const MemoryPauseStartSnapshot& pause_snapshot =
-                            MemoryPauseStartSnapshot{}) noexcept {
+void start_memory_pause(TransferHandle& transfer) noexcept {
     if (transfer.range == nullptr) {
         return;
     }
 
     if (!transfer.paused_by_memory) {
         transfer.paused_by_memory = true;
-        transfer.memory_pause_started_at = Clock::now();
-        const auto inflight_bytes = current_inflight_bytes(*transfer.session);
-        const auto memory_bytes = static_cast<std::int64_t>(
-            core::global_memory_accounting().current_bytes());
-        const auto high_watermark = static_cast<std::int64_t>(
-            transfer.session->options.backpressure_high_bytes);
-        transfer.session->performance_metrics.memory_pause_count.fetch_add(
+        transfer.session->performance_metrics.total_pause_count.fetch_add(
             1, std::memory_order_relaxed);
-        if (memory_bytes < high_watermark) {
-            transfer.session->performance_metrics.memory_pause_pre_high_watermark_count.fetch_add(
-                1, std::memory_order_relaxed);
-            transfer.session->performance_metrics
-                .memory_pause_start_high_watermark_gap_bytes_total.fetch_add(
-                    high_watermark - memory_bytes,
-                    std::memory_order_relaxed);
-        } else {
-            transfer.session->performance_metrics
-                .memory_pause_at_or_above_high_watermark_count.fetch_add(
-                    1, std::memory_order_relaxed);
-        }
-        transfer.session->performance_metrics.memory_pause_start_queued_packets_total.fetch_add(
-            transfer.session->queued_packets.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics.memory_pause_start_queued_bytes_total.fetch_add(
-            transfer.session->queued_bytes.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_queued_payload_bytes_total.fetch_add(
-                transfer.session->queued_payload_bytes.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics.memory_pause_start_inflight_bytes_total.fetch_add(
-            inflight_bytes,
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics.memory_pause_start_memory_bytes_total.fetch_add(
-            memory_bytes,
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics.memory_pause_start_incoming_bytes_total.fetch_add(
-            pause_snapshot.incoming_bytes,
-            std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_delta_accounted_bytes_total.fetch_add(
-                pause_snapshot.delta_accounted_bytes,
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_current_handle_buffered_payload_bytes_total.fetch_add(
-                pause_snapshot.current_handle_buffered_payload_bytes,
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_current_handle_buffered_accounted_bytes_total.fetch_add(
-                pause_snapshot.current_handle_buffered_accounted_bytes,
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_projected_handle_buffered_payload_bytes_total.fetch_add(
-                pause_snapshot.projected_handle_buffered_payload_bytes,
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_projected_handle_buffered_accounted_bytes_total.fetch_add(
-                pause_snapshot.projected_handle_buffered_accounted_bytes,
-                std::memory_order_relaxed);
-        transfer.session->performance_metrics
-            .memory_pause_start_active_buffered_accounted_bytes_total.fetch_add(
-                pause_snapshot.active_buffered_accounted_bytes,
-                std::memory_order_relaxed);
-        const auto paused_handles = transfer.session->memory_paused_handles.fetch_add(
-            1, std::memory_order_relaxed) + 1;
-        update_peak(transfer.session->performance_metrics.max_memory_paused_handles, paused_handles);
-        if (transfer.queue_pause_active && !transfer.queue_pause_overlap_recorded) {
-            transfer.queue_pause_overlap_recorded = true;
-            transfer.session->performance_metrics.queue_pause_overlap_memory_count.fetch_add(
-                1, std::memory_order_relaxed);
-        }
     }
 
     update_transfer_pause_state(transfer);
 }
 
-void finish_memory_pause(TransferHandle& transfer, const bool resumed) noexcept {
+void finish_memory_pause(TransferHandle& transfer) noexcept {
     if (!transfer.paused_by_memory) {
         return;
     }
 
     transfer.paused_by_memory = false;
-    if (transfer.session->memory_paused_handles.load(std::memory_order_relaxed) > 0) {
-        transfer.session->memory_paused_handles.fetch_sub(1, std::memory_order_relaxed);
-    }
-    if (resumed) {
-        transfer.session->performance_metrics.memory_resume_count.fetch_add(
-            1, std::memory_order_relaxed);
-        record_sample_duration(
-            transfer.session->performance_metrics.pause_duration.memory_pause_duration.sample_count,
-            transfer.session->performance_metrics.pause_duration.memory_pause_duration.total_time_ns,
-            transfer.session->performance_metrics.pause_duration.memory_pause_duration.max_time_ns,
-            transfer.memory_pause_started_at);
-    }
-    transfer.memory_pause_started_at = {};
     update_transfer_pause_state(transfer);
 }
 
@@ -575,12 +209,21 @@ void update_progress_rates(core::SessionState& session,
     session.last_progress_persisted_bytes = snapshot.persisted_bytes;
     snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
     snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
-    session.performance_metrics.peak_network_bytes_per_second =
-        std::max(session.performance_metrics.peak_network_bytes_per_second,
-            snapshot.network_bytes_per_second);
-    session.performance_metrics.peak_disk_bytes_per_second =
-        std::max(session.performance_metrics.peak_disk_bytes_per_second,
-            snapshot.disk_bytes_per_second);
+}
+
+void record_first_network_byte(core::SessionState& session,
+                               const std::size_t bytes) noexcept {
+    if (bytes == 0) {
+        return;
+    }
+
+    bool expected = false;
+    if (session.first_network_byte_recorded.compare_exchange_strong(expected,
+            true,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+        session.first_network_byte_at = Clock::now();
+    }
 }
 
 void invoke_progress(core::SessionState& session,
@@ -602,10 +245,7 @@ void invoke_progress(core::SessionState& session,
     snapshot.inflight_bytes = std::max<std::int64_t>(0,
         snapshot.downloaded_bytes - snapshot.persisted_bytes);
     snapshot.queued_packets = session.queued_packets.load(std::memory_order_relaxed);
-    const auto queued_bytes = session.queued_bytes.load(std::memory_order_relaxed);
-    const auto budget_snapshot = collect_runtime_budget_snapshot(session, handles);
-    const auto queued_payload_bytes = budget_snapshot.queued_payload_bytes;
-    snapshot.memory_bytes = static_cast<std::size_t>(budget_snapshot.memory_bytes);
+    snapshot.memory_bytes = core::global_memory_accounting().current_bytes();
     snapshot.resumed = session.resumed;
 
     for (const auto& range : ranges) {
@@ -628,22 +268,13 @@ void invoke_progress(core::SessionState& session,
         }
     }
 
-    snapshot.active_requests = budget_snapshot.active_requests;
-
-    const auto post_queue_inflight_bytes = std::max<std::int64_t>(0,
-        snapshot.inflight_bytes - queued_payload_bytes);
+    snapshot.active_requests = static_cast<std::size_t>(std::count_if(handles.begin(),
+        handles.end(),
+        [](const TransferHandle& handle) {
+            return handle.in_multi;
+        }));
     update_peak(session.performance_metrics.max_memory_bytes, snapshot.memory_bytes);
     update_peak(session.performance_metrics.max_inflight_bytes, snapshot.inflight_bytes);
-    update_peak(session.performance_metrics.max_active_window_bytes,
-        budget_snapshot.active_window_bytes);
-    update_peak(session.performance_metrics.max_active_buffered_accounted_bytes,
-        budget_snapshot.active_buffered_accounted_bytes);
-    update_peak(session.performance_metrics.max_queued_packets, snapshot.queued_packets);
-    update_peak(session.performance_metrics.max_queued_bytes, queued_bytes);
-    update_peak(session.performance_metrics.max_queued_payload_bytes, queued_payload_bytes);
-    update_peak(session.performance_metrics.max_post_queue_inflight_bytes,
-        post_queue_inflight_bytes);
-    update_peak(session.performance_metrics.max_active_requests, snapshot.active_requests);
     update_progress_rates(session, snapshot);
 
     try {
@@ -807,8 +438,7 @@ void enqueue_control_packet(DataQueue& data_queue,
     packet.kind = kind;
     packet.range_id = range_id;
     data_queue.enqueue(data_queue_producer, std::move(packet));
-    const auto queued = session.queued_packets.fetch_add(1, std::memory_order_relaxed) + 1;
-    update_peak(session.performance_metrics.max_queued_packets, queued);
+    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
 }
 
 void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept {
@@ -909,31 +539,13 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     update_peak(transfer.session->performance_metrics.max_packet_size_bytes, packet.payload.size());
 
     if (!transfer.data_queue->try_enqueue(*transfer.data_queue_producer, std::move(packet))) {
-        if (transfer.session->queued_packets.load(std::memory_order_relaxed) >=
-            transfer.session->options.queue_capacity_packets) {
-            transfer.last_queue_pause_trigger = QueuePauseTrigger::capacity_reached;
-        } else {
-            transfer.last_queue_pause_trigger = QueuePauseTrigger::try_enqueue_failure;
-        }
         transfer.buffered_payload = std::move(packet.payload);
         return false;
     }
 
-    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     transfer.session->performance_metrics.packets_enqueued_total.fetch_add(
         1, std::memory_order_relaxed);
-    const auto queued = transfer.session->queued_packets.fetch_add(
-        1, std::memory_order_relaxed) + 1;
-    const auto queued_bytes = transfer.session->queued_bytes.fetch_add(
-        static_cast<std::int64_t>(packet.accounted_bytes), std::memory_order_relaxed) +
-        static_cast<std::int64_t>(packet.accounted_bytes);
-    const auto queued_payload_bytes = transfer.session->queued_payload_bytes.fetch_add(
-        static_cast<std::int64_t>(packet_size), std::memory_order_relaxed) +
-        static_cast<std::int64_t>(packet_size);
-    update_peak(transfer.session->performance_metrics.max_queued_packets, queued);
-    update_peak(transfer.session->performance_metrics.max_queued_bytes, queued_bytes);
-    update_peak(transfer.session->performance_metrics.max_queued_payload_bytes,
-        queued_payload_bytes);
+    transfer.session->queued_packets.fetch_add(1, std::memory_order_relaxed);
     const auto downloaded = transfer.session->downloaded_bytes.fetch_add(
         static_cast<std::int64_t>(packet_size), std::memory_order_relaxed) +
         static_cast<std::int64_t>(packet_size);
@@ -941,8 +553,6 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         transfer.session->persisted_bytes.load(std::memory_order_relaxed);
     update_peak(transfer.session->performance_metrics.max_inflight_bytes,
         std::max<std::int64_t>(0, inflight));
-    update_peak(transfer.session->performance_metrics.max_post_queue_inflight_bytes,
-        std::max<std::int64_t>(0, inflight - queued_payload_bytes));
     adjust_active_buffered_bytes(transfer,
         -static_cast<std::int64_t>(packet.accounted_bytes));
     transfer.buffered_offset = 0;
@@ -993,19 +603,13 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
     transfer.queue_pause_active = false;
-    transfer.queue_pause_overlap_recorded = false;
     transfer.curl_result = CURLE_OK;
     transfer.request_started = Clock::now();
-    transfer.queue_pause_started_at = {};
-    transfer.memory_pause_started_at = {};
-    transfer.queue_resume_blocked_by_memory_started_at = {};
-    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     transfer.range_header.clear();
     reset_transfer_buffer(transfer);
     if (transfer.buffered_payload.capacity() < kAggregatedPacketBytes) {
         transfer.buffered_payload.reserve(kAggregatedPacketBytes);
     }
-    transfer.session->performance_metrics.windows_total.fetch_add(1, std::memory_order_relaxed);
 
     curl_easy_reset(transfer.easy);
     curl_easy_setopt(transfer.easy, CURLOPT_URL, session.url.c_str());
@@ -1021,9 +625,6 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         if (bytes == 0 || current == nullptr || current->range == nullptr) {
             return 0;
         }
-
-        current->session->performance_metrics.write_callback_calls.fetch_add(
-            1, std::memory_order_relaxed);
 
         // stop_requested 表示主线程已经决定收尾，回调这里直接返回失败，
         // 让 libcurl 尽快结束该请求。
@@ -1041,7 +642,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
             // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
             // 就暂停接收，避免把后续字节算进错误的区间。
             if (!current->paused_by_window_boundary) {
-                current->session->performance_metrics.window_boundary_pause_count.fetch_add(1,
+                current->session->performance_metrics.total_pause_count.fetch_add(1,
                     std::memory_order_relaxed);
             }
             current->paused_by_window_boundary = true;
@@ -1067,15 +668,11 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         const auto current_bytes = core::global_memory_accounting().current_bytes();
         const auto projected_size = current->buffered_payload_bytes + allowed;
         const auto projected_accounted = packet_accounted_bytes(projected_size, false);
-        const auto pause_snapshot = collect_memory_pause_start_snapshot(*current,
-            allowed,
-            projected_size,
-            projected_accounted);
         if (core::should_pause_for_backpressure(current_bytes,
                 projected_accounted > previous_accounted ?
                     projected_accounted - previous_accounted : 0,
                 current->session->options.backpressure_high_bytes)) {
-            start_memory_pause(*current, pause_snapshot);
+            start_memory_pause(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
 
@@ -1085,9 +682,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
             return 0;
         }
 
-        maybe_record_relative_time_ms(current->session->performance_metrics.time_to_first_byte_ms,
-            *current->session,
-            Clock::now());
+        record_first_network_byte(*current->session, allowed);
         current->next_offset += static_cast<std::int64_t>(allowed);
         current->request_bytes += static_cast<std::int64_t>(allowed);
         return allowed;
@@ -1121,37 +716,14 @@ void resume_paused_transfers(std::vector<TransferHandle>& handles,
                              const std::size_t queue_capacity_packets,
                              const std::size_t low_watermark) noexcept {
     const auto current_bytes = core::global_memory_accounting().current_bytes();
-    if (!handles.empty() &&
-        handles.front().session != nullptr &&
-        current_bytes <= low_watermark) {
-        record_memory_low_watermark_recovery(*handles.front().session, handles);
-    }
-
-    // 只有内存真正回落到低水位以下才统一恢复，避免高低水位附近的抖动导致
-    // handle 在 pause/continue 之间来回震荡。queue-full pause 也继续沿用这条
-    // 统一恢复门槛，只是在这里额外把“queue 已可恢复但被 memory 挡住”的时间记下来。
     for (auto& handle : handles) {
         if (!handle.in_multi) {
             continue;
         }
 
-        auto queue_can_resume = false;
-        const auto queue_ready = handle.queue_pause_active &&
-            handle.session->queued_packets.load(std::memory_order_relaxed) < queue_capacity_packets;
-        if (handle.queue_pause_active) {
-            if (!queue_ready) {
-                clear_queue_resume_blocked_by_memory(handle, true);
-            } else if (current_bytes > low_watermark) {
-                if (!has_timestamp(handle.queue_resume_blocked_by_memory_started_at)) {
-                    handle.queue_resume_blocked_by_memory_started_at = Clock::now();
-                    handle.session->performance_metrics.queue_resume_blocked_by_memory_count.fetch_add(
-                        1, std::memory_order_relaxed);
-                }
-                continue;
-            } else {
-                queue_can_resume = true;
-            }
-        }
+        const auto queue_can_resume = handle.queue_pause_active &&
+            handle.session->queued_packets.load(std::memory_order_relaxed) < queue_capacity_packets &&
+            current_bytes <= low_watermark;
 
         if (handle.paused_by_memory && current_bytes > low_watermark) {
             continue;
@@ -1159,11 +731,11 @@ void resume_paused_transfers(std::vector<TransferHandle>& handles,
 
         auto resumed_any = false;
         if (handle.paused_by_memory) {
-            finish_memory_pause(handle, true);
+            finish_memory_pause(handle);
             resumed_any = true;
         }
         if (queue_can_resume) {
-            finish_queue_pause(handle, true);
+            finish_queue_pause(handle);
             resumed_any = true;
         }
 
@@ -1195,7 +767,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 
         const auto pause_for_gap = handle.range->pause_for_gap.load(std::memory_order_acquire);
         if (pause_for_gap && !handle.paused_by_gap) {
-            handle.session->performance_metrics.gap_pause_count.fetch_add(
+            handle.session->performance_metrics.total_pause_count.fetch_add(
                 1, std::memory_order_relaxed);
             handle.paused_by_gap = true;
             update_transfer_pause_state(handle);
@@ -1217,9 +789,6 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     const auto current_bytes = core::global_memory_accounting().current_bytes();
     if (current_bytes <= high_watermark) {
         return;
-    }
-    if (!handles.empty() && handles.front().session != nullptr) {
-        record_memory_high_watermark_episode_start(*handles.front().session, handles);
     }
 
     std::vector<TransferHandle*> active;
@@ -1247,11 +816,7 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     const auto pause_count = std::max<std::size_t>(1, (active.size() + 4) / 5);
     for (std::size_t index = 0; index < pause_count && index < active.size(); ++index) {
         auto* handle = active[index];
-        start_memory_pause(*handle,
-            collect_memory_pause_start_snapshot(*handle,
-                0,
-                handle->buffered_payload_bytes,
-                handle->buffered_accounted_bytes));
+        start_memory_pause(*handle);
         curl_easy_pause(handle->easy, CURLPAUSE_RECV);
     }
 }
@@ -1293,8 +858,8 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     }
 
     transfer.range->pause_for_gap.store(false, std::memory_order_release);
-    finish_queue_pause(transfer, false);
-    finish_memory_pause(transfer, false);
+    finish_queue_pause(transfer);
+    finish_memory_pause(transfer);
     transfer.paused_by_window_boundary = false;
     update_transfer_pause_state(transfer);
 
@@ -1321,11 +886,6 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     transfer.paused_by_memory = false;
     transfer.paused_by_window_boundary = false;
     transfer.queue_pause_active = false;
-    transfer.queue_pause_overlap_recorded = false;
-    transfer.queue_pause_started_at = {};
-    transfer.memory_pause_started_at = {};
-    transfer.queue_resume_blocked_by_memory_started_at = {};
-    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     reset_transfer_buffer(transfer);
     return {};
 }
@@ -1336,8 +896,8 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
         transfer.in_multi = false;
     }
 
-    finish_queue_pause(transfer, false);
-    finish_memory_pause(transfer, false);
+    finish_queue_pause(transfer);
+    finish_memory_pause(transfer);
     transfer.paused_by_window_boundary = false;
     // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
     // 不销毁底层 easy 对象本身。
@@ -1347,11 +907,6 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
     transfer.paused_by_memory = false;
     transfer.paused_by_window_boundary = false;
     transfer.queue_pause_active = false;
-    transfer.queue_pause_overlap_recorded = false;
-    transfer.queue_pause_started_at = {};
-    transfer.memory_pause_started_at = {};
-    transfer.queue_resume_blocked_by_memory_started_at = {};
-    transfer.last_queue_pause_trigger = QueuePauseTrigger::none;
     reset_transfer_buffer(transfer);
 }
 
@@ -1401,184 +956,49 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
 }
 
 [[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
+                                                           const storage::FileWriter* file_writer,
                                                            const std::size_t ranges_total,
                                                            const Clock::time_point now) noexcept {
+    static_cast<void>(ranges_total);
     PerformanceSummary summary{};
-    summary.total_duration_ms = std::max<std::int64_t>(0,
-        std::chrono::duration_cast<std::chrono::milliseconds>(now -
-            session.task_started_at).count());
-    const auto effective_downloaded = std::max<std::int64_t>(0,
-        session.downloaded_bytes.load(std::memory_order_relaxed) -
-            session.performance_metrics.resume_reused_bytes);
-    const auto effective_persisted = std::max<std::int64_t>(0,
-        session.persisted_bytes.load(std::memory_order_relaxed) -
-            session.performance_metrics.resume_reused_bytes);
     performance::copy_runtime_to_summary(summary, session.performance_metrics);
-    if (summary.total_duration_ms > 0) {
-        const auto seconds = static_cast<double>(summary.total_duration_ms) / 1000.0;
-        summary.average_network_bytes_per_second =
-            static_cast<double>(effective_downloaded) / seconds;
-        summary.average_disk_bytes_per_second =
-            static_cast<double>(effective_persisted) / seconds;
+    const auto downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
+    if (session.task_started_at.time_since_epoch().count() != 0) {
+        const auto duration_ms = std::max<std::int64_t>(0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                session.task_started_at).count());
+        if (duration_ms > 0) {
+            const auto seconds = static_cast<double>(duration_ms) / 1000.0;
+            summary.average_network_bytes_per_second =
+                static_cast<double>(downloaded_bytes) / seconds;
+        }
+    }
+    if (file_writer != nullptr) {
+        const auto io_metrics = file_writer->io_metrics();
+        const auto disk_service_time_ns =
+            io_metrics.write_time_ns_total + io_metrics.flush_time_ns_total;
+        if (io_metrics.write_bytes_total > 0 && disk_service_time_ns > 0) {
+            summary.average_disk_bytes_per_second =
+                static_cast<double>(io_metrics.write_bytes_total) /
+                (static_cast<double>(disk_service_time_ns) / 1000000000.0);
+        } else {
+            summary.average_disk_bytes_per_second = 0.0;
+        }
+    } else {
+        summary.average_disk_bytes_per_second = 0.0;
+    }
+    if (session.first_network_byte_recorded.load(std::memory_order_relaxed) &&
+        session.task_started_at.time_since_epoch().count() != 0 &&
+        session.first_network_byte_at.time_since_epoch().count() != 0) {
+        summary.time_to_first_byte_ms = std::max<std::int64_t>(0,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                session.first_network_byte_at - session.task_started_at).count());
     }
     if (summary.packets_enqueued_total > 0) {
         summary.average_packet_size_bytes =
-            static_cast<double>(effective_downloaded) /
+            static_cast<double>(downloaded_bytes) /
             static_cast<double>(summary.packets_enqueued_total);
     }
-    if (summary.aligned_write_calls_total > 0) {
-        summary.average_aligned_write_size_bytes =
-            static_cast<double>(summary.aligned_write_bytes_total) /
-            static_cast<double>(summary.aligned_write_calls_total);
-    }
-    if (summary.tail_write_calls_total > 0) {
-        summary.average_tail_write_size_bytes =
-            static_cast<double>(summary.tail_write_bytes_total) /
-            static_cast<double>(summary.tail_write_calls_total);
-    }
-    summary.ranges_total = ranges_total;
-    summary.queue_full_pause_avg_ms = average_sampled_ms(
-        session.performance_metrics.pause_duration.queue_full_pause_duration.sample_count.load(
-            std::memory_order_relaxed),
-        session.performance_metrics.pause_duration.queue_full_pause_duration.total_time_ns.load(
-            std::memory_order_relaxed));
-    summary.queue_full_pause_max_ms = sampled_max_ms(
-        session.performance_metrics.pause_duration.queue_full_pause_duration.max_time_ns.load(
-            std::memory_order_relaxed));
-    summary.memory_pause_avg_ms = average_sampled_ms(
-        session.performance_metrics.pause_duration.memory_pause_duration.sample_count.load(
-            std::memory_order_relaxed),
-        session.performance_metrics.pause_duration.memory_pause_duration.total_time_ns.load(
-            std::memory_order_relaxed));
-    summary.memory_pause_max_ms = sampled_max_ms(
-        session.performance_metrics.pause_duration.memory_pause_duration.max_time_ns.load(
-            std::memory_order_relaxed));
-    summary.queue_resume_blocked_by_memory_avg_ms = average_sampled_ms(
-        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
-            .sample_count.load(std::memory_order_relaxed),
-        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
-            .total_time_ns.load(std::memory_order_relaxed));
-    summary.queue_resume_blocked_by_memory_max_ms = sampled_max_ms(
-        session.performance_metrics.pause_duration.queue_resume_blocked_by_memory_duration
-            .max_time_ns.load(std::memory_order_relaxed));
-    if (summary.queue_full_pause_count > 0) {
-        summary.queue_full_pause_start_queued_packets_avg =
-            static_cast<double>(summary.queue_full_pause_start_queued_packets_total) /
-            static_cast<double>(summary.queue_full_pause_count);
-        summary.queue_full_pause_start_queued_bytes_avg =
-            static_cast<double>(summary.queue_full_pause_start_queued_bytes_total) /
-            static_cast<double>(summary.queue_full_pause_count);
-        summary.queue_full_pause_start_queued_payload_bytes_avg =
-            static_cast<double>(summary.queue_full_pause_start_queued_payload_bytes_total) /
-            static_cast<double>(summary.queue_full_pause_count);
-        summary.queue_full_pause_start_inflight_bytes_avg =
-            static_cast<double>(summary.queue_full_pause_start_inflight_bytes_total) /
-            static_cast<double>(summary.queue_full_pause_count);
-        summary.queue_full_pause_start_memory_bytes_avg =
-            static_cast<double>(summary.queue_full_pause_start_memory_bytes_total) /
-            static_cast<double>(summary.queue_full_pause_count);
-    }
-    if (summary.memory_pause_count > 0) {
-        summary.memory_pause_start_queued_packets_avg =
-            static_cast<double>(summary.memory_pause_start_queued_packets_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_queued_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_queued_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_queued_payload_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_queued_payload_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_inflight_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_inflight_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_memory_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_memory_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_high_watermark_gap_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_high_watermark_gap_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_incoming_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_incoming_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_delta_accounted_bytes_avg =
-            static_cast<double>(summary.memory_pause_start_delta_accounted_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_current_handle_buffered_payload_bytes_avg =
-            static_cast<double>(
-                summary.memory_pause_start_current_handle_buffered_payload_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_current_handle_buffered_accounted_bytes_avg =
-            static_cast<double>(
-                summary.memory_pause_start_current_handle_buffered_accounted_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_projected_handle_buffered_payload_bytes_avg =
-            static_cast<double>(
-                summary.memory_pause_start_projected_handle_buffered_payload_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_projected_handle_buffered_accounted_bytes_avg =
-            static_cast<double>(
-                summary.memory_pause_start_projected_handle_buffered_accounted_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-        summary.memory_pause_start_active_buffered_accounted_bytes_avg =
-            static_cast<double>(
-                summary.memory_pause_start_active_buffered_accounted_bytes_total) /
-            static_cast<double>(summary.memory_pause_count);
-    }
-    if (summary.memory_high_watermark_episode_count > 0) {
-        summary.memory_high_watermark_start_active_requests_avg =
-            static_cast<double>(summary.memory_high_watermark_start_active_requests_total) /
-            static_cast<double>(summary.memory_high_watermark_episode_count);
-        summary.memory_high_watermark_start_active_window_bytes_avg =
-            static_cast<double>(summary.memory_high_watermark_start_active_window_bytes_total) /
-            static_cast<double>(summary.memory_high_watermark_episode_count);
-        summary.memory_high_watermark_start_queued_payload_bytes_avg =
-            static_cast<double>(summary.memory_high_watermark_start_queued_payload_bytes_total) /
-            static_cast<double>(summary.memory_high_watermark_episode_count);
-        summary.memory_high_watermark_start_inflight_bytes_avg =
-            static_cast<double>(summary.memory_high_watermark_start_inflight_bytes_total) /
-            static_cast<double>(summary.memory_high_watermark_episode_count);
-        summary.memory_high_watermark_start_memory_bytes_avg =
-            static_cast<double>(summary.memory_high_watermark_start_memory_bytes_total) /
-            static_cast<double>(summary.memory_high_watermark_episode_count);
-    }
-    if (summary.memory_low_watermark_recovery_count > 0) {
-        summary.memory_low_watermark_resume_active_requests_avg =
-            static_cast<double>(summary.memory_low_watermark_resume_active_requests_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_low_watermark_resume_active_window_bytes_avg =
-            static_cast<double>(summary.memory_low_watermark_resume_active_window_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_low_watermark_resume_queued_payload_bytes_avg =
-            static_cast<double>(summary.memory_low_watermark_resume_queued_payload_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_low_watermark_resume_inflight_bytes_avg =
-            static_cast<double>(summary.memory_low_watermark_resume_inflight_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_low_watermark_resume_memory_bytes_avg =
-            static_cast<double>(summary.memory_low_watermark_resume_memory_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_watermark_drain_queued_payload_bytes_avg =
-            static_cast<double>(summary.memory_watermark_drain_queued_payload_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_watermark_drain_inflight_bytes_avg =
-            static_cast<double>(summary.memory_watermark_drain_inflight_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-        summary.memory_watermark_drain_memory_bytes_avg =
-            static_cast<double>(summary.memory_watermark_drain_memory_bytes_total) /
-            static_cast<double>(summary.memory_low_watermark_recovery_count);
-    }
-    performance::summarize_latency_sample(summary.handle_data_packet,
-        session.performance_metrics.latency.handle_data_packet);
-    performance::summarize_latency_sample(summary.append_bytes,
-        session.performance_metrics.latency.append_bytes);
-    performance::summarize_latency_sample(summary.file_write,
-        session.performance_metrics.latency.file_write);
-    performance::summarize_latency_sample(summary.metadata_snapshot,
-        session.performance_metrics.latency.metadata_snapshot);
-    performance::summarize_latency_sample(summary.crc_sample_read,
-        session.performance_metrics.latency.crc_sample_read);
-    performance::summarize_latency_sample(summary.flush_pending_write,
-        session.performance_metrics.latency.flush_pending_write);
     return summary;
 }
 
@@ -1676,7 +1096,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         const auto [metadata_error, loaded_metadata] = metadata_store.load();
         if (metadata_error) {
             result.error = metadata_error;
-            result.performance = build_performance_summary(session, 0, Clock::now());
+            result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
             return result;
         }
 
@@ -1692,7 +1112,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             request.options.overwrite_existing);
         if (open_error) {
             result.error = open_error;
-            result.performance = build_performance_summary(session, 0, Clock::now());
+            result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
             return result;
         }
 
@@ -1715,7 +1135,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             if (validation_error) {
                 result.error = validation_error;
                 file_writer.close();
-                result.performance = build_performance_summary(session, 0, Clock::now());
+                result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
                 return result;
             }
 
@@ -1734,7 +1154,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             session.total_size);
         const auto safe_vdl = bitmap.contiguous_finished_bytes(session.options.block_size,
             session.total_size);
-        session.performance_metrics.resume_reused_bytes = finished_bytes;
         session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
@@ -1757,6 +1176,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.completed_ranges = bitmap.block_count();
             result.resumed = session.resumed;
             result.performance = build_performance_summary(session,
+                &file_writer,
                 bitmap.block_count(),
                 Clock::now());
             return result;
@@ -1800,7 +1220,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             persistence.join();
             file_writer.close();
             result.error = make_error_code(DownloadErrc::http_init_failed);
-            result.performance = build_performance_summary(session, ranges.size(), Clock::now());
+            result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
             return result;
         }
 
@@ -1846,8 +1266,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                             break;
                         }
 
-                        session.performance_metrics.ranges_stolen.fetch_add(
-                            1, std::memory_order_relaxed);
                         persistence.register_range(stolen.get());
                         pending_ranges.push_back(stolen.get());
                         ranges.push_back(std::move(stolen));
@@ -1893,12 +1311,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             resume_paused_transfers(handles,
                 session.options.queue_capacity_packets,
                 session.options.backpressure_low_bytes);
-            update_peak(session.performance_metrics.max_active_requests,
-                static_cast<std::size_t>(std::count_if(handles.begin(),
-                    handles.end(),
-                    [](const TransferHandle& handle) {
-                        return handle.in_multi;
-                    })));
 
             int running_handles = 0;
             const auto perform_status = curl_multi_perform(multi, &running_handles);
@@ -2010,7 +1422,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.resumed = session.resumed;
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
-        result.performance = build_performance_summary(session, ranges.size(), Clock::now());
+        result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
         return result;
     } catch (...) {
         // 对外契约是不抛异常，所以任何未预期错误最终都折叠成 internal_error。

@@ -21,6 +21,14 @@
 - 当前性能工作同时依赖两类基线：
   - benchmark 基线：用于正式性能回归
   - profiler 行为基线：用于热点路径和行为结构对比
+- 当前性能指标已经分成两层：
+  - 正式 benchmark 主链：`avg_network_speed`、`avg_disk_speed`、`time_to_first_byte_ms`、`max_memory_bytes`、`max_inflight_bytes`、`total_pause_count`
+  - 诊断/验收层：CPU、线程数、句柄数、CRC/续传/断网恢复、长稳入口
+- 当前正式辅助指标固定为：
+  - `queue_full_pause_count`
+  - `packets_enqueued_total`
+  - `avg_packet_size_bytes`
+  - `max_packet_size_bytes`
 - 当前项目已经完成至少一轮真实性能优化，并且已经把“优化前后变化”沉淀进文档。
 - 当前性能优化流程应以 benchmark 为主驱动，以 profiler 为辅助确认。
   - benchmark 先回答收益与退化。
@@ -185,6 +193,7 @@
 - 方案文档：给某个具体优化的设计说明
 - 诊断指标方案：给下一轮观测字段、采集口径和接入点
 - Playbook：给地图、上下文和维护规则
+- `scripts/performance/acceptance.py`：给诊断/验收层的统一执行入口，不进入 benchmark 主表
 
 如果某份文档开始同时承担多个职责，应优先收敛，而不是继续叠加内容。
 

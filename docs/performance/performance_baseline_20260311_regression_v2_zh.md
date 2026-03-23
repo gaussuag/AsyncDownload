@@ -50,6 +50,30 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 - `regression` 保留为历史对照套件。
 - `regression_v2` 是聚合后继续优化时的主回归套件。
 
+## 3.1 当前正式指标口径
+
+自 `2026-03-24` 起，正式 benchmark 主链固定为：
+
+- `avg_network_speed`
+- `avg_disk_speed`
+- `time_to_first_byte_ms`
+- `max_memory_bytes`
+- `max_inflight_bytes`
+- `total_pause_count`
+
+正式辅助指标固定为：
+
+- `queue_full_pause_count`
+- `packets_enqueued_total`
+- `avg_packet_size_bytes`
+- `max_packet_size_bytes`
+
+说明：
+
+- 这份 `2026-03-11` 基线文档保存的是当时已经采集并固化下来的历史数值，因此下方表格仍主要展示当时已入表的字段。
+- `avg_disk_speed` 与 `time_to_first_byte_ms` 已升级为当前正式基线指标，但不应伪造回填到这份历史快照表里；后续 rerun 应在新 benchmark 产物里补齐它们。
+- CPU、线程数、句柄数、CRC/续传/断网恢复和长稳验证已明确降到诊断/验收层，不进入正式 benchmark 主表。
+
 ## 4. regression_v2 套件定义
 
 当前 `regression_v2` 包含以下 case：

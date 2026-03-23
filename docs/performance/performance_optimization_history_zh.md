@@ -2065,3 +2065,154 @@ pause 起点快照进一步强化了上面的判断。
 2. flush 后 metadata/CRC 这整段 pending-flush 窗口如何与主写链并存
 
 而“简单缩小 metadata 文件体积”这条路，在没有别的机制差异前不值得再重复。
+
+## 20. 优化迭代 017：性能指标导出面清理
+
+### 20.1 背景
+
+经过多轮 queue/backpressure 与 persistence 诊断后，性能 summary、CLI 输出、Python benchmark schema、profiler 报表和测试断言之间已经形成了一大片并行维护面。
+
+这轮工作的目标不是继续扩充观测，而是把正式 benchmark 真正依赖的 keeper 指标收回到更小的集合，避免后续线程继续依赖已经降级的诊断字段。
+
+### 20.2 清理范围
+
+本轮保留的导出指标收口为：
+
+- 吞吐：`avg_network_speed`
+- 内存/积压：`max_memory_bytes`、`max_inflight_bytes`
+- pause 计数：`memory_pause_count`、`queue_full_pause_count`、`window_boundary_pause_count`、`gap_pause_count`
+- 包形态：`packets_enqueued_total`、`avg_packet_size_bytes`、`max_packet_size_bytes`
+- 运行摘要：`status`、`total_bytes`、`downloaded_bytes`、`persisted_bytes`、`resumed`、`error`
+
+同时移除了不再进入正式 benchmark 汇总链的字段，包括：
+
+- queue/backpressure 诊断细分项
+- memory watermark 分层与 episode 统计
+- latency / pause duration 采样摘要
+- persistence 写形态与 CRC 采样统计
+- `windows_total`、`ranges_total`、`avg_disk_speed` 等辅助导出项
+
+### 20.3 实现调整
+
+本轮同步修改了以下层级：
+
+- `include/asyncdownload/performance_metrics.hpp`
+- `include/asyncdownload/types.hpp`
+- `src/download/download_engine.cpp`
+- `src/persistence/persistence_thread.cpp`
+- `src/main.cpp`
+- `scripts/performance/performance_common.py`
+- `scripts/performance/benchmark.py`
+- `scripts/performance/profiler.py`
+- 相关集成测试与持久化测试
+
+策略是直接删掉旧字段采集和断言，而不是保留一层“空值兼容壳”，避免后续线程误以为这些字段仍受支持。
+
+### 20.4 验证结果
+
+本轮验证通过：
+
+- `scripts\build.bat release`
+- `ctest -C Release --output-on-failure -E "DownloadIntegrationTest.*"`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.LoadsDownloadOptionsFromConfigFile`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ReportsDetailedProgressSnapshot`
+- 最小 benchmark smoke：
+  [20260323_212656_metrics-cleanup-smoke](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260323_212656_metrics-cleanup-smoke/report.md)
+
+这轮 smoke 已成功产出：
+
+- `raw_runs.csv`
+- `aggregated_cases.csv`
+- `report.md`
+
+说明删字段后 benchmark 聚合链仍然完整可用。
+
+### 20.5 结论
+
+这轮清理完成后：
+
+1. 正式 benchmark 依赖的指标面已经显著缩小。
+2. C++ 运行时采集、CLI summary、Python schema 和测试断言重新对齐。
+3. 旧的诊断指标不再作为默认外部契约暴露，后续若要重新引入，必须带着明确的用途和维护理由进入。
+
+## 21. 优化迭代 018：正式性能主链与诊断/验收层重构（已采纳）
+
+### 21.1 背景
+
+在迭代 017 完成“删字段收口”之后，仍然存在两个明确缺口：
+
+1. 正式 benchmark 主链缺少 `avg_disk_speed` 与 `time_to_first_byte_ms`，导致“吞吐”和“启动/首包时延”没有被完整覆盖。
+2. CPU、线程数、句柄数、断网中断后 resume、CRC/VDL resume、长稳入口虽然有局部实现，但没有独立于 benchmark 主表的统一验收入口。
+
+因此这轮改造的目标不是重新扩张历史诊断字段，而是把性能体系正式分成两层：
+
+- 正式 benchmark 主链
+- 诊断/验收层
+
+### 21.2 本轮采纳内容
+
+正式 benchmark 主链固定为：
+
+- `avg_network_speed`
+- `avg_disk_speed`
+- `time_to_first_byte_ms`
+- `max_memory_bytes`
+- `max_inflight_bytes`
+- `total_pause_count`
+
+正式辅助指标固定为：
+
+- `queue_full_pause_count`
+- `packets_enqueued_total`
+- `avg_packet_size_bytes`
+- `max_packet_size_bytes`
+
+同时新增并采纳：
+
+- CLI `Summary` 补齐 `avg_disk_speed` 与 `time_to_first_byte_ms`
+- 独立 `--diagnostic-file` JSON 输出
+- `scripts/performance/acceptance.py` 作为诊断/验收层统一入口
+
+### 21.3 实现范围
+
+本轮修改覆盖了：
+
+- `include/asyncdownload/performance_metrics.hpp`
+- `include/asyncdownload/types.hpp`
+- `src/core/models.hpp`
+- `src/download/download_engine.cpp`
+- `src/main.cpp`
+- `scripts/performance/performance_common.py`
+- `scripts/performance/benchmark.py`
+- `scripts/performance/profiler.py`
+- `scripts/performance/acceptance.py`
+- `tests/download/download_resume_integration_test.cpp`
+
+关键变化：
+
+- `avg_disk_speed` 统一按 `persisted_bytes / total_duration` 计算
+- `time_to_first_byte_ms` 统一按“任务进入主流程后首次收到有效网络数据”计算
+- 资源诊断从 benchmark 主表拆出，单独导出 CPU、线程数、句柄数
+- 断网中断后 resume、CRC/VDL resume 与长稳入口通过 `acceptance.py` 统一收口
+
+### 21.4 验证结果
+
+本轮验证通过：
+
+- `scripts\build.bat`
+- `scripts\build.bat release`
+- `AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.LoadsDownloadOptionsFromConfigFile:DownloadIntegrationTest.ReportsDetailedProgressSnapshot:DownloadIntegrationTest.WritesResourceDiagnosticsFile:DownloadIntegrationTest.ResumeAfterInterruptedCliDownload:DownloadIntegrationTest.ResumesAfterCrcRollbackPastVdl`
+- benchmark smoke：
+  [20260324_143516_metric-refactor-smoke](/D:/git_repository/coding_with_agents/AsyncDownload/build/benchmarks/20260324_143516_metric-refactor-smoke/report.md)
+- 诊断/验收层 smoke：
+  [20260324_143545_acceptance-smoke](/D:/git_repository/coding_with_agents/AsyncDownload/build/performance_acceptance/20260324_143545_acceptance-smoke/acceptance_report.md)
+
+### 21.5 结论
+
+这轮改造采纳，原因是：
+
+1. 正式 benchmark 主链已经补齐 `avg_disk_speed` 与 `time_to_first_byte_ms`。
+2. benchmark 报表、profiler 报表、CLI summary 与测试断言已经切换到新的正式口径。
+3. 资源诊断与恢复/长稳验证已从 benchmark 主表拆出，进入单独的诊断/验收层入口。
+
+历史文档中出现的 `memory_pause_count`、`window_boundary_pause_count`、`gap_pause_count` 等字段继续保留为历史记录，不再代表当前正式导出口径。
