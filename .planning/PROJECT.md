@@ -18,13 +18,15 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 - ✓ Performance summary export via PerformanceSummary — existing (to be replaced)
 - ✓ benchmark.py smoke test — existing
 - ✓ profiler.py smoke test — existing
+- ✓ TelemetryEvent enum and fixed-size payload skeleton — validated in Phase 1
+- ✓ TelemetrySink queue wrapper over moodycamel::BlockingConcurrentQueue — validated in Phase 1
+- ✓ TelemetryCollector lifecycle and consumer loop skeleton — validated in Phase 1
+- ✓ TelemetrySession facade with steady_clock event emission — validated in Phase 1
+- ✓ Telemetry skeleton unit coverage — validated in Phase 1
 
 ### Active
 
-- [ ] Build TelemetryEvent enum and payload structure
-- [ ] Implement TelemetrySink with moodycamel::BlockingConcurrentQueue
-- [ ] Implement TelemetryCollector for metrics aggregation
-- [ ] Implement TelemetrySession as public API facade
+- [ ] Implement TelemetryCollector metrics aggregation logic
 - [ ] Migrate download_engine to emit TelemetryEvents instead of updating metrics directly
 - [ ] Migrate SessionState to remove telemetry state pollution
 - [ ] Delete acceptance.py and diagnostic export path
@@ -32,6 +34,12 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 - [ ] Verify profiler.py output unchanged
 - [ ] Unit tests for TelemetryCollector
 - [ ] Integration smoke tests for CLI progress and summary
+
+## Current State
+
+Phase 1 is complete and verified. The repository now contains a public telemetry skeleton under `include/asyncdownload/telemetry/` and `src/telemetry/`, plus dedicated tests in `tests/telemetry_skeleton_test.cpp`.
+
+Next focus: Phase 2 will move metric computation into `TelemetryCollector` while preserving the new event/sink/session boundaries established in Phase 1.
 
 ### Out of Scope
 
@@ -62,9 +70,9 @@ The existing benchmark.py and profiler.py scripts consume PerformanceSummary out
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Use moodycamel::BlockingConcurrentQueue | Already in libs/, thread-safe, blocking pop | — Pending |
-| steady_clock timestamps | Monotonic, not affected by system clock adjustments | — Pending |
-| 4-component architecture (Event/Sink/Collector/Session) | Clear separation of concerns, testable individually | — Pending |
+| Use moodycamel::BlockingConcurrentQueue | Already in libs/, thread-safe, blocking pop | Validated in Phase 1 via TelemetrySink wrapper and queue tests |
+| steady_clock timestamps | Monotonic, not affected by system clock adjustments | Validated in Phase 1 event helpers and session emission tests |
+| 4-component architecture (Event/Sink/Collector/Session) | Clear separation of concerns, testable individually | Phase 1 established all four components as compilable skeletons |
 | Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | — Pending |
 | Delete acceptance.py | Redundant with benchmark+profiler paths | — Pending |
 
@@ -86,4 +94,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-24 after initialization*
+*Last updated: 2026-03-24 after Phase 1 verification*

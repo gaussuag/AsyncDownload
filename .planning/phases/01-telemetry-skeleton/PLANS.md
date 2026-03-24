@@ -4,12 +4,12 @@
 
 | # | Plan | Description |
 |---|------|-------------|
-| 1 | [01-create-directory-structure.md](plans/01-create-directory-structure.md) | Set up directory structure and CMake configuration |
-| 2 | [02-implement-telemetry-event.md](plans/02-implement-telemetry-event.md) | Define TelemetryEventType enum and TelemetryPayload structures |
-| 3 | [03-implement-telemetry-sink.md](plans/03-implement-telemetry-sink.md) | Implement TelemetrySink with moodycamel queue |
-| 4 | [04-implement-telemetry-collector.md](plans/04-implement-telemetry-collector.md) | Implement TelemetryCollector stub |
-| 5 | [05-implement-telemetry-session.md](plans/05-implement-telemetry-session.md) | Implement TelemetrySession facade |
-| 6 | [06-add-unit-tests.md](plans/06-add-unit-tests.md) | Add unit tests for skeleton components |
+| 1 | [01-01-PLAN.md](01-01-PLAN.md) | Set up directory structure and CMake configuration |
+| 2 | [01-02-PLAN.md](01-02-PLAN.md) | Define TelemetryEventType enum and TelemetryPayload structures |
+| 3 | [01-03-PLAN.md](01-03-PLAN.md) | Implement TelemetrySink with moodycamel queue |
+| 4 | [01-04-PLAN.md](01-04-PLAN.md) | Implement TelemetryCollector stub |
+| 5 | [01-05-PLAN.md](01-05-PLAN.md) | Implement TelemetrySession facade |
+| 6 | [01-06-PLAN.md](01-06-PLAN.md) | Add unit tests for skeleton components |
 
 ## Coverage
 

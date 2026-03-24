@@ -7,12 +7,12 @@
 
 ### Telemetry Core
 
-- [ ] **TELE-01**: TelemetryEvent enum with all event types (TaskStarted, FirstByteReceived, DownloadDelta, PersistDelta, QueuePaused, MemorySample, TaskCompleted)
-- [ ] **TELE-02**: TelemetryPayload fixed-size tagged structure for each event type
-- [ ] **TELE-03**: TelemetrySink with moodycamel::BlockingConcurrentQueue, multi-producer safe
-- [ ] **TELE-04**: TelemetryCollector consuming from sink, maintaining aggregation state
-- [ ] **TELE-05**: TelemetrySession facade with record_*() methods and current_snapshot()/final_summary()
-- [ ] **TELE-06**: steady_clock timestamp enforcement in all event emission
+- [x] **TELE-01**: TelemetryEvent enum with all event types (TaskStarted, FirstByteReceived, DownloadDelta, PersistDelta, QueuePaused, MemorySample, TaskCompleted)
+- [x] **TELE-02**: TelemetryPayload fixed-size tagged structure for each event type
+- [x] **TELE-03**: TelemetrySink with moodycamel::BlockingConcurrentQueue, multi-producer safe
+- [x] **TELE-04**: TelemetryCollector consuming from sink, maintaining aggregation state
+- [x] **TELE-05**: TelemetrySession facade with record_*() methods and current_snapshot()/final_summary()
+- [x] **TELE-06**: steady_clock timestamp enforcement in all event emission
 
 ### Collector Computation
 
@@ -66,12 +66,12 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TELE-01 | Phase 1 | Pending |
-| TELE-02 | Phase 1 | Pending |
-| TELE-03 | Phase 1 | Pending |
-| TELE-04 | Phase 1 | Pending |
-| TELE-05 | Phase 1 | Pending |
-| TELE-06 | Phase 1 | Pending |
+| TELE-01 | Phase 1 | Complete |
+| TELE-02 | Phase 1 | Complete |
+| TELE-03 | Phase 1 | Complete |
+| TELE-04 | Phase 1 | Complete |
+| TELE-05 | Phase 1 | Complete |
+| TELE-06 | Phase 1 | Complete |
 | COLL-01 | Phase 2 | Pending |
 | COLL-02 | Phase 2 | Pending |
 | COLL-03 | Phase 2 | Pending |
@@ -97,7 +97,7 @@
 
 ---
 *Requirements defined: 2026-03-24*
-*Last updated: 2026-03-24 after roadmap creation*
+*Last updated: 2026-03-24 after Phase 1 verification*
 
 **Roadmap:** .planning/ROADMAP.md (5 phases)
 **State:** .planning/STATE.md

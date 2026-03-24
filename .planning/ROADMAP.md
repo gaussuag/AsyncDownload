@@ -6,7 +6,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 
 ## Phases
 
-- [ ] **Phase 1: Telemetry Skeleton** - Build event enum, payload structure, sink infrastructure, and session facade
+- [x] **Phase 1: Telemetry Skeleton** - Build event enum, payload structure, sink infrastructure, and session facade
 - [ ] **Phase 2: Collector Computation** - Implement all metric aggregations in TelemetryCollector
 - [ ] **Phase 3: Event Emission Migration** - Migrate download_engine and persistence_thread to emit TelemetryEvents
 - [ ] **Phase 4: State Decoupling** - Remove telemetry fields from SessionState, verify CLI progress and final summary
@@ -25,7 +25,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   4. TelemetryCollector consumes events from sink without crashing
   5. TelemetrySession provides record_*() facade that pushes events to sink
   6. All timestamps use steady_clock (uint64_t nanoseconds)
-**Plans**: TBD
+**Plans**: 6 executed (`01-01-SUMMARY.md` through `01-06-SUMMARY.md`)
 
 ### Phase 2: Collector Computation
 **Goal**: Full metrics computation in TelemetryCollector (TTFB, speeds, peaks, counts, packet stats)
@@ -72,14 +72,14 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   2. Deprecated metric calculation code removed from SessionState and download_engine
   3. benchmark.py smoke test passes with identical output
   4. profiler.py smoke test passes with identical output
-**Plans**: 6 plans created (see `.planning/phases/01-telemetry-skeleton/PLANS.md`)
+**Plans**: TBD
 
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Telemetry Skeleton | 0/6 | Planned | - |
-| 2. Collector Computation | 0/7 | Not started | - |
+| 1. Telemetry Skeleton | 6/6 | Complete | 2026-03-24 |
+| 2. Collector Computation | 0/7 | Ready to plan | - |
 | 3. Event Emission Migration | 0/4 | Not started | - |
 | 4. State Decoupling | 0/4 | Not started | - |
 | 5. Integration & Cleanup | 0/4 | Not started | - |
