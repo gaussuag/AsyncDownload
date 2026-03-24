@@ -72,13 +72,13 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   2. Deprecated metric calculation code removed from SessionState and download_engine
   3. benchmark.py smoke test passes with identical output
   4. profiler.py smoke test passes with identical output
-**Plans**: TBD
+**Plans**: 6 plans created (see `.planning/phases/01-telemetry-skeleton/PLANS.md`)
 
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Telemetry Skeleton | 0/6 | Not started | - |
+| 1. Telemetry Skeleton | 0/6 | Planned | - |
 | 2. Collector Computation | 0/7 | Not started | - |
 | 3. Event Emission Migration | 0/4 | Not started | - |
 | 4. State Decoupling | 0/4 | Not started | - |
