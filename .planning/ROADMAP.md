@@ -39,7 +39,13 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   5. total_pause_count and queue_full_pause_count derived from QueuePaused events
   6. packets_enqueued_total, avg_packet_size_bytes, max_packet_size_bytes computed from DownloadDelta
   7. current_snapshot() returns RuntimeSnapshot with watermark_timestamp_ns
-**Plans**: TBD
+**Plans**: 6 planned
+- `02-01-PLAN.md` — TTFB and packet statistics
+- `02-02-PLAN.md` — EMA speed calculation
+- `02-03-PLAN.md` — Peak tracking (memory, inflight)
+- `02-04-PLAN.md` — Pause count tracking
+- `02-05-PLAN.md` — Snapshot and final summary
+- `02-06-PLAN.md` — Unit tests
 
 ### Phase 3: Event Emission Migration
 **Goal**: download_engine and persistence_thread emit TelemetryEvents instead of updating metrics directly
@@ -79,7 +85,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Telemetry Skeleton | 6/6 | Complete | 2026-03-24 |
-| 2. Collector Computation | 0/7 | Ready to plan | - |
+| 2. Collector Computation | 0/6 | Ready to execute | - |
 | 3. Event Emission Migration | 0/4 | Not started | - |
 | 4. State Decoupling | 0/4 | Not started | - |
 | 5. Integration & Cleanup | 0/4 | Not started | - |
