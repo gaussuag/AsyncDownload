@@ -23,23 +23,24 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 - ✓ TelemetryCollector lifecycle and consumer loop skeleton — validated in Phase 1
 - ✓ TelemetrySession facade with steady_clock event emission — validated in Phase 1
 - ✓ Telemetry skeleton unit coverage — validated in Phase 1
+- ✓ TelemetryCollector metric aggregation logic (TTFB, speeds, peaks, counts, packet stats) — validated in Phase 2
+- ✓ `ProgressSnapshot` watermark generation in `TelemetryCollector::current_snapshot()` — validated in Phase 2
+- ✓ Telemetry collector regression coverage — validated in Phase 2
 
 ### Active
 
-- [ ] Implement TelemetryCollector metrics aggregation logic
 - [ ] Migrate download_engine to emit TelemetryEvents instead of updating metrics directly
 - [ ] Migrate SessionState to remove telemetry state pollution
 - [ ] Delete acceptance.py and diagnostic export path
 - [ ] Verify benchmark.py output unchanged
 - [ ] Verify profiler.py output unchanged
-- [ ] Unit tests for TelemetryCollector
 - [ ] Integration smoke tests for CLI progress and summary
 
 ## Current State
 
-Phase 1 is complete and verified. The repository now contains a public telemetry skeleton under `include/asyncdownload/telemetry/` and `src/telemetry/`, plus dedicated tests in `tests/telemetry_skeleton_test.cpp`.
+Phase 2 is complete and verified. The repository now contains a working `TelemetryCollector` that aggregates TTFB, live speeds, final averages, peaks, pause counts, packet statistics, and running snapshots with watermark timestamps. Dedicated collector regression coverage lives in `tests/telemetry/telemetry_collector_test.cpp`.
 
-Next focus: Phase 2 will move metric computation into `TelemetryCollector` while preserving the new event/sink/session boundaries established in Phase 1.
+Next focus: Phase 3 will migrate `download_engine` and `persistence_thread` to emit telemetry events through `TelemetrySession` instead of maintaining metrics directly.
 
 ### Out of Scope
 
@@ -73,6 +74,8 @@ The existing benchmark.py and profiler.py scripts consume PerformanceSummary out
 | Use moodycamel::BlockingConcurrentQueue | Already in libs/, thread-safe, blocking pop | Validated in Phase 1 via TelemetrySink wrapper and queue tests |
 | steady_clock timestamps | Monotonic, not affected by system clock adjustments | Validated in Phase 1 event helpers and session emission tests |
 | 4-component architecture (Event/Sink/Collector/Session) | Clear separation of concerns, testable individually | Phase 1 established all four components as compilable skeletons |
+| Collector owns metric aggregation | Keeps timing/packet/pause/resource calculations out of download and persistence code | Validated in Phase 2 by collector implementation and focused regression tests |
+| Snapshot watermark is part of the public snapshot model | Snapshot consumers need a monotonic read marker without draining the queue | Validated in Phase 2 by `ProgressSnapshot::watermark_timestamp_ns` and collector tests |
 | Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | — Pending |
 | Delete acceptance.py | Redundant with benchmark+profiler paths | — Pending |
 
@@ -94,4 +97,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-24 after Phase 1 verification*
+*Last updated: 2026-03-24 after Phase 2 verification*

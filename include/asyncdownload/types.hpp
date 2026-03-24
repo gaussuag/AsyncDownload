@@ -61,6 +61,7 @@ struct ProgressSnapshot {
     // 基于相邻两次进度采样的平均磁盘写入速度。
     double disk_bytes_per_second = 0.0;
     bool resumed = false;
+    std::int64_t watermark_timestamp_ns = 0;
 };
 
 using ProgressCallback = std::function<void(const ProgressSnapshot&)>;

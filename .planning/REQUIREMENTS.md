@@ -16,13 +16,13 @@
 
 ### Collector Computation
 
-- [ ] **COLL-01**: time_to_first_byte_ms calculation (TaskStarted → FirstByteReceived)
-- [ ] **COLL-02**: avg_network_speed and avg_disk_speed from DownloadDelta/PersistDelta events
-- [ ] **COLL-03**: max_memory_bytes tracking from MemorySample events
-- [ ] **COLL-04**: max_inflight_bytes tracking
-- [ ] **COLL-05**: total_pause_count and queue_full_pause_count from QueuePaused events
-- [ ] **COLL-06**: packets_enqueued_total, avg_packet_size_bytes, max_packet_size_bytes from DownloadDelta
-- [ ] **COLL-07**: Running snapshot generation with watermark_timestamp_ns
+- [x] **COLL-01**: time_to_first_byte_ms calculation (TaskStarted → FirstByteReceived)
+- [x] **COLL-02**: avg_network_speed and avg_disk_speed from DownloadDelta/PersistDelta events
+- [x] **COLL-03**: max_memory_bytes tracking from MemorySample events
+- [x] **COLL-04**: max_inflight_bytes tracking
+- [x] **COLL-05**: total_pause_count and queue_full_pause_count from QueuePaused events
+- [x] **COLL-06**: packets_enqueued_total, avg_packet_size_bytes, max_packet_size_bytes from DownloadDelta
+- [x] **COLL-07**: Running snapshot generation with watermark_timestamp_ns
 
 ### Migration
 
@@ -72,13 +72,13 @@
 | TELE-04 | Phase 1 | Complete |
 | TELE-05 | Phase 1 | Complete |
 | TELE-06 | Phase 1 | Complete |
-| COLL-01 | Phase 2 | Pending |
-| COLL-02 | Phase 2 | Pending |
-| COLL-03 | Phase 2 | Pending |
-| COLL-04 | Phase 2 | Pending |
-| COLL-05 | Phase 2 | Pending |
-| COLL-06 | Phase 2 | Pending |
-| COLL-07 | Phase 2 | Pending |
+| COLL-01 | Phase 2 | Complete |
+| COLL-02 | Phase 2 | Complete |
+| COLL-03 | Phase 2 | Complete |
+| COLL-04 | Phase 2 | Complete |
+| COLL-05 | Phase 2 | Complete |
+| COLL-06 | Phase 2 | Complete |
+| COLL-07 | Phase 2 | Complete |
 | MIGR-01 | Phase 3 | Pending |
 | MIGR-02 | Phase 3 | Pending |
 | MIGR-03 | Phase 4 | Pending |
@@ -97,7 +97,7 @@
 
 ---
 *Requirements defined: 2026-03-24*
-*Last updated: 2026-03-24 after Phase 1 verification*
+*Last updated: 2026-03-24 after Phase 2 verification*
 
 **Roadmap:** .planning/ROADMAP.md (5 phases)
 **State:** .planning/STATE.md
