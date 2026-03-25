@@ -5,7 +5,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -175,24 +174,6 @@ struct SessionState {
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
     ProgressCallback progress_callback{};
-    // 整个任务的性能测量都以 task_started_at 为相对时间零点。
-    std::chrono::steady_clock::time_point task_started_at{};
-    std::chrono::steady_clock::time_point first_network_byte_at{};
-    std::atomic<bool> first_network_byte_recorded{false};
-    // 进度回调由 Orchestrator 线程统一采样，避免在网络回调或持久化线程里直接
-    // 计算速度，减少跨线程统计带来的噪声。
-    std::chrono::steady_clock::time_point last_progress_sample_at{};
-    std::int64_t last_progress_downloaded_bytes = 0;
-    std::int64_t last_progress_persisted_bytes = 0;
-    double last_network_bytes_per_second = 0.0;
-    double last_disk_bytes_per_second = 0.0;
-    bool memory_watermark_episode_active = false;
-    std::size_t memory_watermark_episode_start_active_requests = 0;
-    std::int64_t memory_watermark_episode_start_active_window_bytes = 0;
-    std::int64_t memory_watermark_episode_start_queued_payload_bytes = 0;
-    std::int64_t memory_watermark_episode_start_inflight_bytes = 0;
-    std::int64_t memory_watermark_episode_start_memory_bytes = 0;
-    performance::RuntimePerformanceMetrics performance_metrics{};
     asyncdownload::telemetry::TelemetrySession telemetry_session_{};
 };
 

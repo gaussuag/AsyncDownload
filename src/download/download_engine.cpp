@@ -34,12 +34,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using DataQueue = moodycamel::BlockingConcurrentQueue<core::DataPacket>;
 
-[[nodiscard]] std::int64_t current_inflight_bytes(const core::SessionState& session) noexcept {
-    return std::max<std::int64_t>(0,
-        session.downloaded_bytes.load(std::memory_order_relaxed) -
-            session.persisted_bytes.load(std::memory_order_relaxed));
-}
-
 struct TransferHandle {
     // TransferHandle 代表一个可复用的 easy handle 槽位。
     // 它既保存 libcurl 句柄，也保存当前绑定到哪个 range/window，以及暂停原因、
@@ -90,12 +84,6 @@ private:
 }
 
 constexpr std::size_t kAggregatedPacketBytes = 64 * 1024;
-
-void adjust_active_buffered_bytes(TransferHandle& transfer,
-                                  const std::int64_t accounted_delta) noexcept {
-    static_cast<void>(transfer);
-    static_cast<void>(accounted_delta);
-}
 
 void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept;
 
@@ -163,55 +151,13 @@ void finish_memory_pause(TransferHandle& transfer) noexcept {
     update_transfer_pause_state(transfer);
 }
 
-void update_progress_rates(core::SessionState& session,
-                           ProgressSnapshot& snapshot) noexcept {
-    // 速度统一由调度线程基于相邻两次快照做差分计算，这样网络速率和磁盘速率
-    // 使用同一个时间窗口，UI 看到的数据更容易对比。
-    const auto now = Clock::now();
-    if (session.last_progress_sample_at.time_since_epoch().count() == 0) {
-        session.last_progress_sample_at = now;
-        session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
-        session.last_progress_persisted_bytes = snapshot.persisted_bytes;
-        snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
-        snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
-        return;
-    }
-
-    const auto elapsed_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(now -
-            session.last_progress_sample_at).count();
-    if (elapsed_seconds > 0.0) {
-        const auto downloaded_delta =
-            snapshot.downloaded_bytes - session.last_progress_downloaded_bytes;
-        const auto persisted_delta =
-            snapshot.persisted_bytes - session.last_progress_persisted_bytes;
-        session.last_network_bytes_per_second =
-            std::max(0.0, static_cast<double>(downloaded_delta) / elapsed_seconds);
-        session.last_disk_bytes_per_second =
-            std::max(0.0, static_cast<double>(persisted_delta) / elapsed_seconds);
-    }
-
-    session.last_progress_sample_at = now;
-    session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
-    session.last_progress_persisted_bytes = snapshot.persisted_bytes;
-    snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
-    snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
-}
-
 void record_first_network_byte(core::SessionState& session,
                                const std::size_t bytes) noexcept {
     if (bytes == 0) {
         return;
     }
 
-    bool expected = false;
-    if (session.first_network_byte_recorded.compare_exchange_strong(expected,
-            true,
-            std::memory_order_acq_rel,
-            std::memory_order_relaxed)) {
-        session.first_network_byte_at = Clock::now();
-        session.telemetry_session_.record_first_byte_received();
-    }
+    session.telemetry_session_.record_first_byte_received();
 }
 
 void invoke_progress(core::SessionState& session,
@@ -221,19 +167,10 @@ void invoke_progress(core::SessionState& session,
         return;
     }
 
-    // ProgressSnapshot 的来源分成三类：
-    // 1. SessionState 里的全局原子计数
-    // 2. range 状态机里的逻辑状态
-    // 3. 当前 easy handle 列表里的实时请求状态
-    ProgressSnapshot snapshot{};
+    auto snapshot = session.telemetry_session_.current_snapshot();
     snapshot.total_bytes = session.total_size;
-    snapshot.downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
-    snapshot.persisted_bytes = session.persisted_bytes.load(std::memory_order_relaxed);
     snapshot.vdl_offset = session.vdl_offset.load(std::memory_order_relaxed);
-    snapshot.inflight_bytes = std::max<std::int64_t>(0,
-        snapshot.downloaded_bytes - snapshot.persisted_bytes);
     snapshot.queued_packets = session.queued_packets.load(std::memory_order_relaxed);
-    snapshot.memory_bytes = core::global_memory_accounting().current_bytes();
     snapshot.resumed = session.resumed;
 
     for (const auto& range : ranges) {
@@ -261,8 +198,6 @@ void invoke_progress(core::SessionState& session,
         [](const TransferHandle& handle) {
             return handle.in_multi;
         }));
-    session.telemetry_session_.record_memory_sample(snapshot.memory_bytes);
-    update_progress_rates(session, snapshot);
 
     try {
         session.progress_callback(snapshot);
@@ -466,8 +401,6 @@ void update_speed(TransferHandle& transfer) noexcept {
 }
 
 void reset_transfer_buffer(TransferHandle& transfer) noexcept {
-    adjust_active_buffered_bytes(transfer,
-        -static_cast<std::int64_t>(transfer.buffered_accounted_bytes));
     transfer.buffered_offset = 0;
     transfer.buffered_payload_bytes = 0;
     transfer.buffered_accounted_bytes = 0;
@@ -497,10 +430,6 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     transfer.buffered_payload_bytes = old_size + size;
 
     const auto new_accounted = packet_accounted_bytes(transfer.buffered_payload_bytes, false);
-    adjust_active_buffered_bytes(transfer,
-        static_cast<std::int64_t>(
-            new_accounted > transfer.buffered_accounted_bytes ?
-                new_accounted - transfer.buffered_accounted_bytes : 0));
     if (new_accounted > transfer.buffered_accounted_bytes) {
         const auto delta = new_accounted - transfer.buffered_accounted_bytes;
         const auto current_memory = core::global_memory_accounting().add(delta);
@@ -536,8 +465,6 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     static_cast<void>(downloaded);
     transfer.session->telemetry_session_.record_download_delta(
         static_cast<std::uint64_t>(packet_size));
-    adjust_active_buffered_bytes(transfer,
-        -static_cast<std::int64_t>(packet.accounted_bytes));
     transfer.buffered_offset = 0;
     transfer.buffered_payload_bytes = 0;
     transfer.buffered_accounted_bytes = 0;
@@ -992,7 +919,6 @@ std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
 
 DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
     DownloadResult result{};
-    const auto run_started = Clock::now();
     result.temporary_path = core::make_temporary_path(request.output_path);
     result.metadata_path = core::make_metadata_path(request.output_path);
 
@@ -1039,7 +965,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.total_size = probe_result.total_size;
         session.accept_ranges = probe_result.accept_ranges;
         session.progress_callback = request.progress_callback;
-        session.task_started_at = run_started;
         session.telemetry_session_.record_task_started();
         if (!session.accept_ranges) {
             // 不支持 Range 的服务端无法安全做多连接和窗口化调度，所以这里主动

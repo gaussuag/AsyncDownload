@@ -4,7 +4,7 @@
 
 namespace {
 
-TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryWithoutMutatingRuntimeMetrics) {
+TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryFromEventStream) {
     asyncdownload::core::SessionState session{};
 
     session.telemetry_session_.record_task_started();
@@ -20,14 +20,12 @@ TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryWithoutMutatingR
     session.telemetry_session_.record_task_completed();
 
     const auto summary = session.telemetry_session_.final_summary();
+    const auto snapshot = session.telemetry_session_.current_snapshot();
 
-    EXPECT_EQ(session.performance_metrics.total_pause_count.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.queue_full_pause_count.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.max_memory_bytes.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.max_inflight_bytes.load(std::memory_order_relaxed), 0);
-    EXPECT_EQ(session.performance_metrics.packets_enqueued_total.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.performance_metrics.max_packet_size_bytes.load(std::memory_order_relaxed), 0U);
-
+    EXPECT_EQ(snapshot.downloaded_bytes, 3072);
+    EXPECT_EQ(snapshot.persisted_bytes, 1024);
+    EXPECT_EQ(snapshot.inflight_bytes, 2048);
+    EXPECT_EQ(snapshot.memory_bytes, 8192U);
     EXPECT_EQ(summary.total_pause_count, 2U);
     EXPECT_EQ(summary.queue_full_pause_count, 1U);
     EXPECT_EQ(summary.max_memory_bytes, 8192U);

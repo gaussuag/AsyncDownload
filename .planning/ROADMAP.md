@@ -9,7 +9,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 - [x] **Phase 1: Telemetry Skeleton** - Build event enum, payload structure, sink infrastructure, and session facade
 - [x] **Phase 2: Collector Computation** - Implement all metric aggregations in TelemetryCollector
 - [x] **Phase 3: Event Emission Migration** - Migrate download_engine and persistence_thread to emit TelemetryEvents
-- [ ] **Phase 4: State Decoupling** - Remove telemetry fields from SessionState, verify CLI progress and final summary
+- [x] **Phase 4: State Decoupling** - Remove telemetry fields from SessionState, verify CLI progress and final summary
 - [ ] **Phase 5: Integration & Cleanup** - Verify backward compatibility, delete acceptance.py, run smoke tests
 
 ## Phase Details
@@ -66,11 +66,11 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 **Depends on**: Phase 3
 **Requirements**: MIGR-03, MIGR-04, INTG-01, INTG-02
 **Success Criteria** (what must be TRUE):
-  1. SessionState no longer contains telemetry fields (downloaded_bytes, first_network_byte_at, performance_metrics removed)
+  1. SessionState no longer contains telemetry-only fields such as first-byte timing, progress-rate caches, watermark episode state, or `performance_metrics`
   2. download_engine no longer calculates speeds, TTFB, or summary fields directly
   3. CLI progress display reads from TelemetrySession::current_snapshot()
   4. PerformanceSummary final export via TelemetrySession::final_summary() produces identical output
-**Plans**: 2 planned
+**Plans**: 2 executed (`04-01-SUMMARY.md` through `04-02-SUMMARY.md`)
 - `04-01-PLAN.md` — Remove deprecated SessionState fields and update_progress_rates
 - `04-02-PLAN.md` — Refactor invoke_progress to use TelemetrySession::current_snapshot()
 
@@ -92,7 +92,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 | 1. Telemetry Skeleton | 6/6 | Complete | 2026-03-24 |
 | 2. Collector Computation | 6/6 | Complete | 2026-03-24 |
 | 3. Event Emission Migration | 3/3 | Complete | 2026-03-24 |
-| 4. State Decoupling | 0/2 | Not started | - |
+| 4. State Decoupling | 2/2 | Complete | 2026-03-25 |
 | 5. Integration & Cleanup | 0/4 | Not started | - |
 
 ---

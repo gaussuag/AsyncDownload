@@ -28,13 +28,13 @@
 
 - [x] **MIGR-01**: download_engine emits TelemetryEvents via TelemetrySession instead of updating metrics directly
 - [x] **MIGR-02**: persistence_thread emits PersistDelta and QueuePaused events
-- [ ] **MIGR-03**: SessionState telemetry fields removed (downloaded_bytes, first_network_byte_at, performance_metrics, etc.)
-- [ ] **MIGR-04**: download_engine no longer calculates speeds, TTFB, or summary fields directly
+- [x] **MIGR-03**: SessionState telemetry fields removed (first_network_byte_at, progress-rate caches, performance_metrics, etc.; coordination counters retained)
+- [x] **MIGR-04**: download_engine no longer calculates speeds, TTFB, or summary fields directly
 
 ### Integration
 
-- [ ] **INTG-01**: CLI progress display reads from TelemetrySession::current_snapshot()
-- [ ] **INTG-02**: PerformanceSummary final export via TelemetrySession::final_summary()
+- [x] **INTG-01**: CLI progress display reads from TelemetrySession::current_snapshot()
+- [x] **INTG-02**: PerformanceSummary final export via TelemetrySession::final_summary()
 - [ ] **INTG-03**: benchmark.py smoke test passes with identical output
 - [ ] **INTG-04**: profiler.py smoke test passes with identical output
 
@@ -81,10 +81,10 @@
 | COLL-07 | Phase 2 | Complete |
 | MIGR-01 | Phase 3 | Complete |
 | MIGR-02 | Phase 3 | Complete |
-| MIGR-03 | Phase 4 | Pending |
-| MIGR-04 | Phase 4 | Pending |
-| INTG-01 | Phase 4 | Pending |
-| INTG-02 | Phase 4 | Pending |
+| MIGR-03 | Phase 4 | Complete |
+| MIGR-04 | Phase 4 | Complete |
+| INTG-01 | Phase 4 | Complete |
+| INTG-02 | Phase 4 | Complete |
 | INTG-03 | Phase 5 | Pending |
 | INTG-04 | Phase 5 | Pending |
 | CLEN-01 | Phase 5 | Pending |
@@ -97,7 +97,7 @@
 
 ---
 *Requirements defined: 2026-03-24*
-*Last updated: 2026-03-24 after Phase 3 verification*
+*Last updated: 2026-03-25 after Phase 4 verification*
 
 **Roadmap:** .planning/ROADMAP.md (5 phases)
 **State:** .planning/STATE.md
