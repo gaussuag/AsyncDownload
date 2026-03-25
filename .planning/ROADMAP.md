@@ -8,7 +8,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 
 - [x] **Phase 1: Telemetry Skeleton** - Build event enum, payload structure, sink infrastructure, and session facade
 - [x] **Phase 2: Collector Computation** - Implement all metric aggregations in TelemetryCollector
-- [ ] **Phase 3: Event Emission Migration** - Migrate download_engine and persistence_thread to emit TelemetryEvents
+- [x] **Phase 3: Event Emission Migration** - Migrate download_engine and persistence_thread to emit TelemetryEvents
 - [ ] **Phase 4: State Decoupling** - Remove telemetry fields from SessionState, verify CLI progress and final summary
 - [ ] **Phase 5: Integration & Cleanup** - Verify backward compatibility, delete acceptance.py, run smoke tests
 
@@ -56,7 +56,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   2. persistence_thread emits PersistDelta and QueuePaused events via TelemetrySession
   3. Existing unit tests pass with event emission enabled
   4. SessionState performance_metrics remains unmodified during downloads (verified by tests)
-**Plans**: 3 planned
+**Plans**: 3 executed (`03-01-SUMMARY.md` through `03-03-SUMMARY.md`)
 - `03-01-PLAN.md` — download_engine event emission
 - `03-02-PLAN.md` — persistence_thread event emission
 - `03-03-PLAN.md` — Integration and verification tests
@@ -89,7 +89,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 |-------|----------------|--------|-----------|
 | 1. Telemetry Skeleton | 6/6 | Complete | 2026-03-24 |
 | 2. Collector Computation | 6/6 | Complete | 2026-03-24 |
-| 3. Event Emission Migration | 0/3 | Planned | - |
+| 3. Event Emission Migration | 3/3 | Complete | 2026-03-24 |
 | 4. State Decoupling | 0/4 | Not started | - |
 | 5. Integration & Cleanup | 0/4 | Not started | - |
 

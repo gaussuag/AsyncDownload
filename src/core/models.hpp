@@ -1,5 +1,6 @@
 ﻿#pragma once
 
+#include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "asyncdownload/types.hpp"
 
 #include <array>
@@ -192,6 +193,7 @@ struct SessionState {
     std::int64_t memory_watermark_episode_start_inflight_bytes = 0;
     std::int64_t memory_watermark_episode_start_memory_bytes = 0;
     performance::RuntimePerformanceMetrics performance_metrics{};
+    asyncdownload::telemetry::TelemetrySession telemetry_session_{};
 };
 
 } // namespace asyncdownload::core

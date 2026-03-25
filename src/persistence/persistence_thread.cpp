@@ -14,24 +14,6 @@ namespace asyncdownload::persistence {
 
 namespace {
 
-template <typename T>
-void update_peak(std::atomic<T>& target, const T value) noexcept {
-    auto current = target.load(std::memory_order_relaxed);
-    while (current < value &&
-        !target.compare_exchange_weak(current,
-            value,
-            std::memory_order_release,
-            std::memory_order_relaxed)) {
-    }
-}
-
-void update_inflight_peak(core::SessionState& session) noexcept {
-    const auto inflight = std::max<std::int64_t>(0,
-        session.downloaded_bytes.load(std::memory_order_relaxed) -
-            session.persisted_bytes.load(std::memory_order_relaxed));
-    update_peak(session.performance_metrics.max_inflight_bytes, inflight);
-}
-
 } // namespace
 
 PersistenceThread::PersistenceThread(core::SessionState& session,
@@ -150,7 +132,6 @@ void PersistenceThread::handle_packet(core::DataPacket packet) {
         if (queued_payload_bytes < 0) {
             session_.queued_payload_bytes.store(0, std::memory_order_relaxed);
         }
-        update_inflight_peak(session_);
     }
 
     if (packet.kind == core::PacketKind::range_complete) {
@@ -186,7 +167,7 @@ void PersistenceThread::handle_data_packet(core::DataPacket packet) {
         // Persistence 线程只要等到 expected offset 到达，就能把后续连续片段一起链式写下去。
         packet.accounted_bytes += core::kMapNodeOverheadBytes;
         const auto queued_memory = core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
-        update_peak(session_.performance_metrics.max_memory_bytes, queued_memory);
+        session_.telemetry_session_.record_memory_sample(queued_memory);
         ++current_out_of_order_packets_;
         current_out_of_order_bytes_ += static_cast<std::int64_t>(packet.accounted_bytes);
         range->out_of_order_queue.emplace(packet.offset, std::move(packet));
@@ -304,7 +285,7 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
         bytes_since_flush_ += aligned_bytes;
         session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(aligned_bytes),
             std::memory_order_relaxed);
-        update_inflight_peak(session_);
+        session_.telemetry_session_.record_persist_delta(static_cast<std::uint64_t>(aligned_bytes));
         cursor += static_cast<std::int64_t>(aligned_bytes);
         index += aligned_bytes;
     }
@@ -350,7 +331,8 @@ std::error_code PersistenceThread::flush_tail(core::RangeContext& range, const b
     bytes_since_flush_ += range.tail_buffer.length;
     session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(range.tail_buffer.length),
         std::memory_order_relaxed);
-    update_inflight_peak(session_);
+    session_.telemetry_session_.record_persist_delta(
+        static_cast<std::uint64_t>(range.tail_buffer.length));
     range.tail_buffer = {};
     return {};
 }

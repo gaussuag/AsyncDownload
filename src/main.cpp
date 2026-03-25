@@ -350,7 +350,7 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     const auto& perf = result.performance;
     const auto avg_net_mb = perf.average_network_bytes_per_second / (1024.0 * 1024.0);
     const auto avg_disk_mb = perf.average_disk_bytes_per_second / (1024.0 * 1024.0);
-    stream << std::fixed << std::setprecision(4);
+    stream << std::fixed << std::setprecision(6);
     stream << "Summary\n";
     stream << "  status=" << (result.ok() ? "success" : "failed") << "\n";
     stream << "  total_bytes=" << result.total_bytes << "\n";

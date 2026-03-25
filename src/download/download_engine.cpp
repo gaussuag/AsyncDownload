@@ -91,17 +91,6 @@ private:
 
 constexpr std::size_t kAggregatedPacketBytes = 64 * 1024;
 
-template <typename T>
-void update_peak(std::atomic<T>& target, const T value) noexcept {
-    auto current = target.load(std::memory_order_relaxed);
-    while (current < value &&
-        !target.compare_exchange_weak(current,
-            value,
-            std::memory_order_release,
-            std::memory_order_relaxed)) {
-    }
-}
-
 void adjust_active_buffered_bytes(TransferHandle& transfer,
                                   const std::int64_t accounted_delta) noexcept {
     static_cast<void>(transfer);
@@ -135,10 +124,8 @@ void start_queue_pause(TransferHandle& transfer) noexcept {
     transfer.paused_by_window_boundary = false;
     if (!transfer.queue_pause_active) {
         transfer.queue_pause_active = true;
-        transfer.session->performance_metrics.total_pause_count.fetch_add(
-            1, std::memory_order_relaxed);
-        transfer.session->performance_metrics.queue_full_pause_count.fetch_add(
-            1, std::memory_order_relaxed);
+        transfer.session->telemetry_session_.record_pause(
+            telemetry::TelemetryPauseReason::queue_full, true);
     }
 
     update_transfer_pause_state(transfer);
@@ -160,8 +147,8 @@ void start_memory_pause(TransferHandle& transfer) noexcept {
 
     if (!transfer.paused_by_memory) {
         transfer.paused_by_memory = true;
-        transfer.session->performance_metrics.total_pause_count.fetch_add(
-            1, std::memory_order_relaxed);
+        transfer.session->telemetry_session_.record_pause(
+            telemetry::TelemetryPauseReason::memory_pressure, false);
     }
 
     update_transfer_pause_state(transfer);
@@ -223,6 +210,7 @@ void record_first_network_byte(core::SessionState& session,
             std::memory_order_acq_rel,
             std::memory_order_relaxed)) {
         session.first_network_byte_at = Clock::now();
+        session.telemetry_session_.record_first_byte_received();
     }
 }
 
@@ -273,8 +261,7 @@ void invoke_progress(core::SessionState& session,
         [](const TransferHandle& handle) {
             return handle.in_multi;
         }));
-    update_peak(session.performance_metrics.max_memory_bytes, snapshot.memory_bytes);
-    update_peak(session.performance_metrics.max_inflight_bytes, snapshot.inflight_bytes);
+    session.telemetry_session_.record_memory_sample(snapshot.memory_bytes);
     update_progress_rates(session, snapshot);
 
     try {
@@ -517,7 +504,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     if (new_accounted > transfer.buffered_accounted_bytes) {
         const auto delta = new_accounted - transfer.buffered_accounted_bytes;
         const auto current_memory = core::global_memory_accounting().add(delta);
-        update_peak(transfer.session->performance_metrics.max_memory_bytes, current_memory);
+        transfer.session->telemetry_session_.record_memory_sample(current_memory);
         transfer.buffered_accounted_bytes = new_accounted;
     }
 
@@ -536,23 +523,19 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     packet.offset = transfer.buffered_offset;
     packet.payload = std::move(transfer.buffered_payload);
     packet.accounted_bytes = transfer.buffered_accounted_bytes;
-    update_peak(transfer.session->performance_metrics.max_packet_size_bytes, packet.payload.size());
 
     if (!transfer.data_queue->try_enqueue(*transfer.data_queue_producer, std::move(packet))) {
         transfer.buffered_payload = std::move(packet.payload);
         return false;
     }
 
-    transfer.session->performance_metrics.packets_enqueued_total.fetch_add(
-        1, std::memory_order_relaxed);
     transfer.session->queued_packets.fetch_add(1, std::memory_order_relaxed);
     const auto downloaded = transfer.session->downloaded_bytes.fetch_add(
         static_cast<std::int64_t>(packet_size), std::memory_order_relaxed) +
         static_cast<std::int64_t>(packet_size);
-    const auto inflight = downloaded -
-        transfer.session->persisted_bytes.load(std::memory_order_relaxed);
-    update_peak(transfer.session->performance_metrics.max_inflight_bytes,
-        std::max<std::int64_t>(0, inflight));
+    static_cast<void>(downloaded);
+    transfer.session->telemetry_session_.record_download_delta(
+        static_cast<std::uint64_t>(packet_size));
     adjust_active_buffered_bytes(transfer,
         -static_cast<std::int64_t>(packet.accounted_bytes));
     transfer.buffered_offset = 0;
@@ -642,8 +625,8 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
             // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
             // 就暂停接收，避免把后续字节算进错误的区间。
             if (!current->paused_by_window_boundary) {
-                current->session->performance_metrics.total_pause_count.fetch_add(1,
-                    std::memory_order_relaxed);
+                current->session->telemetry_session_.record_pause(
+                    telemetry::TelemetryPauseReason::none, false);
             }
             current->paused_by_window_boundary = true;
             update_transfer_pause_state(*current);
@@ -767,8 +750,8 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 
         const auto pause_for_gap = handle.range->pause_for_gap.load(std::memory_order_acquire);
         if (pause_for_gap && !handle.paused_by_gap) {
-            handle.session->performance_metrics.total_pause_count.fetch_add(
-                1, std::memory_order_relaxed);
+            handle.session->telemetry_session_.record_pause(
+                telemetry::TelemetryPauseReason::gap, false);
             handle.paused_by_gap = true;
             update_transfer_pause_state(handle);
             curl_easy_pause(handle.easy, CURLPAUSE_RECV);
@@ -960,19 +943,9 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
                                                            const std::size_t ranges_total,
                                                            const Clock::time_point now) noexcept {
     static_cast<void>(ranges_total);
-    PerformanceSummary summary{};
-    performance::copy_runtime_to_summary(summary, session.performance_metrics);
-    const auto downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
-    if (session.task_started_at.time_since_epoch().count() != 0) {
-        const auto duration_ms = std::max<std::int64_t>(0,
-            std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                session.task_started_at).count());
-        if (duration_ms > 0) {
-            const auto seconds = static_cast<double>(duration_ms) / 1000.0;
-            summary.average_network_bytes_per_second =
-                static_cast<double>(downloaded_bytes) / seconds;
-        }
-    }
+    static_cast<void>(now);
+
+    auto summary = session.telemetry_session_.final_summary();
     if (file_writer != nullptr) {
         const auto io_metrics = file_writer->io_metrics();
         const auto disk_service_time_ns =
@@ -981,24 +954,9 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
             summary.average_disk_bytes_per_second =
                 static_cast<double>(io_metrics.write_bytes_total) /
                 (static_cast<double>(disk_service_time_ns) / 1000000000.0);
-        } else {
-            summary.average_disk_bytes_per_second = 0.0;
         }
-    } else {
-        summary.average_disk_bytes_per_second = 0.0;
     }
-    if (session.first_network_byte_recorded.load(std::memory_order_relaxed) &&
-        session.task_started_at.time_since_epoch().count() != 0 &&
-        session.first_network_byte_at.time_since_epoch().count() != 0) {
-        summary.time_to_first_byte_ms = std::max<std::int64_t>(0,
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                session.first_network_byte_at - session.task_started_at).count());
-    }
-    if (summary.packets_enqueued_total > 0) {
-        summary.average_packet_size_bytes =
-            static_cast<double>(downloaded_bytes) /
-            static_cast<double>(summary.packets_enqueued_total);
-    }
+
     return summary;
 }
 
@@ -1082,6 +1040,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.accept_ranges = probe_result.accept_ranges;
         session.progress_callback = request.progress_callback;
         session.task_started_at = run_started;
+        session.telemetry_session_.record_task_started();
         if (!session.accept_ranges) {
             // 不支持 Range 的服务端无法安全做多连接和窗口化调度，所以这里主动
             // 退化到单连接整文件下载，保证行为正确性优先。
@@ -1175,6 +1134,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.persisted_bytes = finished_bytes;
             result.completed_ranges = bitmap.block_count();
             result.resumed = session.resumed;
+            session.telemetry_session_.record_task_completed();
             result.performance = build_performance_summary(session,
                 &file_writer,
                 bitmap.block_count(),
@@ -1422,6 +1382,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.resumed = session.resumed;
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
+        if (!failure) {
+            session.telemetry_session_.record_task_completed();
+        }
         result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
         return result;
     } catch (...) {

@@ -67,6 +67,7 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
@@ -125,6 +126,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
@@ -186,6 +188,7 @@ TEST(PersistenceThreadTest, TracksQueuedBytesAcrossQueueIngressAndDequeue) {
     session.options = options;
     session.total_size = 4096;
     session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
@@ -250,6 +253,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     session.options = options;
     session.total_size = 4096;
     session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
@@ -283,7 +287,8 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 4096);
-    EXPECT_GE(session.performance_metrics.max_inflight_bytes.load(std::memory_order_relaxed), 0);
+    const auto summary = session.telemetry_session_.final_summary();
+    EXPECT_EQ(summary.max_inflight_bytes, 0);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -312,6 +317,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
@@ -370,7 +376,8 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     EXPECT_EQ(bitmap.load(1), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(2), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 3 * 4096);
-    EXPECT_GT(session.performance_metrics.max_memory_bytes.load(std::memory_order_relaxed), 0U);
+    const auto summary = session.telemetry_session_.final_summary();
+    EXPECT_GT(summary.max_memory_bytes, 0U);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);

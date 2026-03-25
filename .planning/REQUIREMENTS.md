@@ -26,8 +26,8 @@
 
 ### Migration
 
-- [ ] **MIGR-01**: download_engine emits TelemetryEvents via TelemetrySession instead of updating metrics directly
-- [ ] **MIGR-02**: persistence_thread emits PersistDelta and QueuePaused events
+- [x] **MIGR-01**: download_engine emits TelemetryEvents via TelemetrySession instead of updating metrics directly
+- [x] **MIGR-02**: persistence_thread emits PersistDelta and QueuePaused events
 - [ ] **MIGR-03**: SessionState telemetry fields removed (downloaded_bytes, first_network_byte_at, performance_metrics, etc.)
 - [ ] **MIGR-04**: download_engine no longer calculates speeds, TTFB, or summary fields directly
 
@@ -79,8 +79,8 @@
 | COLL-05 | Phase 2 | Complete |
 | COLL-06 | Phase 2 | Complete |
 | COLL-07 | Phase 2 | Complete |
-| MIGR-01 | Phase 3 | Pending |
-| MIGR-02 | Phase 3 | Pending |
+| MIGR-01 | Phase 3 | Complete |
+| MIGR-02 | Phase 3 | Complete |
 | MIGR-03 | Phase 4 | Pending |
 | MIGR-04 | Phase 4 | Pending |
 | INTG-01 | Phase 4 | Pending |
@@ -97,7 +97,7 @@
 
 ---
 *Requirements defined: 2026-03-24*
-*Last updated: 2026-03-24 after Phase 2 verification*
+*Last updated: 2026-03-24 after Phase 3 verification*
 
 **Roadmap:** .planning/ROADMAP.md (5 phases)
 **State:** .planning/STATE.md

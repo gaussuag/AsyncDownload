@@ -26,10 +26,11 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 - ✓ TelemetryCollector metric aggregation logic (TTFB, speeds, peaks, counts, packet stats) — validated in Phase 2
 - ✓ `ProgressSnapshot` watermark generation in `TelemetryCollector::current_snapshot()` — validated in Phase 2
 - ✓ Telemetry collector regression coverage — validated in Phase 2
+- ✓ `download_engine` and `persistence_thread` now emit telemetry events through `SessionState::telemetry_session_` — validated in Phase 3
+- ✓ Telemetry emission regression coverage and runtime-metric immutability checks — validated in Phase 3
 
 ### Active
 
-- [ ] Migrate download_engine to emit TelemetryEvents instead of updating metrics directly
 - [ ] Migrate SessionState to remove telemetry state pollution
 - [ ] Delete acceptance.py and diagnostic export path
 - [ ] Verify benchmark.py output unchanged
@@ -38,9 +39,9 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 
 ## Current State
 
-Phase 2 is complete and verified. The repository now contains a working `TelemetryCollector` that aggregates TTFB, live speeds, final averages, peaks, pause counts, packet statistics, and running snapshots with watermark timestamps. Dedicated collector regression coverage lives in `tests/telemetry/telemetry_collector_test.cpp`.
+Phase 3 is complete and verified. The repository now routes download and persistence telemetry through a `SessionState`-owned `TelemetrySession`, and public download summaries now read from the telemetry aggregation path. Regression coverage now includes `tests/telemetry/telemetry_event_emission_test.cpp` in addition to the collector tests.
 
-Next focus: Phase 3 will migrate `download_engine` and `persistence_thread` to emit telemetry events through `TelemetrySession` instead of maintaining metrics directly.
+Next focus: Phase 4 will remove obsolete telemetry state from `SessionState` and redirect progress/final export paths entirely onto telemetry-owned snapshots and summaries.
 
 ### Out of Scope
 
@@ -76,6 +77,7 @@ The existing benchmark.py and profiler.py scripts consume PerformanceSummary out
 | 4-component architecture (Event/Sink/Collector/Session) | Clear separation of concerns, testable individually | Phase 1 established all four components as compilable skeletons |
 | Collector owns metric aggregation | Keeps timing/packet/pause/resource calculations out of download and persistence code | Validated in Phase 2 by collector implementation and focused regression tests |
 | Snapshot watermark is part of the public snapshot model | Snapshot consumers need a monotonic read marker without draining the queue | Validated in Phase 2 by `ProgressSnapshot::watermark_timestamp_ns` and collector tests |
+| Producers emit into one SessionState-owned TelemetrySession | Keeps download and persistence telemetry on a shared event stream with one collector | Validated in Phase 3 by event-emission migration and regression tests |
 | Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | — Pending |
 | Delete acceptance.py | Redundant with benchmark+profiler paths | — Pending |
 
@@ -97,4 +99,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-24 after Phase 2 verification*
+*Last updated: 2026-03-24 after Phase 3 verification*
