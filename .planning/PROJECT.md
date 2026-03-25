@@ -41,7 +41,16 @@ None.
 
 ## Current State
 
-Phase 5 is complete and verified. The deprecated `acceptance.py` and `--diagnostic-file` paths are gone, current user guidance points directly to benchmark/profiler and focused gtests, and unchanged benchmark/profiler scripts successfully consumed the Release CLI contract during loopback smoke validation. This milestone is complete.
+**v1.0 MVP shipped 2026-03-25.** All 5 phases complete. 24/24 requirements satisfied.
+
+The telemetry refactoring is complete:
+- Telemetry module provides event-driven telemetry with clean separation
+- Download engine and persistence thread emit events via TelemetrySession
+- SessionState retains only coordination state
+- Progress and summary sourced from TelemetryCollector
+- benchmark.py and profiler.py remain compatible
+
+**Next milestone:** v1.1 (not yet planned)
 
 ### Out of Scope
 
@@ -53,10 +62,10 @@ Phase 5 is complete and verified. The deprecated `acceptance.py` and `--diagnost
 
 ## Context
 
-AsyncDownload is a C++20 CMake project using vcpkg with libcurl. The existing implementation stores performance metrics (bytes downloaded, speeds, pause counts, memory samples) directly in SessionState and download_engine. This creates:
+AsyncDownload is a C++20 CMake project using vcpkg with libcurl. The existing implementation stores performance metrics (bytes downloaded, speeds, pause counts, memory samples) directly in SessionState and download_engine. This create:
 - Large files with mixed responsibilities
 - Difficulty adding new metrics without modifying core download code
-- Risk of telemetry changes breaking download functionality
+- Risk of telemetry changes break download functionality
 
 The existing benchmark.py and profiler.py scripts consume PerformanceSummary output. These must remain functional after refactoring.
 
@@ -78,7 +87,7 @@ The existing benchmark.py and profiler.py scripts consume PerformanceSummary out
 | Collector owns metric aggregation | Keeps timing/packet/pause/resource calculations out of download and persistence code | Validated in Phase 2 by collector implementation and focused regression tests |
 | Snapshot watermark is part of the public snapshot model | Snapshot consumers need a monotonic read marker without draining the queue | Validated in Phase 2 by `ProgressSnapshot::watermark_timestamp_ns` and collector tests |
 | Producers emit into one SessionState-owned TelemetrySession | Keeps download and persistence telemetry on a shared event stream with one collector | Validated in Phase 3 by event-emission migration and regression tests |
-| SessionState keeps only coordination fields | Download and persistence still need shared counters, but telemetry timing and summaries should not live in shared runtime state | Validated in Phase 4 by removing deprecated fields from `SessionState` |
+| SessionState keep only coordination fields | Download and persistence still need shared counters, but telemetry timing and summaries should not live in shared runtime state | Validated in Phase 4 by removing deprecated fields from `SessionState` |
 | Progress callbacks start from telemetry snapshot data | Keeps UI-facing rates, inflight bytes, and memory sourced from one collector while still merging scheduler state locally | Validated in Phase 4 by `invoke_progress()` refactor and integration tests |
 | Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | Validated in Phase 5 by unchanged benchmark/profiler smoke runs against the Release CLI |
 | Delete acceptance.py | Redundant with benchmark+profiler paths | Validated in Phase 5 by deleting the script and removing the remaining diagnostic sidecar path |
@@ -101,4 +110,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-25 after Phase 5 verification*
+*Last updated: 2026-03-25 after v1.0 milestone completion*
