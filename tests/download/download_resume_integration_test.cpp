@@ -598,7 +598,7 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     const auto avg_disk_speed = parse_summary_speed_mb_s(summary_text, "avg_disk_speed");
     ASSERT_TRUE(avg_network_speed.has_value());
     ASSERT_TRUE(avg_disk_speed.has_value());
-    EXPECT_NE(*avg_network_speed, *avg_disk_speed);
+    EXPECT_NEAR(*avg_network_speed, *avg_disk_speed, 0.000001);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
@@ -896,6 +896,9 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     EXPECT_GE(result.performance.total_pause_count, 0U);
     EXPECT_GE(result.performance.queue_full_pause_count, 0U);
     EXPECT_GE(result.performance.total_pause_count, result.performance.queue_full_pause_count);
+    EXPECT_NEAR(result.performance.average_network_bytes_per_second,
+        result.performance.average_disk_bytes_per_second,
+        0.000001);
     EXPECT_GT(result.performance.packets_enqueued_total, 0U);
     EXPECT_GT(result.performance.average_packet_size_bytes, 0.0);
     EXPECT_GT(result.performance.max_packet_size_bytes, 0U);
@@ -929,6 +932,10 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
         [](const asyncdownload::ProgressSnapshot& snapshot) {
             return snapshot.inflight_bytes >= 0;
         }));
+    EXPECT_EQ(captured.back().downloaded_bytes,
+        static_cast<std::int64_t>(std::filesystem::file_size(source_file)));
+    EXPECT_EQ(captured.back().persisted_bytes,
+        static_cast<std::int64_t>(std::filesystem::file_size(source_file)));
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);

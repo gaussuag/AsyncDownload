@@ -173,6 +173,14 @@ struct SessionState {
     std::atomic<std::size_t> memory_paused_handles{0};
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
+    std::chrono::steady_clock::time_point task_started_at{};
+    std::int64_t telemetry_downloaded_bytes_base = 0;
+    std::int64_t telemetry_persisted_bytes_base = 0;
+    std::chrono::steady_clock::time_point last_progress_sample_at{};
+    std::int64_t last_progress_downloaded_bytes = 0;
+    std::int64_t last_progress_persisted_bytes = 0;
+    double last_network_bytes_per_second = 0.0;
+    double last_disk_bytes_per_second = 0.0;
     ProgressCallback progress_callback{};
     asyncdownload::telemetry::TelemetrySession telemetry_session_{};
 };

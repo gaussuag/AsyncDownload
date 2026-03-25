@@ -34,6 +34,26 @@ TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryFromEventStream)
     EXPECT_DOUBLE_EQ(summary.average_packet_size_bytes, 1536.0);
 }
 
+TEST(TelemetryEventEmissionTest, SessionTelemetryUsesExplicitTaskTimestampsForAverages) {
+    asyncdownload::core::SessionState session{};
+
+    const auto started_at = asyncdownload::telemetry::TelemetryClock::now();
+    const auto first_byte_at = started_at + std::chrono::milliseconds(250);
+    const auto completed_at = started_at + std::chrono::seconds(4);
+
+    session.telemetry_session_.record_task_started(started_at);
+    session.telemetry_session_.record_first_byte_received(first_byte_at);
+    session.telemetry_session_.record_download_delta(300U);
+    session.telemetry_session_.record_persist_delta(300U);
+    session.telemetry_session_.record_task_completed(completed_at);
+
+    const auto summary = session.telemetry_session_.final_summary();
+
+    EXPECT_EQ(summary.time_to_first_byte_ms, 250);
+    EXPECT_DOUBLE_EQ(summary.average_network_bytes_per_second, 75.0);
+    EXPECT_DOUBLE_EQ(summary.average_disk_bytes_per_second, 75.0);
+}
+
 TEST(TelemetryEventEmissionTest, SessionTelemetrySnapshotAdvancesFromEvents) {
     asyncdownload::core::SessionState session{};
 

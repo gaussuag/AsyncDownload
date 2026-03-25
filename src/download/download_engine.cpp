@@ -151,6 +151,39 @@ void finish_memory_pause(TransferHandle& transfer) noexcept {
     update_transfer_pause_state(transfer);
 }
 
+void update_progress_rates(core::SessionState& session,
+                           ProgressSnapshot& snapshot) noexcept {
+    const auto now = Clock::now();
+    if (session.last_progress_sample_at.time_since_epoch().count() == 0) {
+        session.last_progress_sample_at = now;
+        session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
+        session.last_progress_persisted_bytes = snapshot.persisted_bytes;
+        snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
+        snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
+        return;
+    }
+
+    const auto elapsed_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now -
+            session.last_progress_sample_at).count();
+    if (elapsed_seconds > 0.0) {
+        const auto downloaded_delta =
+            snapshot.downloaded_bytes - session.last_progress_downloaded_bytes;
+        const auto persisted_delta =
+            snapshot.persisted_bytes - session.last_progress_persisted_bytes;
+        session.last_network_bytes_per_second =
+            std::max(0.0, static_cast<double>(downloaded_delta) / elapsed_seconds);
+        session.last_disk_bytes_per_second =
+            std::max(0.0, static_cast<double>(persisted_delta) / elapsed_seconds);
+    }
+
+    session.last_progress_sample_at = now;
+    session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
+    session.last_progress_persisted_bytes = snapshot.persisted_bytes;
+    snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
+    snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
+}
+
 void record_first_network_byte(core::SessionState& session,
                                const std::size_t bytes) noexcept {
     if (bytes == 0) {
@@ -169,8 +202,13 @@ void invoke_progress(core::SessionState& session,
 
     auto snapshot = session.telemetry_session_.current_snapshot();
     snapshot.total_bytes = session.total_size;
+    snapshot.downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
+    snapshot.persisted_bytes = session.persisted_bytes.load(std::memory_order_relaxed);
     snapshot.vdl_offset = session.vdl_offset.load(std::memory_order_relaxed);
+    snapshot.inflight_bytes = std::max<std::int64_t>(0,
+        snapshot.downloaded_bytes - snapshot.persisted_bytes);
     snapshot.queued_packets = session.queued_packets.load(std::memory_order_relaxed);
+    snapshot.memory_bytes = core::global_memory_accounting().current_bytes();
     snapshot.resumed = session.resumed;
 
     for (const auto& range : ranges) {
@@ -198,6 +236,7 @@ void invoke_progress(core::SessionState& session,
         [](const TransferHandle& handle) {
             return handle.in_multi;
         }));
+    update_progress_rates(session, snapshot);
 
     try {
         session.progress_callback(snapshot);
@@ -870,20 +909,32 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
                                                            const std::size_t ranges_total,
                                                            const Clock::time_point now) noexcept {
     static_cast<void>(ranges_total);
-    static_cast<void>(now);
-
-    auto summary = session.telemetry_session_.final_summary();
-    if (file_writer != nullptr) {
-        const auto io_metrics = file_writer->io_metrics();
-        const auto disk_service_time_ns =
-            io_metrics.write_time_ns_total + io_metrics.flush_time_ns_total;
-        if (io_metrics.write_bytes_total > 0 && disk_service_time_ns > 0) {
-            summary.average_disk_bytes_per_second =
-                static_cast<double>(io_metrics.write_bytes_total) /
-                (static_cast<double>(disk_service_time_ns) / 1000000000.0);
-        }
+    static_cast<void>(file_writer);
+    auto summary = session.telemetry_session_.final_summary(now);
+    if (session.task_started_at.time_since_epoch().count() == 0 || now <= session.task_started_at) {
+        summary.average_network_bytes_per_second = 0.0;
+        summary.average_disk_bytes_per_second = 0.0;
+        return summary;
     }
 
+    const auto duration_seconds =
+        std::chrono::duration_cast<std::chrono::duration<double>>(now - session.task_started_at).count();
+    if (duration_seconds <= 0.0) {
+        summary.average_network_bytes_per_second = 0.0;
+        summary.average_disk_bytes_per_second = 0.0;
+        return summary;
+    }
+
+    const auto downloaded_bytes = std::max<std::int64_t>(0,
+        session.downloaded_bytes.load(std::memory_order_relaxed) -
+            session.telemetry_downloaded_bytes_base);
+    const auto persisted_bytes = std::max<std::int64_t>(0,
+        session.persisted_bytes.load(std::memory_order_relaxed) -
+            session.telemetry_persisted_bytes_base);
+    summary.average_network_bytes_per_second =
+        static_cast<double>(downloaded_bytes) / duration_seconds;
+    summary.average_disk_bytes_per_second =
+        static_cast<double>(persisted_bytes) / duration_seconds;
     return summary;
 }
 
@@ -929,6 +980,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             return result;
         }
 
+        const auto run_started = Clock::now();
         // libcurl 的全局初始化只需要做一次，但这里仍通过轻量 RAII 包装保证
         // 当前进程在真正进入下载主链前已经具备可工作的网络环境。
         CurlGlobal curl_global;
@@ -965,7 +1017,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.total_size = probe_result.total_size;
         session.accept_ranges = probe_result.accept_ranges;
         session.progress_callback = request.progress_callback;
-        session.telemetry_session_.record_task_started();
+        session.task_started_at = run_started;
+        session.telemetry_session_.record_task_started(run_started);
         if (!session.accept_ranges) {
             // 不支持 Range 的服务端无法安全做多连接和窗口化调度，所以这里主动
             // 退化到单连接整文件下载，保证行为正确性优先。
@@ -1041,6 +1094,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
+        session.telemetry_downloaded_bytes_base = finished_bytes;
+        session.telemetry_persisted_bytes_base = finished_bytes;
 
         if (safe_vdl >= session.total_size) {
             // 恢复后如果发现整个文件其实已经完整可靠，就直接 finalize，
@@ -1059,7 +1114,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.persisted_bytes = finished_bytes;
             result.completed_ranges = bitmap.block_count();
             result.resumed = session.resumed;
-            session.telemetry_session_.record_task_completed();
+            session.telemetry_session_.record_task_completed(Clock::now());
             result.performance = build_performance_summary(session,
                 &file_writer,
                 bitmap.block_count(),
@@ -1308,7 +1363,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
         if (!failure) {
-            session.telemetry_session_.record_task_completed();
+            session.telemetry_session_.record_task_completed(Clock::now());
         }
         result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
         return result;
