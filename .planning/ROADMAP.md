@@ -70,7 +70,9 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   2. download_engine no longer calculates speeds, TTFB, or summary fields directly
   3. CLI progress display reads from TelemetrySession::current_snapshot()
   4. PerformanceSummary final export via TelemetrySession::final_summary() produces identical output
-**Plans**: TBD
+**Plans**: 2 planned
+- `04-01-PLAN.md` — Remove deprecated SessionState fields and update_progress_rates
+- `04-02-PLAN.md` — Refactor invoke_progress to use TelemetrySession::current_snapshot()
 
 ### Phase 5: Integration & Cleanup
 **Goal**: acceptance.py deleted, benchmark.py and profiler.py smoke tests pass
@@ -90,7 +92,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 | 1. Telemetry Skeleton | 6/6 | Complete | 2026-03-24 |
 | 2. Collector Computation | 6/6 | Complete | 2026-03-24 |
 | 3. Event Emission Migration | 3/3 | Complete | 2026-03-24 |
-| 4. State Decoupling | 0/4 | Not started | - |
+| 4. State Decoupling | 0/2 | Not started | - |
 | 5. Integration & Cleanup | 0/4 | Not started | - |
 
 ---
