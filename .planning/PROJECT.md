@@ -31,18 +31,17 @@ Maintain 100% backward compatibility for `benchmark.py` and `profiler.py` while 
 - ✓ `SessionState` now retains only coordination state while telemetry timing and summary fields live in `TelemetrySession` — validated in Phase 4
 - ✓ Progress callbacks now merge telemetry-owned snapshots with coordination/range state — validated in Phase 4
 - ✓ CLI summary and progress regression coverage passes with telemetry-owned snapshot/final-summary paths — validated in Phase 4
+- ✓ Deprecated acceptance and diagnostic export paths removed — validated in Phase 5
+- ✓ `benchmark.py` compatibility smoke passes against the Release CLI contract — validated in Phase 5
+- ✓ `profiler.py` compatibility smoke passes against the Release CLI contract — validated in Phase 5
 
 ### Active
 
-- [ ] Delete acceptance.py and diagnostic export path
-- [ ] Verify benchmark.py output unchanged
-- [ ] Verify profiler.py output unchanged
+None.
 
 ## Current State
 
-Phase 4 is complete and verified. `SessionState` no longer stores telemetry-only timing or runtime-summary state, `download_engine` now builds progress snapshots from `TelemetrySession::current_snapshot()`, and final performance export remains telemetry-backed. Regression coverage now includes both telemetry event-flow tests and the detailed progress snapshot integration path.
-
-Next focus: Phase 5 will verify benchmark/profiler compatibility and delete deprecated tooling paths such as `acceptance.py`.
+Phase 5 is complete and verified. The deprecated `acceptance.py` and `--diagnostic-file` paths are gone, current user guidance points directly to benchmark/profiler and focused gtests, and unchanged benchmark/profiler scripts successfully consumed the Release CLI contract during loopback smoke validation. This milestone is complete.
 
 ### Out of Scope
 
@@ -81,8 +80,8 @@ The existing benchmark.py and profiler.py scripts consume PerformanceSummary out
 | Producers emit into one SessionState-owned TelemetrySession | Keeps download and persistence telemetry on a shared event stream with one collector | Validated in Phase 3 by event-emission migration and regression tests |
 | SessionState keeps only coordination fields | Download and persistence still need shared counters, but telemetry timing and summaries should not live in shared runtime state | Validated in Phase 4 by removing deprecated fields from `SessionState` |
 | Progress callbacks start from telemetry snapshot data | Keeps UI-facing rates, inflight bytes, and memory sourced from one collector while still merging scheduler state locally | Validated in Phase 4 by `invoke_progress()` refactor and integration tests |
-| Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | — Pending |
-| Delete acceptance.py | Redundant with benchmark+profiler paths | — Pending |
+| Keep benchmark/profiler interfaces unchanged | User investment in existing tooling | Validated in Phase 5 by unchanged benchmark/profiler smoke runs against the Release CLI |
+| Delete acceptance.py | Redundant with benchmark+profiler paths | Validated in Phase 5 by deleting the script and removing the remaining diagnostic sidecar path |
 
 ## Evolution
 
@@ -102,4 +101,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-03-25 after Phase 4 verification*
+*Last updated: 2026-03-25 after Phase 5 verification*

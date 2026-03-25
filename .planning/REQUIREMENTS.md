@@ -35,13 +35,13 @@
 
 - [x] **INTG-01**: CLI progress display reads from TelemetrySession::current_snapshot()
 - [x] **INTG-02**: PerformanceSummary final export via TelemetrySession::final_summary()
-- [ ] **INTG-03**: benchmark.py smoke test passes with identical output
-- [ ] **INTG-04**: profiler.py smoke test passes with identical output
+- [x] **INTG-03**: benchmark.py smoke test passes with identical output
+- [x] **INTG-04**: profiler.py smoke test passes with identical output
 
 ### Cleanup
 
-- [ ] **CLEN-01**: Delete acceptance.py and all diagnostic export paths
-- [ ] **CLEN-02**: Remove deprecated metric calculation code from SessionState and download_engine
+- [x] **CLEN-01**: Delete acceptance.py and all diagnostic export paths
+- [x] **CLEN-02**: Remove deprecated metric calculation code from SessionState and download_engine
 
 ## v2 Requirements
 
@@ -85,10 +85,10 @@
 | MIGR-04 | Phase 4 | Complete |
 | INTG-01 | Phase 4 | Complete |
 | INTG-02 | Phase 4 | Complete |
-| INTG-03 | Phase 5 | Pending |
-| INTG-04 | Phase 5 | Pending |
-| CLEN-01 | Phase 5 | Pending |
-| CLEN-02 | Phase 5 | Pending |
+| INTG-03 | Phase 5 | Complete |
+| INTG-04 | Phase 5 | Complete |
+| CLEN-01 | Phase 5 | Complete |
+| CLEN-02 | Phase 5 | Complete |
 
 **Coverage:**
 - v1 requirements: 24 total
@@ -97,7 +97,7 @@
 
 ---
 *Requirements defined: 2026-03-24*
-*Last updated: 2026-03-25 after Phase 4 verification*
+*Last updated: 2026-03-25 after Phase 5 verification*
 
 **Roadmap:** .planning/ROADMAP.md (5 phases)
 **State:** .planning/STATE.md

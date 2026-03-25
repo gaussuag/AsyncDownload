@@ -37,7 +37,6 @@ namespace {
 struct CliOptions {
     bool pause_on_exit = false;
     std::optional<std::filesystem::path> summary_file;
-    std::optional<std::filesystem::path> diagnostic_file;
     std::optional<std::filesystem::path> config_file;
     std::optional<std::size_t> connections_override;
 };
@@ -59,15 +58,6 @@ struct CliOptions {
             }
 
             options.summary_file = argv[++index];
-            continue;
-        }
-
-        if (argument == "--diagnostic-file") {
-            if (index + 1 >= argc) {
-                return false;
-            }
-
-            options.diagnostic_file = argv[++index];
             continue;
         }
 
@@ -95,144 +85,8 @@ struct CliOptions {
 
 void print_usage() {
     std::cerr << "Usage: AsyncDownload <url> <output> [connections] "
-                 "[--config <path>] [--pause-on-exit] [--summary-file <path>] "
-                 "[--diagnostic-file <path>]\n";
+                 "[--config <path>] [--pause-on-exit] [--summary-file <path>]\n";
 }
-
-struct ResourceDiagnostics {
-    std::size_t sample_count = 0;
-    double average_cpu_utilization_pct = 0.0;
-    double peak_cpu_utilization_pct = 0.0;
-    std::size_t peak_thread_count = 0;
-    std::size_t peak_handle_count = 0;
-};
-
-#ifdef _WIN32
-
-struct ProcessCpuTotals {
-    unsigned long long kernel_100ns = 0;
-    unsigned long long user_100ns = 0;
-};
-
-[[nodiscard]] unsigned long long combine_file_time(const FILETIME& file_time) {
-    return (static_cast<unsigned long long>(file_time.dwHighDateTime) << 32ULL) |
-        static_cast<unsigned long long>(file_time.dwLowDateTime);
-}
-
-[[nodiscard]] bool read_process_cpu_totals(ProcessCpuTotals& totals) {
-    FILETIME creation{};
-    FILETIME exit{};
-    FILETIME kernel{};
-    FILETIME user{};
-    if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user) == 0) {
-        return false;
-    }
-
-    totals.kernel_100ns = combine_file_time(kernel);
-    totals.user_100ns = combine_file_time(user);
-    return true;
-}
-
-[[nodiscard]] std::size_t read_process_handle_count() {
-    DWORD handle_count = 0;
-    if (GetProcessHandleCount(GetCurrentProcess(), &handle_count) == 0) {
-        return 0;
-    }
-
-    return static_cast<std::size_t>(handle_count);
-}
-
-[[nodiscard]] std::size_t read_process_thread_count() {
-    const auto process_id = GetCurrentProcessId();
-    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
-
-    THREADENTRY32 entry{};
-    entry.dwSize = sizeof(entry);
-    std::size_t count = 0;
-    if (Thread32First(snapshot, &entry) == TRUE) {
-        do {
-            if (entry.th32OwnerProcessID == process_id) {
-                ++count;
-            }
-            entry.dwSize = sizeof(entry);
-        } while (Thread32Next(snapshot, &entry) == TRUE);
-    }
-
-    CloseHandle(snapshot);
-    return count;
-}
-
-#endif
-
-class ResourceDiagnosticsSampler {
-public:
-    void start() {
-        sample();
-    }
-
-    void sample() {
-#ifdef _WIN32
-        ProcessCpuTotals current_cpu{};
-        const auto now = std::chrono::steady_clock::now();
-        const auto thread_count = read_process_thread_count();
-        const auto handle_count = read_process_handle_count();
-        diagnostics_.peak_thread_count = std::max(diagnostics_.peak_thread_count, thread_count);
-        diagnostics_.peak_handle_count = std::max(diagnostics_.peak_handle_count, handle_count);
-
-        if (read_process_cpu_totals(current_cpu)) {
-            if (has_previous_cpu_) {
-                const auto elapsed_seconds =
-                    std::chrono::duration_cast<std::chrono::duration<double>>(now -
-                        previous_sample_at_).count();
-                if (elapsed_seconds > 0.0) {
-                    const auto cpu_delta_100ns =
-                        (current_cpu.kernel_100ns - previous_cpu_totals_.kernel_100ns) +
-                        (current_cpu.user_100ns - previous_cpu_totals_.user_100ns);
-                    const auto cpu_seconds = static_cast<double>(cpu_delta_100ns) / 10000000.0;
-                    const auto core_count = std::max(1u, std::thread::hardware_concurrency());
-                    const auto utilization = std::max(0.0,
-                        (cpu_seconds / (elapsed_seconds * static_cast<double>(core_count))) *
-                            100.0);
-                    cpu_utilization_sum_pct_ += utilization;
-                    ++cpu_sample_count_;
-                    diagnostics_.peak_cpu_utilization_pct =
-                        std::max(diagnostics_.peak_cpu_utilization_pct, utilization);
-                }
-            }
-
-            previous_cpu_totals_ = current_cpu;
-            previous_sample_at_ = now;
-            has_previous_cpu_ = true;
-        }
-#else
-        const auto now = std::chrono::steady_clock::now();
-        static_cast<void>(now);
-#endif
-        ++diagnostics_.sample_count;
-    }
-
-    [[nodiscard]] ResourceDiagnostics finish() {
-        sample();
-        if (cpu_sample_count_ > 0) {
-            diagnostics_.average_cpu_utilization_pct =
-                cpu_utilization_sum_pct_ / static_cast<double>(cpu_sample_count_);
-        }
-        return diagnostics_;
-    }
-
-private:
-    ResourceDiagnostics diagnostics_{};
-    double cpu_utilization_sum_pct_ = 0.0;
-    std::size_t cpu_sample_count_ = 0;
-#ifdef _WIN32
-    bool has_previous_cpu_ = false;
-    ProcessCpuTotals previous_cpu_totals_{};
-    std::chrono::steady_clock::time_point previous_sample_at_{};
-#endif
-};
 
 [[nodiscard]] bool read_size_field(const nlohmann::json& object,
                                    const char* key,
@@ -394,64 +248,6 @@ void write_summary_file(const std::filesystem::path& path,
     write_summary(stream, result);
 }
 
-void write_diagnostic_file(const std::filesystem::path& path,
-                           const asyncdownload::DownloadResult& result,
-                           const ResourceDiagnostics& diagnostics) {
-    std::error_code ec;
-    const auto parent = path.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            std::cerr << "Failed to create diagnostic directory: " << ec.message() << "\n";
-            return;
-        }
-    }
-
-    const auto& perf = result.performance;
-    nlohmann::json payload = {
-        {"run_summary",
-            {
-                {"status", result.ok() ? "success" : "failed"},
-                {"total_bytes", result.total_bytes},
-                {"downloaded_bytes", result.downloaded_bytes},
-                {"persisted_bytes", result.persisted_bytes},
-                {"resumed", result.resumed},
-                {"error", result.ok() ? "" : result.error.message()},
-            }},
-        {"performance_summary",
-            {
-                {"avg_network_speed_mb_s",
-                    perf.average_network_bytes_per_second / (1024.0 * 1024.0)},
-                {"avg_disk_speed_mb_s",
-                    perf.average_disk_bytes_per_second / (1024.0 * 1024.0)},
-                {"time_to_first_byte_ms", perf.time_to_first_byte_ms},
-                {"max_memory_bytes", perf.max_memory_bytes},
-                {"max_inflight_bytes", perf.max_inflight_bytes},
-                {"total_pause_count", perf.total_pause_count},
-                {"queue_full_pause_count", perf.queue_full_pause_count},
-                {"packets_enqueued_total", perf.packets_enqueued_total},
-                {"avg_packet_size_bytes", perf.average_packet_size_bytes},
-                {"max_packet_size_bytes", perf.max_packet_size_bytes},
-            }},
-        {"resource_diagnostics",
-            {
-                {"sample_count", diagnostics.sample_count},
-                {"average_cpu_utilization_pct", diagnostics.average_cpu_utilization_pct},
-                {"peak_cpu_utilization_pct", diagnostics.peak_cpu_utilization_pct},
-                {"peak_thread_count", diagnostics.peak_thread_count},
-                {"peak_handle_count", diagnostics.peak_handle_count},
-            }},
-    };
-
-    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-    if (!stream.is_open()) {
-        std::cerr << "Failed to open diagnostic file: " << path.string() << "\n";
-        return;
-    }
-
-    stream << payload.dump(2) << "\n";
-}
-
 void maybe_pause_on_exit(const bool enabled) {
     if (!enabled) {
         return;
@@ -499,10 +295,7 @@ int main(int argc, char** argv) {
         request.options.max_connections = *cli_options.connections_override;
     }
 
-    ResourceDiagnosticsSampler diagnostics_sampler;
-    diagnostics_sampler.start();
     request.progress_callback = [&](const asyncdownload::ProgressSnapshot& snapshot) {
-        diagnostics_sampler.sample();
         const auto network_mb_per_second =
             snapshot.network_bytes_per_second / (1024.0 * 1024.0);
         const auto disk_mb_per_second =
@@ -528,14 +321,10 @@ int main(int argc, char** argv) {
 
     asyncdownload::DownloadClient client;
     const auto result = client.download(request);
-    const auto diagnostics = diagnostics_sampler.finish();
     std::cout << "\n";
     write_summary(std::cout, result);
     if (cli_options.summary_file.has_value()) {
         write_summary_file(*cli_options.summary_file, result);
-    }
-    if (cli_options.diagnostic_file.has_value()) {
-        write_diagnostic_file(*cli_options.diagnostic_file, result, diagnostics);
     }
 
     if (!result.ok()) {

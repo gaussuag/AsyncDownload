@@ -10,7 +10,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 - [x] **Phase 2: Collector Computation** - Implement all metric aggregations in TelemetryCollector
 - [x] **Phase 3: Event Emission Migration** - Migrate download_engine and persistence_thread to emit TelemetryEvents
 - [x] **Phase 4: State Decoupling** - Remove telemetry fields from SessionState, verify CLI progress and final summary
-- [ ] **Phase 5: Integration & Cleanup** - Verify backward compatibility, delete acceptance.py, run smoke tests
+- [x] **Phase 5: Integration & Cleanup** - Verify backward compatibility, delete acceptance.py, run smoke tests
 
 ## Phase Details
 
@@ -83,7 +83,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
   2. Deprecated metric calculation code removed from SessionState and download_engine
   3. benchmark.py smoke test passes with identical output
   4. profiler.py smoke test passes with identical output
-**Plans**: 2 planned
+**Plans**: 2 executed (`05-01-SUMMARY.md` through `05-02-SUMMARY.md`)
 - `05-01-PLAN.md` — Cleanup (CLEN-01, CLEN-02)
 - `05-02-PLAN.md` — Smoke tests (INTG-03, INTG-04)
 
@@ -95,7 +95,7 @@ Refactoring AsyncDownload's telemetry system from tight coupling with download l
 | 2. Collector Computation | 6/6 | Complete | 2026-03-24 |
 | 3. Event Emission Migration | 3/3 | Complete | 2026-03-24 |
 | 4. State Decoupling | 2/2 | Complete | 2026-03-25 |
-| 5. Integration & Cleanup | 0/2 | Not started | - |
+| 5. Integration & Cleanup | 2/2 | Complete | 2026-03-25 |
 
 ---
 *Roadmap created: 2026-03-24*

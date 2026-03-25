@@ -306,25 +306,19 @@ python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.z
 - `throughput_candidate`、`balanced_candidate`、`deep_buffer_candidate` 更适合作为“高并发路径修复进度”观察点。
 - `gap_tolerance_probe` 适合作为 gap 路径风险观察点。
 
-## 11. 诊断/验收层入口
+## 11. 补充验证入口
 
-以下内容不进入 benchmark 主表，但应作为诊断/验收层保留：
+以下内容不进入 benchmark 主表，但仍应通过直接命令保留：
 
-- 资源诊断：CPU、线程数、句柄数
 - 正确性/恢复诊断：CRC/VDL resume、断网中断后 resume
-- 长稳入口：独立的 `regression_v2` 长稳复测
+- benchmark smoke：最小 `regression_v2` 套件确认字段与报表结构
+- profiler smoke：最小 profile case 确认脚本、trace 和导出链可用
 
-统一入口：
-
-```powershell
-python scripts\performance\acceptance.py all --url "http://127.0.0.1:4287/1gb_files.zip"
-```
-
-可单独执行：
+建议入口：
 
 ```powershell
-python scripts\performance\acceptance.py resource --url "http://127.0.0.1:4287/1gb_files.zip"
-python scripts\performance\acceptance.py resume-interruption
-python scripts\performance\acceptance.py crc-resume
-python scripts\performance\acceptance.py long-run --url "http://127.0.0.1:4287/1gb_files.zip" --repeats 10
+build\tests\Release\AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ResumeAfterInterruptedCliDownload
+build\tests\Release\AsyncDownload_tests.exe --gtest_filter=DownloadIntegrationTest.ResumesAfterCrcRollbackPastVdl
+python scripts\performance\benchmark.py --url "http://127.0.0.1:4287/1gb_files.zip" --benchmark-suite regression_v2 --case-list baseline_default,balanced_candidate,memory_guard,scheduler_stress --repeats 1 --label "regression-smoke"
+python scripts\performance\profiler.py --url "http://127.0.0.1:4287/1gb_files.zip" --case-list throughput_candidate,scheduler_stress --repeats 1 --label "profile-smoke"
 ```

@@ -2216,3 +2216,52 @@ pause 起点快照进一步强化了上面的判断。
 3. 资源诊断与恢复/长稳验证已从 benchmark 主表拆出，进入单独的诊断/验收层入口。
 
 历史文档中出现的 `memory_pause_count`、`window_boundary_pause_count`、`gap_pause_count` 等字段继续保留为历史记录，不再代表当前正式导出口径。
+
+## 22. 删除独立诊断/验收链路并收敛到 benchmark/profiler（2026-03-25）
+
+### 22.1 目标
+
+完成遥测重构后的最终清理：
+
+- 删除 `scripts/performance/acceptance.py`
+- 删除 CLI `--diagnostic-file` 独立导出链路
+- 保持 `benchmark.py` / `profiler.py` 作为仍然可用的性能脚本入口
+- 保持正式 summary 字段和 Python 聚合 schema 不变
+
+### 22.2 实现范围
+
+本轮修改覆盖了：
+
+- `src/main.cpp`
+- `tests/download/download_resume_integration_test.cpp`
+- `README.md`
+- `docs/performance/performance_playbook_zh.md`
+- `docs/performance/performance_thread_initialization_zh.md`
+- `docs/performance/optimization_regression_guide_zh.md`
+- `docs/performance/performance_optimization_history_zh.md`
+- `scripts/performance/acceptance.py`
+
+关键变化：
+
+- CLI 不再接受 `--diagnostic-file`
+- 资源诊断 JSON 导出与对应集成测试一起删除
+- 文档中的性能验证入口统一收敛到 `benchmark.py`、`profiler.py` 和定向 gtest
+- 历史文档保留 `acceptance.py` 曾经存在过的记录，但当前指导文档不再把它作为现行入口
+
+### 22.3 验证结果
+
+本轮验证通过：
+
+- `scripts\build.bat`
+- `scripts\build.bat release`
+- `build\tests\Debug\AsyncDownload_tests.exe`
+- `python scripts\performance\benchmark.py ...` smoke（最小 `regression_v2` case 集）
+- `python scripts\performance\profiler.py ...` smoke（最小 profiler case 集，按本机工具可用性执行）
+
+### 22.4 结论
+
+这轮清理采纳，原因是：
+
+1. 正式性能入口已经稳定收敛到 benchmark 与 profiler。
+2. 独立诊断 JSON 与 `acceptance.py` 不再提供额外 keeper 价值，只增加维护面。
+3. 删除后，summary schema、benchmark/profiler 报表结构和回归验证入口仍然连续。

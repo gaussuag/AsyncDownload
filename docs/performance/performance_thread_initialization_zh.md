@@ -47,7 +47,7 @@
    - `packets_enqueued_total`
    - `avg_packet_size_bytes`
    - `max_packet_size_bytes`
-3. 资源诊断与恢复/长稳验证已明确降到诊断/验收层，不进入 benchmark 主表；统一入口补充为 `scripts/performance/acceptance.py`。
+3. 资源诊断与恢复/长稳验证不再保留独立 `acceptance.py` 入口；需要时直接组合 benchmark/profiler smoke 与定向 gtest。
 4. 性能指标体系已经历多轮观测补强，当前 `include/asyncdownload/performance_metrics.hpp`、`include/asyncdownload/types.hpp`、`src/main.cpp`、`scripts/performance/performance_common.py` 与相关测试之间存在明显的并行维护面。
 5. 当前导出链路混合了 3 类内容：长期 keeper 指标、为某一轮机制闭环而补的诊断指标、以及 latency/pause duration 这类采样摘要；本线程首先要把这几类边界重新理清。
 6. `src/main.cpp` 的 summary 输出与 `scripts/performance/performance_common.py` 的 `SUMMARY_SPECS` 已经承载很大的扁平字段面，新增或删除一个指标会同时牵动 CLI、Python 聚合、测试和文档，不适合继续无约束扩张。

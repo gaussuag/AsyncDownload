@@ -4,8 +4,6 @@
 #include "metadata/metadata_store.hpp"
 
 #include <gtest/gtest.h>
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -931,76 +929,6 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
         [](const asyncdownload::ProgressSnapshot& snapshot) {
             return snapshot.inflight_bytes >= 0;
         }));
-
-    const auto final_removed = std::filesystem::remove_all(temp_root, ec);
-    static_cast<void>(final_removed);
-#endif
-}
-
-TEST(DownloadIntegrationTest, WritesResourceDiagnosticsFile) {
-#ifndef _WIN32
-    GTEST_SKIP() << "This integration test currently uses Windows process control.";
-#else
-    const auto workspace_root = get_workspace_root();
-    const auto temp_root = make_unique_temp_root("asyncdownload_resource_diagnostics_integration");
-    std::error_code ec;
-    const auto removed = std::filesystem::remove_all(temp_root, ec);
-    static_cast<void>(removed);
-    std::filesystem::create_directories(temp_root, ec);
-    ASSERT_FALSE(ec);
-
-    const auto source_file = temp_root / "source.bin";
-    const auto output_file = temp_root / "diagnostics.bin";
-    const auto summary_file = temp_root / "summary.txt";
-    const auto diagnostics_file = temp_root / "diagnostics.json";
-    const auto cli_path = get_cli_path();
-    write_test_file(source_file, 8 * 1024 * 1024);
-    ASSERT_TRUE(std::filesystem::exists(cli_path));
-
-    ChildProcess server;
-    const auto script_path = workspace_root / "tests" / "support" / "range_server.py";
-    const auto server_command = quote_arg(L"python") + L" " +
-        quote_arg(script_path.wstring()) + L" " +
-        quote_arg(source_file.wstring()) + L" --port 0 --chunk-size 65536 --delay-ms 5";
-    ASSERT_TRUE(start_process(server, L"", server_command, workspace_root, true));
-
-    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
-    ASSERT_FALSE(port_line.empty());
-
-    ChildProcess cli;
-    const auto url = std::string("http://127.0.0.1:") + port_line + "/source.bin";
-    const auto cli_command = quote_arg(cli_path.wstring()) + L" " +
-        quote_arg(std::wstring(url.begin(), url.end())) + L" " +
-        quote_arg(output_file.wstring()) + L" --summary-file " +
-        quote_arg(summary_file.wstring()) + L" --diagnostic-file " +
-        quote_arg(diagnostics_file.wstring());
-    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, false));
-    ASSERT_EQ(cli.wait(20000), WAIT_OBJECT_0);
-    const auto exit_code = cli.exit_code();
-    cli.close();
-    stop_child(server, 0);
-
-    ASSERT_EQ(exit_code, 0U);
-    ASSERT_TRUE(std::filesystem::exists(diagnostics_file));
-    const auto diagnostics_text = read_text_file(diagnostics_file);
-    const auto diagnostics_json = nlohmann::json::parse(diagnostics_text, nullptr, false, true);
-    ASSERT_FALSE(diagnostics_json.is_discarded());
-    ASSERT_TRUE(diagnostics_json.contains("resource_diagnostics"));
-    ASSERT_TRUE(diagnostics_json.contains("performance_summary"));
-
-    const auto& resource = diagnostics_json.at("resource_diagnostics");
-    EXPECT_TRUE(resource.contains("sample_count"));
-    EXPECT_TRUE(resource.contains("peak_thread_count"));
-    EXPECT_TRUE(resource.contains("peak_handle_count"));
-    EXPECT_GE(resource.at("sample_count").get<std::size_t>(), 1U);
-    EXPECT_GE(resource.at("peak_thread_count").get<std::size_t>(), 1U);
-    EXPECT_GE(resource.at("peak_handle_count").get<std::size_t>(), 1U);
-
-    const auto& performance = diagnostics_json.at("performance_summary");
-    EXPECT_TRUE(performance.contains("avg_network_speed_mb_s"));
-    EXPECT_TRUE(performance.contains("avg_disk_speed_mb_s"));
-    EXPECT_TRUE(performance.contains("time_to_first_byte_ms"));
-    EXPECT_GE(performance.at("time_to_first_byte_ms").get<std::int64_t>(), 0);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
