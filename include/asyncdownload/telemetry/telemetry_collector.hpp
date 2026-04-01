@@ -60,7 +60,7 @@ private:
     std::int64_t max_inflight_bytes_{0};
     std::size_t total_pause_count_{0};
     std::size_t queue_full_pause_count_{0};
-    ProgressSnapshot snapshot_{};
+    std::size_t latest_memory_bytes_{0};
 };
 
 } // namespace asyncdownload::telemetry

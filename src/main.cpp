@@ -206,14 +206,9 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     const auto avg_disk_mb = perf.average_disk_bytes_per_second / (1024.0 * 1024.0);
     stream << std::fixed << std::setprecision(6);
     stream << "Summary\n";
-    stream << "  status=" << (result.ok() ? "success" : "failed") << "\n";
-    stream << "  total_bytes=" << result.total_bytes << "\n";
-    stream << "  downloaded_bytes=" << result.downloaded_bytes << "\n";
-    stream << "  persisted_bytes=" << result.persisted_bytes << "\n";
     stream << "  avg_network_speed=" << avg_net_mb << " MB/s\n";
     stream << "  avg_disk_speed=" << avg_disk_mb << " MB/s\n";
     stream << "  time_to_first_byte_ms=" << perf.time_to_first_byte_ms << "\n";
-    stream << "  resumed=" << (result.resumed ? "true" : "false") << "\n";
     stream << "  max_memory_bytes=" << perf.max_memory_bytes << "\n";
     stream << "  max_inflight_bytes=" << perf.max_inflight_bytes << "\n";
     stream << "  total_pause_count=" << perf.total_pause_count << "\n";
@@ -221,9 +216,6 @@ void write_summary(std::ostream& stream, const asyncdownload::DownloadResult& re
     stream << "  packets_enqueued_total=" << perf.packets_enqueued_total << "\n";
     stream << "  avg_packet_size_bytes=" << perf.average_packet_size_bytes << "\n";
     stream << "  max_packet_size_bytes=" << perf.max_packet_size_bytes << "\n";
-    if (!result.ok()) {
-        stream << "  error=" << result.error.message() << "\n";
-    }
     stream.unsetf(std::ios::floatfield);
 }
 

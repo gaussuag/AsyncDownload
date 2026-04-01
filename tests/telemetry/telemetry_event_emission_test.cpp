@@ -70,7 +70,6 @@ TEST(TelemetryEventEmissionTest, SessionTelemetrySnapshotAdvancesFromEvents) {
     EXPECT_EQ(snapshot.persisted_bytes, 1024);
     EXPECT_EQ(snapshot.inflight_bytes, 3072);
     EXPECT_EQ(snapshot.memory_bytes, 16384U);
-    EXPECT_GT(snapshot.watermark_timestamp_ns, 0);
 }
 
 } // namespace

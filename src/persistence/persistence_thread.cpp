@@ -119,20 +119,6 @@ void PersistenceThread::handle_packet(core::DataPacket packet) {
 
     // 只有真正开始处理这个 packet 时，它才算离开“网络未落盘积压”集合。
     session_.queued_packets.fetch_sub(1, std::memory_order_relaxed);
-    if (packet.kind == core::PacketKind::data) {
-        const auto queued_bytes = session_.queued_bytes.fetch_sub(
-            static_cast<std::int64_t>(packet.accounted_bytes), std::memory_order_relaxed) -
-            static_cast<std::int64_t>(packet.accounted_bytes);
-        if (queued_bytes < 0) {
-            session_.queued_bytes.store(0, std::memory_order_relaxed);
-        }
-        const auto queued_payload_bytes = session_.queued_payload_bytes.fetch_sub(
-            static_cast<std::int64_t>(packet.payload.size()), std::memory_order_relaxed) -
-            static_cast<std::int64_t>(packet.payload.size());
-        if (queued_payload_bytes < 0) {
-            session_.queued_payload_bytes.store(0, std::memory_order_relaxed);
-        }
-    }
 
     if (packet.kind == core::PacketKind::range_complete) {
         handle_range_complete(packet.range_id);

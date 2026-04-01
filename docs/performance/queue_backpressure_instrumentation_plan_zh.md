@@ -47,6 +47,8 @@
 这些字段不一定全部导出到最终 benchmark summary，但需要先在运行态存在：
 
 - `SessionState::queued_bytes`
+  - 注意：该字段曾作为诊断方案的一部分存在，但已经在后续指标清理中从当前实现退役
+  - 如果未来线程仍需要字节口径的 queue 诊断，应按本方案重新补回完整采集链，而不是假定当前代码里已经保留
   - 语义：当前仍在 network -> persistence 队列里的累计 `accounted_bytes`
   - 作用：给 `queued_packets` 增加字节维度
 - `TransferHandle::queue_pause_active`
@@ -115,6 +117,11 @@
 ## 5. 指标采集口径
 
 ### 5.1 `queued_bytes`
+
+当前代码状态说明：
+
+- 该字段已不属于当前默认实现面
+- 下面口径描述保留为“若未来重新引入该诊断字段时应遵守的规则”，不是对当前代码状态的描述
 
 口径建议与 `queued_packets` 保持一致：
 
@@ -190,14 +197,14 @@
 主要在：
 
 - `src/download/download_engine.cpp`
-  - enqueue 成功时更新 `queued_bytes`
+  - 若重新引入该字段，enqueue 成功时更新 `queued_bytes`
   - queue-full pause 开始
   - memory pause 开始
   - pause overlap 统计
   - resume 时完成 queue/full 与 memory duration
   - 识别 queue-ready-but-memory-blocked
 - `src/persistence/persistence_thread.cpp`
-  - dequeue 开始处理 packet 时扣减 `queued_bytes`
+  - 若重新引入该字段，dequeue 开始处理 packet 时扣减 `queued_bytes`
 
 ### 6.3 summary 与导出链路
 
@@ -215,7 +222,7 @@
 至少需要补：
 
 - `tests/persistence/persistence_thread_test.cpp`
-  - `queued_bytes` 入队/出队口径
+  - 若重新引入该字段，补 `queued_bytes` 入队/出队口径
 - `tests/download/*`
   - queue-full pause 和 memory pause 生命周期的最小行为断言
 - 如现有测试不方便覆盖，可新增更小的 `download_engine` 定位测试

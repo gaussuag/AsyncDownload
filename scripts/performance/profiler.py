@@ -540,7 +540,6 @@ def main() -> int:
             log_info(
                 "Finished profile "
                 f"{row['run_sequence']}/{total_runs}: "
-                f"status={row['status']} "
                 f"trace_stop={row['wpr_stop_exit_code']} "
                 f"avg_net={row['avg_network_speed_mb_s']:.2f}MB/s "
                 f"pauses={int(row['total_pause_count'])} "
@@ -549,13 +548,13 @@ def main() -> int:
 
             run_sequence += 1
 
-            if row["exit_code"] != 0 or row["status"] != "success":
+            if row["exit_code"] != 0:
                 failure = {
                     "sweep_name": sweep_name,
                     "case_name": case.name,
                     "repeat_index": repeat_index,
                     "stage": "download-status",
-                    "reason": row.get("error") or "CLI returned failure status",
+                    "reason": row.get("error") or "CLI returned non-zero exit code",
                 }
                 break
             if stop_trace["exit_code"] != 0:

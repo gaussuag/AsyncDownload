@@ -122,6 +122,7 @@ CLI 结束后还会输出一段 `Summary`，包含：
 - 最大内存与最大 inflight
 - 总 pause 次数与 queue-full pause 次数
 - packet 形态指标：`packets_enqueued_total`、`avg_packet_size_bytes`、`max_packet_size_bytes`
+- `Summary` 只保留 benchmark 所需的正式指标；成功/失败状态请看进程退出码和 `stderr`
 
 ## 恢复文件说明
 

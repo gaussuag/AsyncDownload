@@ -42,14 +42,9 @@ DEFAULT_OPTIONS: dict[str, Any] = {
 }
 
 SUMMARY_SPECS: list[tuple[str, str, str]] = [
-    ("status", "status", "str"),
-    ("total_bytes", "total_bytes", "int"),
-    ("downloaded_bytes", "downloaded_bytes", "int"),
-    ("persisted_bytes", "persisted_bytes", "int"),
     ("avg_network_speed", "avg_network_speed_mb_s", "speed"),
     ("avg_disk_speed", "avg_disk_speed_mb_s", "speed"),
     ("time_to_first_byte_ms", "time_to_first_byte_ms", "int"),
-    ("resumed", "resumed", "bool"),
     ("max_memory_bytes", "max_memory_bytes", "int"),
     ("max_inflight_bytes", "max_inflight_bytes", "int"),
     ("total_pause_count", "total_pause_count", "int"),
@@ -94,7 +89,6 @@ RAW_FIELD_ORDER = [
     "flush_threshold_bytes",
     "flush_interval_ms",
     "overwrite_existing",
-    "status",
     "exit_code",
     "wall_clock_duration_ms",
     "stdout_path",
@@ -106,7 +100,7 @@ RAW_FIELD_ORDER = [
     "temporary_path",
     "metadata_path",
     "error",
-] + SUMMARY_NUMERIC_FIELDS + ["resumed"]
+] + SUMMARY_NUMERIC_FIELDS
 
 
 @dataclass(frozen=True)
@@ -549,15 +543,6 @@ def write_config(path: Path, options: dict[str, Any]) -> None:
     write_json(path, {"download_options": options})
 
 
-def parse_bool(text: str) -> bool:
-    lowered = text.strip().lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    raise ValueError(f"invalid boolean value: {text}")
-
-
 def parse_speed(text: str) -> float:
     normalized = text.strip()
     if normalized.endswith("MB/s"):
@@ -582,19 +567,14 @@ def parse_summary(summary_path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for source_key, target_key, field_type in SUMMARY_SPECS:
         raw_value = parsed[source_key]
-        if field_type == "str":
-            result[target_key] = raw_value
-        elif field_type == "int":
+        if field_type == "int":
             result[target_key] = int(raw_value)
         elif field_type == "float":
             result[target_key] = float(raw_value)
         elif field_type == "speed":
             result[target_key] = parse_speed(raw_value)
-        elif field_type == "bool":
-            result[target_key] = parse_bool(raw_value)
         else:
             raise RuntimeError(f"unsupported summary field type: {field_type}")
-    result["error"] = parsed.get("error", "")
     return result
 
 
@@ -911,6 +891,11 @@ def execute_download_run(
         "metadata_path": format_relative(Path(str(output_path) + ".config.json"), run_root),
     }
     row.update(summary_data)
+    if completed.returncode != 0:
+        stderr_lines = [line.strip() for line in completed.stderr.splitlines() if line.strip()]
+        row["error"] = stderr_lines[-1] if stderr_lines else "CLI returned non-zero exit code"
+    else:
+        row["error"] = ""
 
     metadata_payload = {
         "run_id": run_id,

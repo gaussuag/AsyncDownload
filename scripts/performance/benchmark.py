@@ -104,9 +104,6 @@ def aggregate_runs(
             row[f"{field}_min"] = min_value
             row[f"{field}_max"] = max_value
             row[f"{field}_stdev"] = stdev_value
-        resumed_values = [bool(run["resumed"]) for run in runs]
-        row["all_resumed"] = all(resumed_values)
-        row["any_resumed"] = any(resumed_values)
         aggregated_rows.append(row)
         if baseline_key is not None and key == baseline_key:
             baseline_speed = row["avg_network_speed_mb_s_median"]
@@ -505,7 +502,6 @@ def main() -> int:
                         "Finished run "
                         f"{row['run_sequence']}/{total_runs} "
                         f"(attempt {attempt_index}/{max_attempts}): "
-                        f"status={row['status']} "
                         f"exit={row['exit_code']} "
                         f"duration_ms={row['wall_clock_duration_ms']} "
                         f"avg_net={row['avg_network_speed_mb_s']:.2f}MB/s "
@@ -515,7 +511,7 @@ def main() -> int:
                         f"pauses={int(row['total_pause_count'])}"
                     )
                     final_row = row
-                    if row["exit_code"] == 0 and row["status"] == "success":
+                    if row["exit_code"] == 0:
                         repeat_succeeded = True
                         attempt_failure = None
                         run_sequence += 1
@@ -525,7 +521,7 @@ def main() -> int:
                         "case_name": case.name,
                         "repeat_index": repeat_index,
                         "attempt_index": attempt_index,
-                        "reason": row.get("error") or "CLI returned failure status",
+                        "reason": row.get("error") or "CLI returned non-zero exit code",
                         "exit_code": row["exit_code"],
                         "summary_path": row["summary_path"],
                         "stdout_path": row["stdout_path"],
@@ -564,7 +560,7 @@ def main() -> int:
         if failure is not None:
             break
 
-    successful_rows = [row for row in raw_rows if row["exit_code"] == 0 and row["status"] == "success"]
+    successful_rows = [row for row in raw_rows if row["exit_code"] == 0]
     aggregated_rows = aggregate_runs(successful_rows, baseline_key=("baseline", "baseline_default"), expected_repeats=args.repeats)
 
     aggregated_field_order = [
@@ -588,8 +584,6 @@ def main() -> int:
         "flush_threshold_bytes",
         "flush_interval_ms",
         "overwrite_existing",
-        "all_resumed",
-        "any_resumed",
         "avg_network_speed_gain_vs_baseline_pct",
     ]
     for field in SUMMARY_NUMERIC_FIELDS + ["wall_clock_duration_ms"]:

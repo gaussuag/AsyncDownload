@@ -588,12 +588,16 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     ASSERT_TRUE(files_equal(source_file, output_file));
 
     const auto summary_text = read_text_file(summary_file);
-    EXPECT_NE(summary_text.find("status=success"), std::string::npos);
     EXPECT_NE(summary_text.find("avg_network_speed="), std::string::npos);
     EXPECT_NE(summary_text.find("avg_disk_speed="), std::string::npos);
     EXPECT_NE(summary_text.find("time_to_first_byte_ms="), std::string::npos);
     EXPECT_NE(summary_text.find("total_pause_count="), std::string::npos);
     EXPECT_NE(summary_text.find("packets_enqueued_total="), std::string::npos);
+    EXPECT_EQ(summary_text.find("status="), std::string::npos);
+    EXPECT_EQ(summary_text.find("total_bytes="), std::string::npos);
+    EXPECT_EQ(summary_text.find("downloaded_bytes="), std::string::npos);
+    EXPECT_EQ(summary_text.find("persisted_bytes="), std::string::npos);
+    EXPECT_EQ(summary_text.find("resumed="), std::string::npos);
     const auto avg_network_speed = parse_summary_speed_mb_s(summary_text, "avg_network_speed");
     const auto avg_disk_speed = parse_summary_speed_mb_s(summary_text, "avg_disk_speed");
     ASSERT_TRUE(avg_network_speed.has_value());

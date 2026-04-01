@@ -29,10 +29,6 @@ constexpr double kEmaCurrentWeight = 0.2;
     return static_cast<std::int64_t>(downloaded_bytes - persisted_bytes);
 }
 
-[[nodiscard]] std::int64_t snapshot_watermark_now() noexcept {
-    return static_cast<std::int64_t>(telemetry_timestamp_ns(TelemetryClock::now()));
-}
-
 } // namespace
 
 void TelemetryCollector::record_task_started(const TelemetryClock::time_point timestamp) noexcept {
@@ -75,9 +71,8 @@ void TelemetryCollector::record_download_delta(const std::uint64_t bytes,
     }
     last_network_sample_at_ = timestamp;
     total_download_bytes_ += bytes;
-    snapshot_.downloaded_bytes = static_cast<std::int64_t>(total_download_bytes_);
-    snapshot_.inflight_bytes = clamp_inflight_bytes(total_download_bytes_, total_persist_bytes_);
-    max_inflight_bytes_ = std::max(max_inflight_bytes_, snapshot_.inflight_bytes);
+    const auto inflight_bytes = clamp_inflight_bytes(total_download_bytes_, total_persist_bytes_);
+    max_inflight_bytes_ = std::max(max_inflight_bytes_, inflight_bytes);
 }
 
 void TelemetryCollector::record_persist_delta(const std::uint64_t bytes,
@@ -99,8 +94,6 @@ void TelemetryCollector::record_persist_delta(const std::uint64_t bytes,
     }
     last_disk_sample_at_ = timestamp;
     total_persist_bytes_ += bytes;
-    snapshot_.persisted_bytes = static_cast<std::int64_t>(total_persist_bytes_);
-    snapshot_.inflight_bytes = clamp_inflight_bytes(total_download_bytes_, total_persist_bytes_);
 }
 
 void TelemetryCollector::record_pause(const TelemetryPauseReason reason,
@@ -126,8 +119,8 @@ void TelemetryCollector::record_memory_sample(const std::uint64_t memory_bytes,
     }
 
     update_latest_event_timestamp(timestamp);
-    snapshot_.memory_bytes = static_cast<std::size_t>(memory_bytes);
-    max_memory_bytes_ = std::max(max_memory_bytes_, static_cast<std::size_t>(memory_bytes));
+    latest_memory_bytes_ = static_cast<std::size_t>(memory_bytes);
+    max_memory_bytes_ = std::max(max_memory_bytes_, latest_memory_bytes_);
 }
 
 void TelemetryCollector::record_task_completed(const TelemetryClock::time_point timestamp) noexcept {
@@ -143,10 +136,13 @@ void TelemetryCollector::record_task_completed(const TelemetryClock::time_point 
 
 ProgressSnapshot TelemetryCollector::current_snapshot() const noexcept {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    ProgressSnapshot snapshot = snapshot_;
+    ProgressSnapshot snapshot{};
+    snapshot.downloaded_bytes = static_cast<std::int64_t>(total_download_bytes_);
+    snapshot.persisted_bytes = static_cast<std::int64_t>(total_persist_bytes_);
+    snapshot.inflight_bytes = clamp_inflight_bytes(total_download_bytes_, total_persist_bytes_);
+    snapshot.memory_bytes = latest_memory_bytes_;
     snapshot.network_bytes_per_second = network_speed_ema_;
     snapshot.disk_bytes_per_second = disk_speed_ema_;
-    snapshot.watermark_timestamp_ns = snapshot_watermark_now();
     return snapshot;
 }
 
@@ -203,7 +199,7 @@ void TelemetryCollector::reset_state(const TelemetryClock::time_point timestamp)
     max_inflight_bytes_ = 0;
     total_pause_count_ = 0U;
     queue_full_pause_count_ = 0U;
-    snapshot_ = ProgressSnapshot{};
+    latest_memory_bytes_ = 0U;
 }
 
 void TelemetryCollector::update_latest_event_timestamp(

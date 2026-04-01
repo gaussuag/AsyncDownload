@@ -49,19 +49,14 @@ struct ProgressSnapshot {
     // 已下载但尚未物理落盘的字节数，可以直观看到网络与磁盘是否失衡。
     std::int64_t inflight_bytes = 0;
     std::size_t queued_packets = 0;
-    std::size_t active_ranges = 0;
-    std::size_t finished_ranges = 0;
     std::size_t active_requests = 0;
     std::size_t paused_ranges = 0;
-    std::size_t gap_paused_ranges = 0;
-    std::size_t memory_paused_ranges = 0;
     std::size_t memory_bytes = 0;
     // 基于相邻两次进度采样的平均网络接收速度。
     double network_bytes_per_second = 0.0;
     // 基于相邻两次进度采样的平均磁盘写入速度。
     double disk_bytes_per_second = 0.0;
     bool resumed = false;
-    std::int64_t watermark_timestamp_ns = 0;
 };
 
 using ProgressCallback = std::function<void(const ProgressSnapshot&)>;

@@ -165,22 +165,9 @@ struct SessionState {
     std::atomic<std::int64_t> vdl_offset{0};
     // queued_packets 用于进度和背压观测，表示还有多少包在持久化链路里等待处理。
     std::atomic<std::size_t> queued_packets{0};
-    // queued_bytes 表示 network -> persistence 队列里按 accounted_bytes 统计的积压体量。
-    std::atomic<std::int64_t> queued_bytes{0};
-    std::atomic<std::int64_t> queued_payload_bytes{0};
-    std::atomic<std::int64_t> active_buffered_accounted_bytes{0};
-    std::atomic<std::size_t> queue_paused_handles{0};
-    std::atomic<std::size_t> memory_paused_handles{0};
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
     std::chrono::steady_clock::time_point task_started_at{};
-    std::int64_t telemetry_downloaded_bytes_base = 0;
-    std::int64_t telemetry_persisted_bytes_base = 0;
-    std::chrono::steady_clock::time_point last_progress_sample_at{};
-    std::int64_t last_progress_downloaded_bytes = 0;
-    std::int64_t last_progress_persisted_bytes = 0;
-    double last_network_bytes_per_second = 0.0;
-    double last_disk_bytes_per_second = 0.0;
     ProgressCallback progress_callback{};
     asyncdownload::telemetry::TelemetrySession telemetry_session_{};
 };

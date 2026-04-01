@@ -29,7 +29,6 @@ void enqueue_data_packet(
     static_cast<void>(current_bytes);
     queue.enqueue(std::move(packet));
     session.queued_packets.fetch_add(1, std::memory_order_relaxed);
-    session.queued_bytes.fetch_add(static_cast<std::int64_t>(accounted), std::memory_order_relaxed);
 }
 
 bool wait_for_condition(const std::function<bool()>& predicate,
@@ -164,7 +163,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     static_cast<void>(removed);
 }
 
-TEST(PersistenceThreadTest, TracksQueuedBytesAcrossQueueIngressAndDequeue) {
+TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root =
@@ -211,10 +210,10 @@ TEST(PersistenceThreadTest, TracksQueuedBytesAcrossQueueIngressAndDequeue) {
     packet.payload.assign(4096, 0x7A);
     enqueue_data_packet(queue, session, std::move(packet));
 
-    EXPECT_GT(session.queued_bytes.load(std::memory_order_relaxed), 0);
+    EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 1U);
     EXPECT_TRUE(wait_for_condition([&session]() {
         return session.persisted_bytes.load(std::memory_order_acquire) == 4096 &&
-            session.queued_bytes.load(std::memory_order_acquire) == 0;
+            session.queued_packets.load(std::memory_order_acquire) == 0U;
     }, std::chrono::milliseconds(1000)));
 
     persistence.stop();
@@ -223,7 +222,6 @@ TEST(PersistenceThreadTest, TracksQueuedBytesAcrossQueueIngressAndDequeue) {
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 0U);
-    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -285,7 +283,6 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     writer.close();
 
     EXPECT_FALSE(persistence.error());
-    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 4096);
     const auto summary = session.telemetry_session_.final_summary();
     EXPECT_EQ(summary.max_inflight_bytes, 0);
@@ -371,7 +368,6 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     writer.close();
 
     EXPECT_FALSE(persistence.error());
-    EXPECT_EQ(session.queued_bytes.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(bitmap.load(0), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(1), asyncdownload::core::BlockState::finished);
     EXPECT_EQ(bitmap.load(2), asyncdownload::core::BlockState::finished);

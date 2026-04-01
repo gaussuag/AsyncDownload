@@ -2265,3 +2265,212 @@ pause 起点快照进一步强化了上面的判断。
 1. 正式性能入口已经稳定收敛到 benchmark 与 profiler。
 2. 独立诊断 JSON 与 `acceptance.py` 不再提供额外 keeper 价值，只增加维护面。
 3. 删除后，summary schema、benchmark/profiler 报表结构和回归验证入口仍然连续。
+
+## 23. 优化迭代 018：benchmark summary 字段进一步收敛
+
+### 23.1 背景
+
+`regression_v2` 基线已经把当前正式 benchmark 指标固定为 6 个主链指标和 4 个辅助指标。
+
+但在实际导出链里，`src/main.cpp` 的 `Summary`、`scripts/performance/performance_common.py` 的
+`SUMMARY_SPECS`、`benchmark.py` 聚合字段和集成测试仍然夹带了：
+
+- `status`
+- `total_bytes`
+- `downloaded_bytes`
+- `persisted_bytes`
+- `resumed`
+- `all_resumed`
+- `any_resumed`
+
+这些字段不属于正式 benchmark 指标，会把运行结果元数据和性能指标混在同一条导出链里，继续扩大维护面。
+
+### 23.2 本轮收敛
+
+本轮把 CLI summary 和 Python schema 继续收口到正式 benchmark 指标本身：
+
+- 主链：`avg_network_speed`、`avg_disk_speed`、`time_to_first_byte_ms`、`max_memory_bytes`、`max_inflight_bytes`、`total_pause_count`
+- 辅助：`queue_full_pause_count`、`packets_enqueued_total`、`avg_packet_size_bytes`、`max_packet_size_bytes`
+
+同时删除以下非基准字段在当前导出链中的直接暴露：
+
+- `status`
+- `total_bytes`
+- `downloaded_bytes`
+- `persisted_bytes`
+- `resumed`
+- `all_resumed`
+- `any_resumed`
+
+运行结果成败不再通过 `Summary` 字段表达，而是统一回到：
+
+- 进程 `exit_code`
+- `stderr`
+- benchmark/profiler 产物中的运行元数据
+
+### 23.3 影响范围
+
+本轮同步修改了：
+
+- `src/main.cpp`
+- `scripts/performance/performance_common.py`
+- `scripts/performance/benchmark.py`
+- `scripts/performance/profiler.py`
+- `tests/download/download_resume_integration_test.cpp`
+- `README.md`
+
+### 23.4 验证结论
+
+这轮清理的 keeper 条件是：
+
+1. 正式 10 个 benchmark 指标必须完整保留。
+2. benchmark/profiler 脚本不能再依赖被删除字段才能运行。
+3. summary 导出与测试断言必须同步收敛，不能留下“代码已删、schema 仍等旧字段”的残留。
+
+### 23.5 源码层进一步收敛
+
+在完成 summary/schema 清理后，代码里还残留着上一代指标体系的兼容骨架：
+
+- `include/asyncdownload/performance_metrics.hpp` 中未再被调用的
+  `RuntimePerformanceMetrics`
+- `SummaryDirectPerformanceMetrics`
+- `load_value()`
+- `copy_runtime_to_summary()`
+- `download_engine.cpp` 中 `build_performance_summary()` 的无效兼容参数
+
+这些结构已经不再承载当前正式 benchmark 指标计算，保留它们只会让后续维护者误以为项目仍然存在“两套性能汇总路径”。
+
+因此本轮继续把源码层收敛为：
+
+- `TelemetrySession::final_summary()` 直接产出的正式 summary 结构
+- `performance_metrics.hpp` 只保留当前正式 benchmark 指标的最小字段定义
+- `build_performance_summary()` 只保留实际参与计算的输入
+
+这样可以把“当前正式 benchmark 指标的唯一实现路径”明确固定下来，避免后续线程在 legacy 壳层上继续叠加字段。
+
+### 23.6 SessionState 与 TelemetryCollector 重复缓存清理
+
+继续排查后又确认了一层重复：
+
+- `SessionState` 里保留了一组只用于 progress 速度重算和 summary 兼容补偿的缓存字段
+  - `telemetry_downloaded_bytes_base`
+  - `telemetry_persisted_bytes_base`
+  - `last_progress_sample_at`
+  - `last_progress_downloaded_bytes`
+  - `last_progress_persisted_bytes`
+  - `last_network_bytes_per_second`
+  - `last_disk_bytes_per_second`
+- `TelemetryCollector` 内部还保留了 `snapshot_`，而它记录的 `downloaded/persisted/inflight/memory`
+  又可以直接从 collector 的累计状态即时构造出来
+
+本轮处理方式是：
+
+1. 删除 `SessionState` 里上述 progress/base 缓存字段。
+2. 删除 `download_engine.cpp` 中基于这些缓存的二次 progress 速度计算与 summary 速度覆盖。
+3. 让正式 summary 继续直接来源于 `TelemetrySession::final_summary()`。
+4. 删除 `TelemetryCollector` 的 `snapshot_` 缓存，改为在 `current_snapshot()` 中基于累计计数即时构造 snapshot。
+
+保留项也明确了边界：
+
+- `SessionState.downloaded_bytes` / `persisted_bytes` 仍保留，因为恢复态和最终结果仍需要“绝对进度”语义，而不仅仅是本轮增量。
+- `TelemetrySession` 仍保留为 facade，因为它没有重复存储状态，只是对外暴露稳定接口。
+
+## 24. 优化迭代 024：废弃运行态指标骨架清理（采纳）
+
+### 24.1 背景
+
+在 keeper 指标已经稳定收口到正式 10 个 benchmark 指标之后，代码里仍然残留了两类“看起来像还在维护，实际上已经退出正式链路”的运行态指标骨架：
+
+- `SessionState` 内部的
+  - `queued_bytes`
+  - `queued_payload_bytes`
+  - `active_buffered_accounted_bytes`
+- `ProgressSnapshot` 里的
+  - `active_ranges`
+  - `finished_ranges`
+  - `gap_paused_ranges`
+  - `memory_paused_ranges`
+  - `watermark_timestamp_ns`
+
+继续保留这些字段会带来两个问题：
+
+1. 后续维护者容易误以为项目仍然保留了一套更宽的 queue/backpressure 运行态指标面。
+2. 测试和代码会继续围绕这些字段保留无效断言或空转逻辑，扩大维护面。
+
+### 24.2 本轮结论
+
+这轮深扫后确认：
+
+- 正式 benchmark 的 10 个 keeper 指标仍然完整存在，且仍被 CLI summary、Python 聚合脚本、文档基线与测试共同消费。
+- `queued_bytes` / `queued_payload_bytes` 在当前源码里已经没有完整生产链：
+  - `PersistenceThread` 还在 dequeue 侧扣减
+  - 但主实现路径里已经没有对应的 enqueue 侧稳定增计
+  - 实际只剩测试辅助代码在手工维护它们
+- `active_buffered_accounted_bytes` 已经只剩字段定义，没有任何运行态读写。
+- `ProgressSnapshot` 上述 5 个边缘字段在当前仓库里没有真实消费方，只有 `watermark_timestamp_ns` 还被两个 telemetry 单测做“字段存在性”断言。
+
+因此这些字段按当前代码状态应视为：
+
+- 已废弃的内部诊断指标骨架
+- 或没有继续形成真实消费链的冗余进度字段
+
+### 24.3 本轮清理
+
+本轮保留不动的范围：
+
+- `avg_network_speed`
+- `avg_disk_speed`
+- `time_to_first_byte_ms`
+- `max_memory_bytes`
+- `max_inflight_bytes`
+- `total_pause_count`
+- `queue_full_pause_count`
+- `packets_enqueued_total`
+- `avg_packet_size_bytes`
+- `max_packet_size_bytes`
+
+本轮删除或收口的范围：
+
+- 从 `SessionState` 删除：
+  - `queued_bytes`
+  - `queued_payload_bytes`
+  - `active_buffered_accounted_bytes`
+- 从 `PersistenceThread` 删除相应的无效 dequeue 扣减逻辑
+- 从 `ProgressSnapshot` 删除：
+  - `active_ranges`
+  - `finished_ranges`
+  - `gap_paused_ranges`
+  - `memory_paused_ranges`
+  - `watermark_timestamp_ns`
+- 同步收紧 persistence / telemetry 相关测试，避免继续为废弃字段保留伪生产链
+
+### 24.4 边界
+
+这轮清理不代表 queue/backpressure 的字节口径诊断永远不再需要。
+
+本轮真正固定的是：
+
+- 当前正式 keeper 指标里不包含这批字段
+- 当前主实现里也不再假装维护它们
+- 如果后续线程确实要重新引入 byte-budget 诊断字段，必须带着明确用途、完整采集口径和脚本/测试同步方案重新进入代码，而不是继续依赖这批半退役骨架
+
+### 24.5 影响范围
+
+本轮同步修改了：
+
+- `include/asyncdownload/types.hpp`
+- `src/core/models.hpp`
+- `src/download/download_engine.cpp`
+- `src/persistence/persistence_thread.cpp`
+- `src/telemetry/telemetry_collector.cpp`
+- `tests/persistence/persistence_thread_test.cpp`
+- `tests/telemetry/telemetry_collector_test.cpp`
+- `tests/telemetry/telemetry_event_emission_test.cpp`
+
+### 24.6 验证要求
+
+keeper 条件保持不变：
+
+1. 正式 10 个 benchmark 指标不能减少。
+2. 进度与 telemetry 的现存真实消费面必须继续可用。
+3. 删除的字段不能只删结构定义而保留伪维护逻辑或伪断言。

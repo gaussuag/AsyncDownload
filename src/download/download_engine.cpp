@@ -151,39 +151,6 @@ void finish_memory_pause(TransferHandle& transfer) noexcept {
     update_transfer_pause_state(transfer);
 }
 
-void update_progress_rates(core::SessionState& session,
-                           ProgressSnapshot& snapshot) noexcept {
-    const auto now = Clock::now();
-    if (session.last_progress_sample_at.time_since_epoch().count() == 0) {
-        session.last_progress_sample_at = now;
-        session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
-        session.last_progress_persisted_bytes = snapshot.persisted_bytes;
-        snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
-        snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
-        return;
-    }
-
-    const auto elapsed_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(now -
-            session.last_progress_sample_at).count();
-    if (elapsed_seconds > 0.0) {
-        const auto downloaded_delta =
-            snapshot.downloaded_bytes - session.last_progress_downloaded_bytes;
-        const auto persisted_delta =
-            snapshot.persisted_bytes - session.last_progress_persisted_bytes;
-        session.last_network_bytes_per_second =
-            std::max(0.0, static_cast<double>(downloaded_delta) / elapsed_seconds);
-        session.last_disk_bytes_per_second =
-            std::max(0.0, static_cast<double>(persisted_delta) / elapsed_seconds);
-    }
-
-    session.last_progress_sample_at = now;
-    session.last_progress_downloaded_bytes = snapshot.downloaded_bytes;
-    session.last_progress_persisted_bytes = snapshot.persisted_bytes;
-    snapshot.network_bytes_per_second = session.last_network_bytes_per_second;
-    snapshot.disk_bytes_per_second = session.last_disk_bytes_per_second;
-}
-
 void record_first_network_byte(core::SessionState& session,
                                const std::size_t bytes) noexcept {
     if (bytes == 0) {
@@ -214,20 +181,8 @@ void invoke_progress(core::SessionState& session,
     for (const auto& range : ranges) {
         const auto status = static_cast<core::RangeStatus>(
             range->status.load(std::memory_order_acquire));
-        if (status == core::RangeStatus::downloading || status == core::RangeStatus::paused) {
-            ++snapshot.active_ranges;
-        }
-        if (range->marked_finished.load(std::memory_order_acquire)) {
-            ++snapshot.finished_ranges;
-        }
         if (status == core::RangeStatus::paused) {
             ++snapshot.paused_ranges;
-        }
-        if (range->pause_for_gap.load(std::memory_order_acquire)) {
-            ++snapshot.gap_paused_ranges;
-        }
-        if (range->pause_for_memory.load(std::memory_order_acquire)) {
-            ++snapshot.memory_paused_ranges;
         }
     }
 
@@ -236,7 +191,6 @@ void invoke_progress(core::SessionState& session,
         [](const TransferHandle& handle) {
             return handle.in_multi;
         }));
-    update_progress_rates(session, snapshot);
 
     try {
         session.progress_callback(snapshot);
@@ -905,37 +859,8 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
 }
 
 [[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
-                                                           const storage::FileWriter* file_writer,
-                                                           const std::size_t ranges_total,
                                                            const Clock::time_point now) noexcept {
-    static_cast<void>(ranges_total);
-    static_cast<void>(file_writer);
-    auto summary = session.telemetry_session_.final_summary(now);
-    if (session.task_started_at.time_since_epoch().count() == 0 || now <= session.task_started_at) {
-        summary.average_network_bytes_per_second = 0.0;
-        summary.average_disk_bytes_per_second = 0.0;
-        return summary;
-    }
-
-    const auto duration_seconds =
-        std::chrono::duration_cast<std::chrono::duration<double>>(now - session.task_started_at).count();
-    if (duration_seconds <= 0.0) {
-        summary.average_network_bytes_per_second = 0.0;
-        summary.average_disk_bytes_per_second = 0.0;
-        return summary;
-    }
-
-    const auto downloaded_bytes = std::max<std::int64_t>(0,
-        session.downloaded_bytes.load(std::memory_order_relaxed) -
-            session.telemetry_downloaded_bytes_base);
-    const auto persisted_bytes = std::max<std::int64_t>(0,
-        session.persisted_bytes.load(std::memory_order_relaxed) -
-            session.telemetry_persisted_bytes_base);
-    summary.average_network_bytes_per_second =
-        static_cast<double>(downloaded_bytes) / duration_seconds;
-    summary.average_disk_bytes_per_second =
-        static_cast<double>(persisted_bytes) / duration_seconds;
-    return summary;
+    return session.telemetry_session_.final_summary(now);
 }
 
 std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
@@ -1033,7 +958,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         const auto [metadata_error, loaded_metadata] = metadata_store.load();
         if (metadata_error) {
             result.error = metadata_error;
-            result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
+            result.performance = build_performance_summary(session, Clock::now());
             return result;
         }
 
@@ -1049,7 +974,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             request.options.overwrite_existing);
         if (open_error) {
             result.error = open_error;
-            result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
+            result.performance = build_performance_summary(session, Clock::now());
             return result;
         }
 
@@ -1072,7 +997,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             if (validation_error) {
                 result.error = validation_error;
                 file_writer.close();
-                result.performance = build_performance_summary(session, &file_writer, 0, Clock::now());
+                result.performance = build_performance_summary(session, Clock::now());
                 return result;
             }
 
@@ -1094,8 +1019,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
-        session.telemetry_downloaded_bytes_base = finished_bytes;
-        session.telemetry_persisted_bytes_base = finished_bytes;
 
         if (safe_vdl >= session.total_size) {
             // 恢复后如果发现整个文件其实已经完整可靠，就直接 finalize，
@@ -1115,10 +1038,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.completed_ranges = bitmap.block_count();
             result.resumed = session.resumed;
             session.telemetry_session_.record_task_completed(Clock::now());
-            result.performance = build_performance_summary(session,
-                &file_writer,
-                bitmap.block_count(),
-                Clock::now());
+            result.performance = build_performance_summary(session, Clock::now());
             return result;
         }
 
@@ -1160,7 +1080,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             persistence.join();
             file_writer.close();
             result.error = make_error_code(DownloadErrc::http_init_failed);
-            result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
+            result.performance = build_performance_summary(session, Clock::now());
             return result;
         }
 
@@ -1365,7 +1285,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         if (!failure) {
             session.telemetry_session_.record_task_completed(Clock::now());
         }
-        result.performance = build_performance_summary(session, &file_writer, ranges.size(), Clock::now());
+        result.performance = build_performance_summary(session, Clock::now());
         return result;
     } catch (...) {
         // 对外契约是不抛异常，所以任何未预期错误最终都折叠成 internal_error。

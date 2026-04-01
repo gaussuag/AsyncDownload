@@ -47,7 +47,6 @@ TEST_F(TelemetryCollectorTest, ComputesEmaSpeedsForCurrentSnapshotAndAveragesFor
     const auto snapshot = collector_.current_snapshot();
     EXPECT_DOUBLE_EQ(snapshot.network_bytes_per_second, 200.0);
     EXPECT_DOUBLE_EQ(snapshot.disk_bytes_per_second, 80.0);
-    EXPECT_GT(snapshot.watermark_timestamp_ns, 0);
 
     const auto summary = collector_.final_summary();
     EXPECT_DOUBLE_EQ(summary.average_network_bytes_per_second, 75.0);
