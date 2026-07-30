@@ -8,11 +8,9 @@
 #include "download/http_probe.hpp"
 #include "download/range_scheduler.hpp"
 #include "flow/packet_flow.hpp"
-#include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "range/range_lifecycle.hpp"
 #include "recovery/recovery_checkpoint.hpp"
-#include "storage/file_writer.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
 
@@ -851,27 +849,6 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
     return session.telemetry_session_.final_summary(now);
 }
 
-std::error_code finalize_storage_phase(
-    recovery::RecoveryCheckpoint& checkpoint,
-    const core::SessionState& session,
-    const core::AtomicBlockBitmap& bitmap,
-    std::error_code failure) noexcept {
-    const auto completed_bytes = bitmap.contiguous_finished_bytes(
-        session.effective_policy.persistence().block_bytes,
-        session.total_size);
-    if (!failure && completed_bytes >= session.total_size) {
-        return checkpoint.finalize().error;
-    }
-
-    // 如果任务失败，就保留 .part 和 metadata 供下次恢复使用，不在这里做破坏性清理。
-    checkpoint.close_preserving_artifacts();
-    if (!failure) {
-        return make_error_code(DownloadErrc::http_transfer_failed);
-    }
-
-    return failure;
-}
-
 } // namespace
 
 DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
@@ -1488,11 +1465,25 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         cleanup_network_resources(multi, handles);
-        failure = finalize_storage_phase(
-            *recovery_checkpoint,
-            session,
-            bitmap,
-            failure);
+        if (!failure) {
+            const auto completed_bytes =
+                bitmap.contiguous_finished_bytes(
+                    session.effective_policy.
+                        persistence().block_bytes,
+                    session.total_size);
+            if (completed_bytes < session.total_size) {
+                failure = make_error_code(
+                    DownloadErrc::
+                        http_transfer_failed);
+            } else {
+                failure =
+                    recovery_checkpoint->finalize().error;
+            }
+        }
+        if (failure) {
+            recovery_checkpoint->
+                close_preserving_artifacts();
+        }
 
         // DownloadResult 主要面向调用方总结最终状态，因此在这里统一从 session 和
         // bitmap 回填一次，避免中途多个分支各自维护结果对象。

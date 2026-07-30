@@ -93,7 +93,7 @@ namespace {
         request.policy.io_alignment_bytes > 0;
 }
 
-[[nodiscard]] bool metadata_matches(
+[[nodiscard]] bool candidate_identity_matches(
     const core::MetadataState& state,
     const RecoveryOpenRequest& request) noexcept {
     if (state.url != request.remote.url ||
@@ -319,7 +319,7 @@ RecoveryOpenResult RecoveryCheckpoint::open(
         const auto can_resume =
             part_exists &&
             loaded.has_value() &&
-            metadata_matches(*loaded, request) &&
+            candidate_identity_matches(*loaded, request) &&
             (request.policy.allow_sparse_resume ||
              metadata_proves_complete(
                  *loaded,
@@ -853,16 +853,6 @@ CleanupResult RecoveryCheckpoint::discard_candidate(
         CleanupStatus::failed,
         internal_error()
     };
-}
-
-storage::FileWriter&
-RecoveryCheckpoint::legacy_file_writer() noexcept {
-    return implementation_->file_writer;
-}
-
-metadata::MetadataStore&
-RecoveryCheckpoint::legacy_metadata_store() noexcept {
-    return implementation_->metadata_store;
 }
 
 }

@@ -8,22 +8,6 @@
 #include <system_error>
 #include <vector>
 
-namespace asyncdownload::download {
-class DownloadEngine;
-}
-
-namespace asyncdownload::persistence {
-class PersistenceThread;
-}
-
-namespace asyncdownload::metadata {
-class MetadataStore;
-}
-
-namespace asyncdownload::storage {
-class FileWriter;
-}
-
 namespace asyncdownload::recovery {
 
 class PreparedCheckpoint {
@@ -106,16 +90,7 @@ private:
     [[nodiscard]] CleanupResult discard_candidate(
         DiscardReason reason) noexcept;
 
-    [[nodiscard]] storage::FileWriter&
-    legacy_file_writer() noexcept;
-
-    [[nodiscard]] metadata::MetadataStore&
-    legacy_metadata_store() noexcept;
-
     std::unique_ptr<Implementation> implementation_;
-
-    friend class download::DownloadEngine;
-    friend class persistence::PersistenceThread;
 };
 
 }
