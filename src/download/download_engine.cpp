@@ -166,7 +166,10 @@ void invoke_progress(core::SessionState& session,
     snapshot.vdl_offset = session.vdl_offset.load(std::memory_order_relaxed);
     snapshot.inflight_bytes = std::max<std::int64_t>(0,
         snapshot.downloaded_bytes - snapshot.persisted_bytes);
-    snapshot.queued_packets = session.queued_packets.load(std::memory_order_relaxed);
+    snapshot.queued_packets = handles.empty() ||
+            handles.front().packet_producer == nullptr ?
+        0 :
+        handles.front().packet_producer->snapshot().queued_packets;
     snapshot.memory_bytes = core::global_memory_accounting().current_bytes();
     snapshot.resumed = session.resumed;
 
@@ -358,7 +361,6 @@ void rollback_inflight_window(TransferHandle& transfer) noexcept {
 
 [[nodiscard]] std::error_code publish_range_complete(
     flow::PacketProducer& producer,
-    core::SessionState& session,
     const core::RangeContext& range) noexcept {
     const auto end = range.end_offset.load(std::memory_order_acquire);
     if (end == std::numeric_limits<std::int64_t>::max()) {
@@ -377,7 +379,6 @@ void rollback_inflight_window(TransferHandle& transfer) noexcept {
             published.error :
             make_error_code(DownloadErrc::internal_error);
     }
-    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
     return {};
 }
 
@@ -424,8 +425,6 @@ void reflect_packet_publication(
     if (admission.published_bytes == 0) {
         return;
     }
-    transfer.session->queued_packets.fetch_add(
-        1, std::memory_order_relaxed);
     transfer.session->downloaded_bytes.fetch_add(
         static_cast<std::int64_t>(admission.published_bytes),
         std::memory_order_relaxed);
@@ -642,7 +641,7 @@ void resume_paused_transfers(std::vector<TransferHandle>& handles,
         }
 
         const auto queue_can_resume = handle.queue_pause_active &&
-            handle.session->queued_packets.load(std::memory_order_relaxed) <
+            handle.packet_producer->snapshot().queued_packets <
                 policy.packet_budget &&
             current_bytes <= policy.memory_low_bytes;
 
@@ -796,7 +795,6 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
         // Orchestrator 这里只负责发一个“网络阶段已完成”的控制消息。
         const auto publish_error = publish_range_complete(
             *transfer.packet_producer,
-            session,
             *transfer.range);
         if (publish_error) {
             return publish_error;
@@ -1209,7 +1207,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                             const auto publish_error =
                                 publish_range_complete(
                                     packet_flow->producer(),
-                                    session,
                                     *range);
                             if (publish_error) {
                                 failure = publish_error;

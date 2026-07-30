@@ -158,6 +158,56 @@ public:
         }
     }
 
+    [[nodiscard]] bool reserve_data_credit() noexcept {
+        auto current = queued_packets.load(std::memory_order_acquire);
+        while (true) {
+            if (current >= policy.packet_budget) {
+                return false;
+            }
+            if (queued_packets.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    [[nodiscard]] bool reserve_control_credit() noexcept {
+        auto current = queued_packets.load(std::memory_order_acquire);
+        while (true) {
+            if (current == std::numeric_limits<std::size_t>::max()) {
+                fail(make_error_code(DownloadErrc::internal_error));
+                return false;
+            }
+            if (queued_packets.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    [[nodiscard]] bool release_credit() noexcept {
+        auto current = queued_packets.load(std::memory_order_acquire);
+        while (true) {
+            if (current == 0) {
+                fail(make_error_code(DownloadErrc::internal_error));
+                return false;
+            }
+            if (queued_packets.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
     [[nodiscard]] PacketAdmission publish_draft(LaneState& lane) noexcept {
         if (lane.payload.empty()) {
             return {
@@ -207,6 +257,16 @@ public:
                 first_error()
             };
         }
+        if (!reserve_data_credit()) {
+            enter_pause(lane, QUEUE_PAUSE_MASK);
+            return {
+                PacketAdmissionCode::packet_budget_exhausted,
+                0,
+                0,
+                lane.pause_mask,
+                {}
+            };
+        }
 
         detail::PacketEnvelope envelope{};
         envelope.kind = detail::PacketEnvelopeKind::data;
@@ -219,6 +279,7 @@ public:
         const auto published_bytes = envelope.data.payload.size();
 
         if (!queue.try_publish(envelope)) {
+            static_cast<void>(release_credit());
             lane.payload = std::move(envelope.data.payload);
             enter_pause(lane, QUEUE_PAUSE_MASK);
             return {
@@ -230,7 +291,6 @@ public:
             };
         }
 
-        queued_packets.fetch_add(1, std::memory_order_relaxed);
         ++next_sequence;
         published_data_bytes.store(
             published + static_cast<std::uint64_t>(published_bytes),
@@ -685,15 +745,20 @@ PacketPublishResult PacketProducer::publish(
     envelope.kind = detail::PacketEnvelopeKind::control;
     envelope.sequence = implementation.next_sequence;
     envelope.control = packet;
+    if (!implementation.reserve_control_credit()) {
+        return {
+            PacketPublishCode::failed,
+            implementation.first_error()
+        };
+    }
     if (!implementation.queue.publish(envelope)) {
+        static_cast<void>(implementation.release_credit());
         implementation.fail(make_error_code(DownloadErrc::internal_error));
         return {
             PacketPublishCode::failed,
             implementation.first_error()
         };
     }
-    implementation.queued_packets.fetch_add(
-        1, std::memory_order_relaxed);
     ++implementation.next_sequence;
     return {PacketPublishCode::published, {}};
 }
@@ -785,8 +850,12 @@ PacketReconcileResult PacketProducer::reconcile(
             const auto previous = lane.pause_mask;
             lane.pause_mask &= static_cast<std::uint8_t>(
                 ~MEMORY_PAUSE_MASK);
-            lane.pause_mask &= static_cast<std::uint8_t>(
-                ~QUEUE_PAUSE_MASK);
+            if (implementation.queued_packets.load(
+                    std::memory_order_acquire) <
+                implementation.policy.packet_budget) {
+                lane.pause_mask &= static_cast<std::uint8_t>(
+                    ~QUEUE_PAUSE_MASK);
+            }
             if (previous != 0 && lane.pause_mask == 0) {
                 actions[action_count++] = {
                     lane.id,
@@ -882,8 +951,17 @@ PacketReceiveResult PacketConsumer::receive(
             return {PacketReceiveCode::closed, {}};
         }
 
-        implementation.queued_packets.fetch_sub(
-            1, std::memory_order_relaxed);
+        if (!implementation.release_credit()) {
+            if (envelope.accounted_bytes != 0) {
+                static_cast<void>(
+                    implementation.release_accounting(
+                        envelope.accounted_bytes));
+            }
+            return {
+                PacketReceiveCode::failed,
+                implementation.first_error()
+            };
+        }
         lease.owner_ = &owner_;
         lease.sequence_ = envelope.sequence;
         lease.accounted_bytes_ = envelope.accounted_bytes;
@@ -922,8 +1000,7 @@ std::error_code PacketConsumer::fail(
         if (envelope.kind == detail::PacketEnvelopeKind::close) {
             continue;
         }
-        implementation.queued_packets.fetch_sub(
-            1, std::memory_order_relaxed);
+        static_cast<void>(implementation.release_credit());
         if (envelope.accounted_bytes != 0) {
             static_cast<void>(
                 implementation.release_accounting(
@@ -982,8 +1059,8 @@ PacketFlow::~PacketFlow() {
     while (implementation_->queue.receive(
         envelope, std::chrono::microseconds(0))) {
         if (envelope.kind != detail::PacketEnvelopeKind::close) {
-            implementation_->queued_packets.fetch_sub(
-                1, std::memory_order_relaxed);
+            static_cast<void>(
+                implementation_->release_credit());
             if (envelope.accounted_bytes != 0) {
                 static_cast<void>(
                     implementation_->release_accounting(

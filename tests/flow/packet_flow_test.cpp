@@ -23,10 +23,13 @@ asyncdownload::download::FlowControlPolicy test_policy() {
 }
 
 std::unique_ptr<asyncdownload::flow::PacketFlow> make_flow(
-    asyncdownload::telemetry::TelemetrySession& telemetry) {
+    asyncdownload::telemetry::TelemetrySession& telemetry,
+    const std::size_t packet_budget = 4) {
     std::unique_ptr<asyncdownload::flow::PacketFlow> flow;
+    auto policy = test_policy();
+    policy.packet_budget = packet_budget;
     EXPECT_FALSE(asyncdownload::flow::PacketFlow::create(
-        test_policy(), telemetry, flow));
+        policy, telemetry, flow));
     return flow;
 }
 
@@ -46,6 +49,110 @@ TEST(PacketFlowTest, CreatesOneProducerAndOneConsumerFromValidatedPolicy) {
         lease, std::chrono::milliseconds(1));
     EXPECT_EQ(received.code, asyncdownload::flow::PacketReceiveCode::closed);
     EXPECT_FALSE(received.error);
+}
+
+TEST(PacketFlowTest, EnforcesLogicalHardBudgetAtOneTwoAndThirtyThree) {
+    for (const auto budget : {1U, 2U, 33U}) {
+        asyncdownload::core::global_memory_accounting().reset();
+        asyncdownload::telemetry::TelemetrySession telemetry;
+        auto flow = make_flow(telemetry, budget);
+        asyncdownload::flow::ProducerLane lane;
+        ASSERT_FALSE(flow->producer().open_lane(lane));
+        const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+        const asyncdownload::range::LeaseId lease{{6}, 1};
+        const asyncdownload::range::ByteSpan span{
+            0,
+            static_cast<std::int64_t>((budget + 1) * bytes.size())
+        };
+
+        for (std::size_t index = 0; index < budget; ++index) {
+            ASSERT_TRUE(flow->producer().accept(
+                lane,
+                {
+                    lease,
+                    span,
+                    static_cast<std::int64_t>(index * bytes.size()),
+                    bytes
+                }).accepted());
+            ASSERT_TRUE(flow->producer().flush(lane).accepted());
+        }
+        ASSERT_TRUE(flow->producer().accept(
+            lane,
+            {
+                lease,
+                span,
+                static_cast<std::int64_t>(budget * bytes.size()),
+                bytes
+            }).accepted());
+
+        const auto exhausted = flow->producer().flush(lane);
+        EXPECT_EQ(
+            exhausted.code,
+            asyncdownload::flow::PacketAdmissionCode::packet_budget_exhausted);
+        EXPECT_EQ(exhausted.consumed_bytes, 0U);
+        EXPECT_EQ(exhausted.published_bytes, 0U);
+        EXPECT_EQ(flow->producer().snapshot().queued_packets, budget);
+
+        asyncdownload::flow::PacketLease packet;
+        ASSERT_EQ(
+            flow->consumer().receive(
+                packet, std::chrono::milliseconds(1)).code,
+            asyncdownload::flow::PacketReceiveCode::packet);
+        packet.complete();
+        const auto resumed = flow->producer().flush(lane);
+        EXPECT_TRUE(resumed.accepted());
+        EXPECT_EQ(resumed.published_bytes, bytes.size());
+        ASSERT_FALSE(flow->producer().close());
+
+        while (flow->consumer().receive(
+                   packet,
+                   std::chrono::milliseconds(1)).code ==
+               asyncdownload::flow::PacketReceiveCode::packet) {
+            packet.complete();
+        }
+        const auto snapshot = flow->producer().snapshot();
+        EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::closed);
+        EXPECT_EQ(snapshot.queued_packets, 0U);
+        EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    }
+}
+
+TEST(PacketFlowTest, ControlBypassesDataAdmissionBudgetWithoutBeingDropped) {
+    asyncdownload::core::global_memory_accounting().reset();
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry, 1);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{9}, 1}, {0, 4}, 0, bytes}).accepted());
+    ASSERT_TRUE(flow->producer().flush(lane).accepted());
+
+    const auto control = flow->producer().publish({
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{9}, 1},
+        4
+    });
+
+    EXPECT_EQ(
+        control.code,
+        asyncdownload::flow::PacketPublishCode::published);
+    EXPECT_EQ(flow->producer().snapshot().queued_packets, 2U);
+    ASSERT_FALSE(flow->producer().close());
+    asyncdownload::flow::PacketLease packet;
+    ASSERT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::packet);
+    EXPECT_EQ(packet.kind(), asyncdownload::flow::PacketKind::data);
+    packet.complete();
+    ASSERT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::packet);
+    EXPECT_EQ(packet.kind(), asyncdownload::flow::PacketKind::control);
+    packet.complete();
+    EXPECT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::closed);
 }
 
 TEST(PacketFlowTest, AcceptsContiguousChunksIntoOneLaneDraft) {

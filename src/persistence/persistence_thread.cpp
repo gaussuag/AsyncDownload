@@ -120,9 +120,6 @@ void PersistenceThread::process_loop() {
 }
 
 void PersistenceThread::handle_packet(flow::PacketLease packet) {
-    // 只有真正开始处理这个 packet 时，它才算离开“网络未落盘积压”集合。
-    session_.queued_packets.fetch_sub(1, std::memory_order_relaxed);
-
     if (packet.kind() == flow::PacketKind::control) {
         const auto* control = packet.control();
         if (control == nullptr ||

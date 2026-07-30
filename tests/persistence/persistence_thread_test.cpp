@@ -41,14 +41,8 @@ void enqueue_data_packet(
             packet.payload
         });
     ASSERT_TRUE(accepted.accepted());
-    if (accepted.published_bytes != 0) {
-        session.queued_packets.fetch_add(1, std::memory_order_relaxed);
-    }
     const auto flushed = producer.flush(lane);
     ASSERT_TRUE(flushed.accepted());
-    if (flushed.published_bytes != 0) {
-        session.queued_packets.fetch_add(1, std::memory_order_relaxed);
-    }
 }
 
 void enqueue_range_complete(
@@ -68,7 +62,6 @@ void enqueue_range_complete(
     ASSERT_EQ(
         published.code,
         asyncdownload::flow::PacketPublishCode::published);
-    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::unique_ptr<asyncdownload::flow::PacketFlow> make_packet_flow(
@@ -404,10 +397,10 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, packet);
 
-    EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 1U);
-    EXPECT_TRUE(wait_for_condition([&session]() {
+    EXPECT_EQ(packet_flow->producer().snapshot().queued_packets, 1U);
+    EXPECT_TRUE(wait_for_condition([&session, &packet_flow]() {
         return session.persisted_bytes.load(std::memory_order_acquire) == 4096 &&
-            session.queued_packets.load(std::memory_order_acquire) == 0U;
+            packet_flow->producer().snapshot().queued_packets == 0U;
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
@@ -416,7 +409,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     writer.close();
 
     EXPECT_FALSE(persistence.error());
-    EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 0U);
+    EXPECT_EQ(packet_flow->producer().snapshot().queued_packets, 0U);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
