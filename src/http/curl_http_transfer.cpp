@@ -594,16 +594,29 @@ public:
     HttpPollResult poll(
         const std::chrono::milliseconds timeout)
             noexcept override {
-        if (!owner_thread_matches() ||
-            timeout.count() < 0) {
+        if (!owner_thread_matches()) {
             const auto error =
                 make_error_code(
                     DownloadErrc::internal_error);
-            fail_session(error);
             return {
                 HttpPollCode::failed,
                 std::nullopt,
                 error
+            };
+        }
+        if (timeout.count() < 0) {
+            const auto failure =
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error);
+            stop_active_for_failure(
+                failure,
+                false);
+            return {
+                HttpPollCode::failed,
+                std::nullopt,
+                failure.error
             };
         }
         if (state_ == HttpSessionState::closed) {
@@ -629,21 +642,27 @@ public:
             };
         }
 
-        const auto reconcile_error =
+        const auto reconcile_failure =
             reconcile_pauses();
-        if (reconcile_error) {
-            fail_session(reconcile_error);
+        if (reconcile_failure.error) {
+            stop_active_for_failure(
+                reconcile_failure,
+                reconcile_failure.reason ==
+                    HttpFailureReason::
+                        upstream_failed);
             return {
                 HttpPollCode::failed,
                 std::nullopt,
-                reconcile_error
+                reconcile_failure.error
             };
         }
 
         const auto first_drive =
             perform_and_drain();
         if (first_drive.error) {
-            fail_session(first_drive.error);
+            stop_active_for_failure(
+                first_drive.failure,
+                false);
             return first_drive;
         }
         if (const auto event = take_event();
@@ -679,20 +698,28 @@ public:
                 &descriptor_count);
         static_cast<void>(descriptor_count);
         if (wait_result != CURLM_OK) {
-            const auto error = make_error_code(
-                DownloadErrc::http_transfer_failed);
-            fail_session(error);
+            const auto failure =
+                make_failure(
+                    HttpFailureReason::
+                        multi_wait_failed,
+                    DownloadErrc::
+                        http_transfer_failed);
+            stop_active_for_failure(
+                failure,
+                false);
             return {
                 HttpPollCode::failed,
                 std::nullopt,
-                error
+                failure.error
             };
         }
 
         const auto second_drive =
             perform_and_drain();
         if (second_drive.error) {
-            fail_session(second_drive.error);
+            stop_active_for_failure(
+                second_drive.failure,
+                false);
             return second_drive;
         }
         if (const auto event = take_event();
@@ -730,6 +757,16 @@ public:
             return {};
         }
         state_ = HttpSessionState::cancelling;
+        if (request.kind ==
+                HttpCancelKind::upstream_failed &&
+            !error_) {
+            error_ = request.cause;
+            primary_failure_ = {
+                HttpFailureReason::
+                    upstream_failed,
+                request.cause
+            };
+        }
 
         for (auto& slot_pointer : slots_) {
             auto& slot = *slot_pointer;
@@ -741,28 +778,32 @@ public:
             if (slot.in_multi) {
                 if (detail::multi_remove_handle(
                         multi_,
-                        slot.easy) != CURLM_OK &&
-                    !error_) {
-                    error_ = make_error_code(
-                        DownloadErrc::
-                            http_transfer_failed);
+                        slot.easy) == CURLM_OK) {
+                    slot.in_multi = false;
+                } else if (!error_) {
+                    const auto failure =
+                        make_failure(
+                            HttpFailureReason::
+                                remove_handle_failed,
+                            DownloadErrc::
+                                http_transfer_failed);
+                    error_ = failure.error;
+                    primary_failure_ = failure;
                 }
-                slot.in_multi = false;
             }
-            if (request.kind ==
-                HttpCancelKind::upstream_failed) {
-                const auto discard_error =
-                    packet_producer_.discard(
-                        slot.lane);
-                if (discard_error && !error_) {
-                    error_ = discard_error;
-                }
-            } else {
-                const auto flush_error =
-                    flush_lane(slot);
-                if (flush_error && !error_) {
-                    error_ = flush_error;
-                }
+            const auto lane_error =
+                settle_lane(
+                    slot,
+                    request.kind ==
+                        HttpCancelKind::
+                            upstream_failed);
+            if (lane_error && !error_) {
+                error_ = lane_error;
+                primary_failure_ = {
+                    HttpFailureReason::
+                        callback_sink_failed,
+                    lane_error
+                };
             }
             const auto cause = request.kind ==
                     HttpCancelKind::upstream_failed
@@ -835,7 +876,9 @@ public:
     }
 
 private:
-    struct DriveResult : HttpPollResult {};
+    struct DriveResult : HttpPollResult {
+        HttpFailure failure{};
+    };
 
     CurlHttpTransferSession(
         HttpSessionConfig config,
@@ -1067,7 +1110,7 @@ private:
         return set(CURLOPT_RANGE, nullptr);
     }
 
-    std::error_code reconcile_pauses() noexcept {
+    HttpFailure reconcile_pauses() noexcept {
         observations_.clear();
         actions_.clear();
         try {
@@ -1085,7 +1128,9 @@ private:
             actions_.resize(
                 observations_.size());
         } catch (...) {
-            return make_error_code(
+            return make_failure(
+                HttpFailureReason::
+                    allocation_failed,
                 DownloadErrc::internal_error);
         }
         const auto reconciled =
@@ -1096,8 +1141,14 @@ private:
             reconciled.action_count >
                 actions_.size()) {
             return reconciled.error
-                ? reconciled.error
-                : make_error_code(
+                ? HttpFailure{
+                    HttpFailureReason::
+                        upstream_failed,
+                    reconciled.error
+                }
+                : make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
                     DownloadErrc::internal_error);
         }
         for (std::size_t index = 0;
@@ -1132,7 +1183,9 @@ private:
                 if (detail::easy_pause(
                         slot->easy,
                         CURLPAUSE_RECV) != CURLE_OK) {
-                    return make_error_code(
+                    return make_failure(
+                        HttpFailureReason::
+                            pause_failed,
                         DownloadErrc::
                             http_transfer_failed);
                 }
@@ -1143,7 +1196,9 @@ private:
                 if (detail::easy_pause(
                         slot->easy,
                         CURLPAUSE_CONT) != CURLE_OK) {
-                    return make_error_code(
+                    return make_failure(
+                        HttpFailureReason::
+                            pause_failed,
                         DownloadErrc::
                             http_transfer_failed);
                 }
@@ -1160,14 +1215,19 @@ private:
                 &running_handles);
         static_cast<void>(running_handles);
         if (perform_result != CURLM_OK) {
+            const auto failure =
+                make_failure(
+                    HttpFailureReason::
+                        multi_perform_failed,
+                    DownloadErrc::
+                        http_transfer_failed);
             return {
                 {
                     HttpPollCode::failed,
                     std::nullopt,
-                    make_error_code(
-                        DownloadErrc::
-                            http_transfer_failed)
-                }
+                    failure.error
+                },
+                failure
             };
         }
         int pending_messages = 0;
@@ -1181,14 +1241,19 @@ private:
             auto* slot = find_slot(
                 message->easy_handle);
             if (slot == nullptr) {
+                const auto failure =
+                    make_failure(
+                        HttpFailureReason::
+                            protocol_order_invalid,
+                        DownloadErrc::
+                            internal_error);
                 return {
                     {
                         HttpPollCode::failed,
                         std::nullopt,
-                        make_error_code(
-                            DownloadErrc::
-                                internal_error)
-                    }
+                        failure.error
+                    },
+                    failure
                 };
             }
             finalize_done(
@@ -1200,7 +1265,8 @@ private:
                 HttpPollCode::idle,
                 std::nullopt,
                 {}
-            }
+            },
+            {}
         };
     }
 
@@ -1292,7 +1358,7 @@ private:
                 slot.accepted_through,
                 failure
             };
-            fail_session(failure.error);
+            fail_session(failure);
         } else {
             slot.pending_event =
                 HttpLeaseSucceeded{
@@ -1528,10 +1594,62 @@ private:
     }
 
     void fail_session(
-        const std::error_code error) noexcept {
+        const HttpFailure failure) noexcept {
         state_ = HttpSessionState::failed;
-        if (!error_) {
-            error_ = error;
+        if (!error_ && failure.error) {
+            error_ = failure.error;
+            primary_failure_ = failure;
+        }
+    }
+
+    std::error_code settle_lane(
+        Slot& slot,
+        const bool discard) noexcept {
+        if (discard) {
+            return packet_producer_.discard(
+                slot.lane);
+        }
+        const auto flush_error =
+            flush_lane(slot);
+        if (!flush_error) {
+            return {};
+        }
+        const auto discard_error =
+            packet_producer_.discard(
+                slot.lane);
+        return flush_error
+            ? flush_error
+            : discard_error;
+    }
+
+    void stop_active_for_failure(
+        const HttpFailure failure,
+        const bool discard) noexcept {
+        fail_session(failure);
+        for (auto& slot_pointer : slots_) {
+            auto& slot = *slot_pointer;
+            if (!slot.lease.has_value() ||
+                slot.pending_event.has_value()) {
+                continue;
+            }
+            slot.cancelling = true;
+            if (slot.in_multi) {
+                if (detail::multi_remove_handle(
+                        multi_,
+                        slot.easy) == CURLM_OK) {
+                    slot.in_multi = false;
+                }
+            }
+            static_cast<void>(
+                settle_lane(
+                    slot,
+                    discard));
+            slot.pending_event = HttpLeaseFailed{
+                token_for(slot),
+                slot.lease->id,
+                slot.accepted_through,
+                failure
+            };
         }
     }
 
@@ -1591,6 +1709,7 @@ private:
     std::vector<flow::PacketPauseAction> actions_;
     HttpSessionState state_ = HttpSessionState::open;
     std::error_code error_{};
+    HttpFailure primary_failure_{};
 };
 
 class CurlHttpTransferPort final :

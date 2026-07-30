@@ -34,6 +34,11 @@ struct CurlRuntimeFaultPlan {
     std::atomic<std::uint64_t> multi_wait_calls{0};
     std::atomic<std::uint64_t> remove_handle_calls{0};
     std::atomic<std::uint64_t> multi_cleanup_calls{0};
+    std::atomic<std::uint64_t> operation_sequence{0};
+    std::atomic<std::uint64_t> last_remove_order{0};
+    std::atomic<std::uint64_t> last_easy_cleanup_order{0};
+    std::atomic<std::uint64_t> multi_cleanup_order{0};
+    std::atomic<std::uint64_t> slist_free_order{0};
 
     void reset() noexcept {
         fail_next_easy_init.store(false);
@@ -57,6 +62,11 @@ struct CurlRuntimeFaultPlan {
         multi_wait_calls.store(0);
         remove_handle_calls.store(0);
         multi_cleanup_calls.store(0);
+        operation_sequence.store(0);
+        last_remove_order.store(0);
+        last_easy_cleanup_order.store(0);
+        multi_cleanup_order.store(0);
+        slist_free_order.store(0);
     }
 };
 
@@ -148,6 +158,11 @@ inline void easy_reset(CURL* easy) noexcept {
 }
 
 inline void easy_cleanup(CURL* easy) noexcept {
+#if defined(ASYNCDOWNLOAD_HTTP_TRANSFER_FAULT_TEST)
+    auto& plan = curl_runtime_fault_plan();
+    plan.last_easy_cleanup_order.store(
+        plan.operation_sequence.fetch_add(1) + 1);
+#endif
     curl_easy_cleanup(easy);
 }
 
@@ -206,6 +221,8 @@ inline CURLMcode multi_remove_handle(
 #if defined(ASYNCDOWNLOAD_HTTP_TRANSFER_FAULT_TEST)
     auto& plan = curl_runtime_fault_plan();
     plan.remove_handle_calls.fetch_add(1);
+    plan.last_remove_order.store(
+        plan.operation_sequence.fetch_add(1) + 1);
     const auto result =
         curl_multi_remove_handle(
             multi,
@@ -286,6 +303,8 @@ inline CURLMcode multi_cleanup(
 #if defined(ASYNCDOWNLOAD_HTTP_TRANSFER_FAULT_TEST)
     auto& plan = curl_runtime_fault_plan();
     plan.multi_cleanup_calls.fetch_add(1);
+    plan.multi_cleanup_order.store(
+        plan.operation_sequence.fetch_add(1) + 1);
     const auto result =
         curl_multi_cleanup(multi);
     return plan.fail_next_multi_cleanup.exchange(false)
@@ -312,6 +331,11 @@ inline curl_slist* slist_append(
 
 inline void slist_free_all(
     curl_slist* list) noexcept {
+#if defined(ASYNCDOWNLOAD_HTTP_TRANSFER_FAULT_TEST)
+    auto& plan = curl_runtime_fault_plan();
+    plan.slist_free_order.store(
+        plan.operation_sequence.fetch_add(1) + 1);
+#endif
     curl_slist_free_all(list);
 }
 

@@ -354,6 +354,7 @@ TEST_F(
     EXPECT_EQ(
         session->snapshot().pending_events,
         0U);
+    EXPECT_FALSE(session->close());
     cleanup(*session);
 }
 
@@ -391,28 +392,71 @@ TEST_F(
 TEST_F(
     CurlHttpTransferFaultTest,
     MultiPerformFailureIsNeverRetried) {
-    auto session = open_session();
+    auto session = open_session(2);
     ASSERT_NE(session, nullptr);
+    const asyncdownload::range::RangeLease first_lease{
+        {{1}, 1},
+        {0, 2},
+        true
+    };
+    const asyncdownload::range::RangeLease second_lease{
+        {{2}, 1},
+        {2, 4},
+        true
+    };
     ASSERT_EQ(
-        session->start(lease()).code,
+        session->start(first_lease).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+    ASSERT_EQ(
+        session->start(second_lease).code,
         asyncdownload::http::
             HttpStartCode::started);
     fault_plan().
         fail_next_multi_perform.store(true);
 
-    const auto first =
-        session->poll(
-            std::chrono::milliseconds(0));
-    const auto second =
+    const auto first_poll =
         session->poll(
             std::chrono::milliseconds(0));
 
     EXPECT_EQ(
-        first.code,
+        first_poll.code,
         asyncdownload::http::
             HttpPollCode::failed);
     EXPECT_EQ(
-        second.code,
+        fault_plan().
+            multi_perform_calls.load(),
+        1U);
+    const auto stopped =
+        session->snapshot();
+    EXPECT_EQ(stopped.active_transfers, 0U);
+    EXPECT_EQ(stopped.pending_events, 2U);
+    for (std::size_t index = 0;
+         index < 2;
+         ++index) {
+        const auto event =
+            session->poll(
+                std::chrono::milliseconds(0));
+        ASSERT_EQ(
+            event.code,
+            asyncdownload::http::
+                HttpPollCode::event);
+        ASSERT_TRUE(event.event.has_value());
+        const auto* failure =
+            std::get_if<
+                asyncdownload::http::
+                    HttpLeaseFailed>(
+                &*event.event);
+        ASSERT_NE(failure, nullptr);
+        EXPECT_EQ(
+            failure->failure.reason,
+            asyncdownload::http::
+                HttpFailureReason::
+                    multi_perform_failed);
+    }
+    EXPECT_EQ(
+        session->poll(
+            std::chrono::milliseconds(0)).code,
         asyncdownload::http::
             HttpPollCode::failed);
     EXPECT_EQ(
@@ -543,6 +587,69 @@ TEST_F(
         fault_plan().
             multi_cleanup_calls.load(),
         1U);
+}
+
+TEST_F(
+    CurlHttpTransferFaultTest,
+    PreservesUpstreamCauseOverCleanupFailure) {
+    auto session = open_session();
+    ASSERT_NE(session, nullptr);
+    ASSERT_EQ(
+        session->start(lease()).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+    const auto upstream =
+        std::make_error_code(
+            std::errc::io_error);
+
+    const auto cancel_error =
+        session->cancel({
+            asyncdownload::http::
+                HttpCancelKind::upstream_failed,
+            upstream
+        });
+    EXPECT_EQ(cancel_error, upstream);
+    const auto event =
+        session->poll(
+            std::chrono::milliseconds(0));
+    ASSERT_EQ(
+        event.code,
+        asyncdownload::http::
+            HttpPollCode::event);
+    ASSERT_TRUE(event.event.has_value());
+    const auto* failure =
+        std::get_if<
+            asyncdownload::http::
+                HttpLeaseFailed>(
+            &*event.event);
+    ASSERT_NE(failure, nullptr);
+    EXPECT_EQ(failure->failure.error, upstream);
+
+    fault_plan().
+        fail_next_multi_cleanup.store(true);
+    EXPECT_EQ(session->close(), upstream);
+}
+
+TEST_F(
+    CurlHttpTransferFaultTest,
+    ClosesEasyBeforeMultiBeforeHeaderList) {
+    auto session = open_session(2);
+    ASSERT_NE(session, nullptr);
+
+    EXPECT_FALSE(session->close());
+
+    const auto easy_order =
+        fault_plan().
+            last_easy_cleanup_order.load();
+    const auto multi_order =
+        fault_plan().
+            multi_cleanup_order.load();
+    const auto header_order =
+        fault_plan().
+            slist_free_order.load();
+    EXPECT_GT(easy_order, 0U);
+    EXPECT_GT(multi_order, easy_order);
+    EXPECT_GT(header_order, multi_order);
 }
 
 }
