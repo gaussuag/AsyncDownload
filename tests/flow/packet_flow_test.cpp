@@ -5,12 +5,16 @@
 #include "flow/packet_flow.hpp"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
 #include <latch>
 #include <limits>
+#include <map>
 #include <memory>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -806,6 +810,159 @@ TEST(PacketFlowTest, RejectsZeroPacketBudgetWithoutCreatingFlow) {
 
     EXPECT_EQ(error, std::make_error_code(std::errc::invalid_argument));
     EXPECT_EQ(flow, nullptr);
+}
+
+TEST(PacketFlowTest, ConcurrentProducerConsumerPreservesEverySequence) {
+    constexpr std::size_t packet_count = 100'000;
+    for (const auto budget : {1U, 2U, 33U}) {
+        asyncdownload::telemetry::TelemetrySession telemetry;
+        std::promise<asyncdownload::flow::PacketFlow*> ready;
+        std::latch consumer_done(1);
+        std::atomic<std::size_t> released_credits{0};
+        auto producer = std::async(std::launch::async, [&]() {
+            std::unique_ptr<asyncdownload::flow::PacketFlow> flow;
+            auto policy = test_policy();
+            policy.packet_budget = budget;
+            auto error = asyncdownload::flow::PacketFlow::create(
+                policy, telemetry, flow);
+            if (error) {
+                ready.set_value(nullptr);
+                return std::pair{false,
+                                 asyncdownload::flow::PacketFlowSnapshot{}};
+            }
+            asyncdownload::flow::ProducerLane lane;
+            error = flow->producer().open_lane(lane);
+            if (error) {
+                ready.set_value(nullptr);
+                return std::pair{false,
+                                 flow->producer().snapshot()};
+            }
+            ready.set_value(flow.get());
+            bool valid = true;
+            for (std::size_t index = 0;
+                 index < packet_count && valid;
+                 ++index) {
+                const std::array<std::uint8_t, 1> payload{
+                    static_cast<std::uint8_t>(index % 251)
+                };
+                const auto admission = flow->producer().accept(
+                    lane,
+                    {
+                        {{8}, 1},
+                        {0, static_cast<std::int64_t>(packet_count)},
+                        static_cast<std::int64_t>(index),
+                        payload
+                    });
+                valid = admission.accepted() &&
+                    admission.consumed_bytes == payload.size();
+                while (valid) {
+                    const auto observed =
+                        released_credits.load(std::memory_order_acquire);
+                    const auto flushed = flow->producer().flush(lane);
+                    if (flushed.accepted()) {
+                        break;
+                    }
+                    if (flushed.code !=
+                        asyncdownload::flow::PacketAdmissionCode::
+                            packet_budget_exhausted) {
+                        valid = false;
+                        break;
+                    }
+                    released_credits.wait(
+                        observed, std::memory_order_acquire);
+                }
+            }
+            if (valid) {
+                error = flow->producer().close();
+                valid = !error;
+            }
+            consumer_done.wait();
+            return std::pair{
+                valid,
+                flow->producer().snapshot()
+            };
+        });
+
+        auto* flow = ready.get_future().get();
+        ASSERT_NE(flow, nullptr);
+        asyncdownload::flow::PacketLease lease;
+        std::map<
+            asyncdownload::flow::PacketSequence,
+            asyncdownload::flow::PacketLease> held;
+        std::size_t observed_packets = 0;
+        std::uint64_t expected_checksum = 0;
+        std::uint64_t actual_checksum = 0;
+        std::uint32_t random_state = 0x9E3779B9U;
+        bool valid = true;
+        std::size_t consecutive_timeouts = 0;
+        while (valid) {
+            const auto received = flow->consumer().receive(
+                lease, std::chrono::milliseconds(1));
+            if (received.code ==
+                asyncdownload::flow::PacketReceiveCode::timeout) {
+                ++consecutive_timeouts;
+                valid = consecutive_timeouts < 10'000;
+                continue;
+            }
+            consecutive_timeouts = 0;
+            if (received.code ==
+                asyncdownload::flow::PacketReceiveCode::closed) {
+                break;
+            }
+            if (received.code !=
+                    asyncdownload::flow::PacketReceiveCode::packet ||
+                lease.kind() !=
+                    asyncdownload::flow::PacketKind::data ||
+                lease.data() == nullptr) {
+                valid = false;
+                break;
+            }
+            const auto* data = lease.data();
+            const auto expected_value = static_cast<std::uint8_t>(
+                observed_packets % 251);
+            valid =
+                lease.sequence() == observed_packets + 1 &&
+                data->offset ==
+                    static_cast<std::int64_t>(observed_packets) &&
+                data->payload.size() == 1 &&
+                data->payload.front() == expected_value;
+            expected_checksum += expected_value;
+            actual_checksum += data->payload.front();
+            ++observed_packets;
+            released_credits.fetch_add(1, std::memory_order_acq_rel);
+            released_credits.notify_one();
+
+            random_state ^= random_state << 13;
+            random_state ^= random_state >> 17;
+            random_state ^= random_state << 5;
+            if ((random_state & 7U) == 0U) {
+                valid = !lease.account_reorder_node();
+                held.emplace(lease.sequence(), std::move(lease));
+                if (held.size() > 32) {
+                    held.begin()->second.complete();
+                    held.erase(held.begin());
+                }
+            } else {
+                lease.complete();
+            }
+        }
+        for (auto& [sequence, packet] : held) {
+            static_cast<void>(sequence);
+            packet.complete();
+        }
+        consumer_done.count_down();
+        const auto [producer_valid, snapshot] = producer.get();
+
+        EXPECT_TRUE(valid);
+        EXPECT_TRUE(producer_valid);
+        EXPECT_EQ(observed_packets, packet_count);
+        EXPECT_EQ(actual_checksum, expected_checksum);
+        EXPECT_EQ(
+            snapshot.state,
+            asyncdownload::flow::PacketFlowState::closed);
+        EXPECT_EQ(snapshot.queued_packets, 0U);
+        EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    }
 }
 
 }
