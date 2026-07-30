@@ -4,12 +4,12 @@
 
 | Item | Value |
 | --- | --- |
-| Active stage | 5 — HTTP Transfer |
-| Last passed stage | 4 — Recovery Checkpoint |
+| Active stage | 6 — Telemetry Session |
+| Last passed stage | 5 — HTTP Transfer |
 | Stage 0 base | `622339136e563752885d8b5ee6a6a0157e28266c` |
 | Stage 0 test rollback point | `98f891f` |
 | Current branch | `codex/refactor-05-http-transfer` |
-| Next slice | 05.1 — characterize probe, status, pause replay, ports, and known gaps |
+| Next slice | 06.1 — characterize telemetry contracts |
 
 ## Stage ledger
 
@@ -20,8 +20,8 @@
 | 2 — Packet Flow / Backpressure | passed | `evidence/phase_02_packet_flow_backpressure.md` | commits after `eca01fc` |
 | 3 — Range Lifecycle | passed | `evidence/phase_03_range_lifecycle.md` | commits after `f271997` |
 | 4 — Recovery Checkpoint | passed | `evidence/phase_04_recovery_checkpoint.md` | commits after `af1a61d` |
-| 5 — HTTP Transfer | active | pending | depends on Stage 4 |
-| 6 — Telemetry Session | locked | pending | depends on Stage 5 |
+| 5 — HTTP Transfer | passed | `evidence/phase_05_http_transfer.md` | commits after `6f77a1d` |
+| 6 — Telemetry Session | active | pending | depends on Stage 5 |
 
 ## Persistent environment facts
 
@@ -53,5 +53,15 @@
 - Stage 4 formal benchmark artifact is
   `build/benchmarks/20260731_053020_phase-04-post`; all 160 runs pass and all summaries have the
   exact 10-key schema.
+- Stage 5 Debug and Release main test binaries each run 253 tests: 251 pass and the same 2
+  architecture skips. HTTP fault tests pass 18/18, Packet Flow 8/8, Range 6/6, and Recovery
+  16/16 in both configurations.
+- Stage 5 full benchmark artifact is `build/benchmarks/20260731_071747_phase-5-post`; all 160 runs
+  pass with exact 10-key summaries. The double-modal default anchor was resolved by consecutive
+  40-run actual-base A/B artifacts
+  `build/benchmarks/20260731_073556_phase-5-pre-normalized-confirmation` and
+  `build/benchmarks/20260731_073819_phase-5-post-normalized-confirmation`.
+- Stage 5 WPR attempted artifact is `build/profiles/20260731_072838_phase-5-profile`; WPR start was
+  denied by the same `0xc5585011` local tracing policy.
 - `skills/asyncdownload-performance` and `skills/history-archive` are absent at current HEAD but
   available in base commit `7a96af2`; their workflows govern this execution as a fallback.

@@ -2563,3 +2563,52 @@ bytes。
 正式 benchmark 没有暴露 checkpoint generation 或 flush count，因此不从吞吐结果反推
 successor 次数；代次与 future-get 事实以 barrier-controlled fault test 为准。benchmark
 只回答正常 workload 是否出现 keeper 回归，结果通过。
+
+## 27. 架构迭代 027：HTTP Transfer 性能中性验收（采纳）
+
+### 27.1 目的
+
+阶段 5 把 probe、Curl multi/easy 生命周期、response validation、callback replay、Lease
+event、cancel 与 cleanup 收口到 `HttpTransferPort` / `HttpTransferSession`。本轮不改变
+HTTP/1.1、fresh/forbid reuse、连接数、scheduler window、Packet Flow 聚合、backpressure、
+flush、recovery 或正式 10-key Summary。
+
+### 27.2 正式结果与双峰确认
+
+阶段 4 正式前态与阶段 5 后态均为同机、同一 loopback 1 GiB identity 对象、Release、
+八个 case、每 case 20 次。除 `baseline_default` 外的七个 case 变化为 `-3.78%` 到
+`+2.97%`，均在 5% keeper 内；memory、inflight、pause 与约 64 KiB packet shape 保持。
+
+`baseline_default` 的跨时段结果为 `696.57 → 571.94 MB/s`，呈双峰并越过门槛，因此按
+playbook 提升到 40 次。为消除时段和输出路径偏差，阶段 4 的 `6f77a1d` source frontier
+在隔离 worktree 重建，随后让 pre/post 二进制连续使用同一个主工作区输出根目录：
+
+- contemporary pre：`356.36 MB/s`
+- contemporary post：`582.88 MB/s`
+- change：`+63.56%`
+- TTFB：`13 → 4 ms`
+- pause：`55.5 → 4`
+- average packet：`64,520 → 64,516 bytes`
+- maximum packet：两侧均为 `65,536 bytes`
+
+紧邻 40-run A/B 否定了 Stage 5 默认锚点退化；跨时段差异归因于本机调度/cache 双峰，
+不据此做参数优化。全套 post 的 `memory_guard` max-memory 中位数为 `12,414,804`
+bytes，Stage 4 为 `12,382,637` bytes，低内存形态保持。
+
+### 27.3 证据与边界
+
+- 正式前态：`build/benchmarks/20260731_053020_phase-04-post`
+- 正式后态：`build/benchmarks/20260731_071747_phase-5-post`
+- 首次 40-run post：
+  `build/benchmarks/20260731_072610_phase-5-post-baseline-confirmation`
+- 归一化 contemporary pre：
+  `build/benchmarks/20260731_073556_phase-5-pre-normalized-confirmation`
+- 归一化 contemporary post：
+  `build/benchmarks/20260731_073819_phase-5-post-normalized-confirmation`
+- WPR：`build/profiles/20260731_072838_phase-5-profile`
+
+WPR 在 `wpr-start` 被本机 policy 以 `0xc5585011` 拒绝。源码审计确认 header parser 只在
+header callback；body callback 只读取缓存的 header state，不新增 heap allocation、
+payload copy、mutex、`std::function` 或 virtual per-batch dispatch。pause replay 仍由
+Curl 驱动，1 ms wait 只存在于 final lane flush。完整 slice 与 rollback 证据见
+`docs/architecture/refactor/evidence/phase_05_http_transfer.md`。
