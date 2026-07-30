@@ -2514,3 +2514,52 @@ WPR 仍在 `wpr-start` 被本机 system-performance tracing policy 以 `0xc55850
 与阶段 2 的原因一致。该环境限制没有替代 benchmark、Debug/Release tests 或 exact
 10-key schema gate。完整 slice 归因与回滚证据记录在
 `docs/architecture/refactor/evidence/phase_03_range_lifecycle.md`。
+
+## 26. 架构迭代 026：Recovery Checkpoint 性能中性验收（采纳）
+
+### 26.1 目的
+
+阶段 4 把恢复身份、part file、checkpoint image、metadata commit、forced successor 和
+finalize 协议收口到 `RecoveryCheckpoint`。本轮不调整 connection、window、queue、
+backpressure、flush cadence、CRC strategy、packet aggregation 或正式 Summary schema。
+
+`04.10` 修复了 pending commit 期间丢失 range-complete/shutdown force 的正确性缺口。
+该变化只在 force 与现有 commit 重叠时增加一个 mandatory successor；确定性 fault test
+分别覆盖 range completion、shutdown、多 force 合并和 successor submit failure。
+
+### 26.2 正式同机结果
+
+阶段 3 正式前态与阶段 4 后态均使用 Release、同一 loopback 1 GiB 文件和每 case 20 次。
+当前 `regression_v2` 比前态新增 `throughput_candidate`，因此百分比只比较两侧共同的七个
+case：
+
+- `baseline_default`：`582.37 → 696.57 MB/s`，`+19.61%`
+- `balanced_candidate`：`495.38 → 522.87 MB/s`，`+5.55%`
+- `deep_buffer_candidate`：`500.14 → 488.87 MB/s`，`-2.25%`
+- `memory_guard`：`676.40 → 690.73 MB/s`，`+2.12%`
+- `scheduler_stress`：`489.96 → 491.85 MB/s`，`+0.39%`
+- `queue_backpressure_stress`：`543.40 → 565.37 MB/s`，`+4.04%`
+- `gap_tolerance_probe`：`490.19 → 486.56 MB/s`，`-0.74%`
+
+新增的 `throughput_candidate` 后态中位值为 `495.31 MB/s`。七个共同 case 的
+network/disk 中位数变化范围为 `-2.25%` 到 `+19.61%`，没有命中 `-5%` 回归门槛。
+pause 中位数逐 case 不变；memory 与 inflight 变化约在 `-4.2%` 到 `+0.5%` 内。
+`memory_guard` 的 max memory 中位数为 `12,382,637` bytes，前态为 `12,439,560`
+bytes。
+
+### 26.3 证据与边界
+
+- 正式前态：
+  `build/benchmarks/20260731_030514_phase-03-11-legacy-deletion`
+- 正式后态：
+  `build/benchmarks/20260731_053020_phase-04-post`
+- 后态完成 `160/160`，无 retry、无失败。
+- 全部 160 份 Summary 均保持 exact 10 keys。
+- sticky-force correctness 由
+  `RangeCompletionDuringPendingCommitCreatesSuccessor`、
+  `ShutdownDuringPendingCommitCreatesSuccessor` 和
+  `SuccessorSubmitFailureRetainsLastCheckpoint` 单独归因。
+
+正式 benchmark 没有暴露 checkpoint generation 或 flush count，因此不从吞吐结果反推
+successor 次数；代次与 future-get 事实以 barrier-controlled fault test 为准。benchmark
+只回答正常 workload 是否出现 keeper 回归，结果通过。
