@@ -2,18 +2,19 @@
 
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
+#include "download/download_policy.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace asyncdownload::download {
 
 class RangeScheduler {
 public:
-    // total_size 和 accept_ranges 在一次任务内固定不变；options 决定切分粒度和并发策略。
-    RangeScheduler(const asyncdownload::DownloadOptions& options,
-                   std::int64_t total_size,
-                   bool accept_ranges) noexcept;
+    RangeScheduler(SchedulingPolicy policy,
+                   std::int64_t total_size) noexcept;
 
     // 根据当前 bitmap 生成初始 RangeContext 列表，只覆盖未完成区域。
     [[nodiscard]] std::vector<std::unique_ptr<core::RangeContext>>
@@ -37,9 +38,8 @@ private:
     [[nodiscard]] std::vector<std::pair<std::int64_t, std::int64_t>>
     split_spans(const std::vector<std::pair<std::int64_t, std::int64_t>>& spans) const noexcept;
 
-    asyncdownload::DownloadOptions options_;
+    SchedulingPolicy policy_{};
     std::int64_t total_size_ = 0;
-    bool accept_ranges_ = false;
     // range_id 由调度器统一分配，保证后续 metadata 和控制消息都能稳定索引。
     std::size_t next_range_id_ = 0;
 };

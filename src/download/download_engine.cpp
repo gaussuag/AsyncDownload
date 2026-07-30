@@ -1053,7 +1053,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         // 调度器基于当前 bitmap 生成“还需要下载哪些区间”。
         // 对全新任务来说是整文件切片；对恢复任务来说则只会覆盖未完成区域。
-        RangeScheduler scheduler(session.options, session.total_size, session.accept_ranges);
+        RangeScheduler scheduler(
+            effective_policy.scheduling(),
+            session.total_size);
         auto ranges = scheduler.build_initial_ranges(bitmap);
         std::deque<core::RangeContext*> pending_ranges;
         for (const auto& range : ranges) {

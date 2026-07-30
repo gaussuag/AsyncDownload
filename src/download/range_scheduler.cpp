@@ -1,17 +1,45 @@
 ﻿#include "range_scheduler.hpp"
 
-#include "core/alignment.hpp"
-
 #include <algorithm>
+#include <cstdint>
+#include <utility>
 
 namespace asyncdownload::download {
+namespace {
 
-RangeScheduler::RangeScheduler(const asyncdownload::DownloadOptions& options,
-                               const std::int64_t total_size,
-                               const bool accept_ranges) noexcept
-    : options_(options),
-      total_size_(total_size),
-      accept_ranges_(accept_ranges) {}
+[[nodiscard]] std::int64_t align_down(
+    const std::int64_t value,
+    const std::int64_t alignment) noexcept {
+    return value - (value % alignment);
+}
+
+[[nodiscard]] bool align_up_within(
+    const std::int64_t value,
+    const std::int64_t alignment,
+    const std::int64_t limit,
+    std::int64_t& result) noexcept {
+    const auto remainder = value % alignment;
+    const auto adjustment = remainder == 0 ? 0 : alignment - remainder;
+    if (adjustment > limit - value) {
+        return false;
+    }
+
+    result = value + adjustment;
+    return true;
+}
+
+[[nodiscard]] bool has_two_units(
+    const std::int64_t value,
+    const std::int64_t unit) noexcept {
+    return value / unit >= 2;
+}
+
+}
+
+RangeScheduler::RangeScheduler(SchedulingPolicy policy,
+                               const std::int64_t total_size) noexcept
+    : policy_(std::move(policy)),
+      total_size_(total_size) {}
 
 std::vector<std::unique_ptr<core::RangeContext>>
 RangeScheduler::build_initial_ranges(const core::AtomicBlockBitmap& bitmap) noexcept {
@@ -34,7 +62,7 @@ RangeScheduler::build_initial_ranges(const core::AtomicBlockBitmap& bitmap) noex
 std::unique_ptr<core::RangeContext>
 RangeScheduler::steal_largest_range(
     const std::vector<std::unique_ptr<core::RangeContext>>& ranges) noexcept {
-    if (!accept_ranges_) {
+    if (!policy_.allow_work_stealing) {
         // 非 Range 服务端无法安全把一段下载任务拆给第二个请求，所以直接禁用 steal。
         return nullptr;
     }
@@ -63,13 +91,10 @@ RangeScheduler::steal_largest_range(
         }
     }
 
-    auto minimum_remaining_for_steal = static_cast<std::int64_t>(options_.block_size * 2);
-    if (options_.max_connections >= 16) {
-        minimum_remaining_for_steal = std::max<std::int64_t>(
-            minimum_remaining_for_steal,
-            static_cast<std::int64_t>(options_.scheduler_window_bytes * 2));
-    }
-    if (donor == nullptr || donor_remaining < minimum_remaining_for_steal) {
+    if (donor == nullptr ||
+        !has_two_units(donor_remaining, policy_.block_bytes) ||
+        (policy_.connection_limit >= 16 &&
+         !has_two_units(donor_remaining, policy_.transfer_window_bytes))) {
         return nullptr;
     }
 
@@ -77,7 +102,9 @@ RangeScheduler::steal_largest_range(
     const auto old_end = donor->end_offset.load(std::memory_order_acquire);
     // midpoint 必须按 block_size 对齐，这样新旧 range 的分界线就和位图颗粒度一致，
     // 后续 finished 判定和恢复逻辑都会更稳定。
-    const auto midpoint = core::align_down(current + (donor_remaining / 2), options_.block_size);
+    const auto midpoint = align_down(
+        current + (donor_remaining / 2),
+        policy_.block_bytes);
     if (midpoint <= current || midpoint > old_end) {
         return nullptr;
     }
@@ -94,7 +121,7 @@ RangeScheduler::next_window(const core::RangeContext& range) const noexcept {
         return {0, -1};
     }
 
-    if (!accept_ranges_) {
+    if (!policy_.issue_range_requests) {
         // 不能做 Range 时，一个请求必须覆盖整文件；这里返回完整区间，
         // 让上层走最保守的单请求路径。
         return {0, total_size_ - 1};
@@ -102,14 +129,15 @@ RangeScheduler::next_window(const core::RangeContext& range) const noexcept {
 
     // window 是“单次 HTTP 请求的租约大小”，不是整个逻辑 range 的大小。
     // 这样同一个 range 可以被拆成多个顺序请求，中间还能给 work stealing 留空间。
-    const auto window = static_cast<std::int64_t>(options_.scheduler_window_bytes);
-    return {start, std::min(end, start + window - 1)};
+    const auto remaining = end - start + 1;
+    const auto extent = std::min(remaining, policy_.transfer_window_bytes);
+    return {start, start + extent - 1};
 }
 
 std::vector<std::pair<std::int64_t, std::int64_t>>
 RangeScheduler::build_unfinished_spans(const core::AtomicBlockBitmap& bitmap) const noexcept {
     std::vector<std::pair<std::int64_t, std::int64_t>> spans;
-    const auto block_size = static_cast<std::int64_t>(options_.block_size);
+    const auto block_size = policy_.block_bytes;
 
     std::int64_t current_start = -1;
     for (std::size_t block = 0; block < bitmap.block_count(); ++block) {
@@ -149,7 +177,9 @@ RangeScheduler::build_unfinished_spans(const core::AtomicBlockBitmap& bitmap) co
 std::vector<std::pair<std::int64_t, std::int64_t>>
 RangeScheduler::split_spans(
     const std::vector<std::pair<std::int64_t, std::int64_t>>& spans) const noexcept {
-    if (!accept_ranges_ || options_.max_connections <= 1 || spans.empty()) {
+    if (!policy_.issue_range_requests ||
+        policy_.connection_limit <= 1 ||
+        spans.empty()) {
         return spans;
     }
 
@@ -157,7 +187,7 @@ RangeScheduler::split_spans(
 
     // 初始切分尽量把最大洞不断对半拆开，直到足够喂满可用连接数。
     // 后续运行期如果仍有负载不均，再交给 steal_largest_range 做动态修正。
-    while (result.size() < options_.max_connections) {
+    while (result.size() < policy_.connection_limit) {
         auto largest_it = std::max_element(result.begin(), result.end(),
             [](const auto& lhs, const auto& rhs) {
                 return (lhs.second - lhs.first) < (rhs.second - rhs.first);
@@ -169,14 +199,19 @@ RangeScheduler::split_spans(
         const auto start = largest_it->first;
         const auto end = largest_it->second;
         const auto remaining = end - start + 1;
-        if (remaining < static_cast<std::int64_t>(options_.block_size * 2)) {
+        if (!has_two_units(remaining, policy_.block_bytes)) {
             break;
         }
 
         // 初始切分使用 align_up，让右半段总是从块边界开始，便于后续把它直接作为
         // 一个独立 RangeContext 派发出去。
-        const auto midpoint = core::align_up(start + (remaining / 2), options_.block_size);
-        if (midpoint <= start || midpoint > end) {
+        std::int64_t midpoint = 0;
+        if (!align_up_within(
+                start + (remaining / 2),
+                policy_.block_bytes,
+                end,
+                midpoint) ||
+            midpoint <= start) {
             break;
         }
 
