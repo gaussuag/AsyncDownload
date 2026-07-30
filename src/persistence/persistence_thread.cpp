@@ -4,7 +4,6 @@
 #include "core/alignment.hpp"
 #include "core/constants.hpp"
 #include "core/crc32.hpp"
-#include "core/memory_accounting.hpp"
 
 #include <algorithm>
 #include <array>
@@ -44,8 +43,14 @@ void PersistenceThread::register_range(core::RangeContext* range) {
     std::scoped_lock lock(ranges_mutex_);
     if (range->range_id >= ranges_.size()) {
         ranges_.resize(range->range_id + 1, nullptr);
+        out_of_order_queues_.resize(range->range_id + 1);
     }
     ranges_[range->range_id] = range;
+    if (!out_of_order_queues_[range->range_id]) {
+        out_of_order_queues_[range->range_id] =
+            std::make_unique<
+                std::map<std::int64_t, flow::PacketLease>>();
+    }
 }
 
 void PersistenceThread::start() {
@@ -134,6 +139,10 @@ void PersistenceThread::handle_packet(flow::PacketLease packet) {
         return;
     }
 
+    handle_data_packet(std::move(packet));
+}
+
+void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
     const auto* data = packet.data();
     if (data == nullptr ||
         data->lease.range.value >
@@ -142,58 +151,64 @@ void PersistenceThread::handle_packet(flow::PacketLease packet) {
         set_error(make_error_code(DownloadErrc::internal_error));
         return;
     }
-
-    core::DataPacket legacy{};
-    try {
-        legacy.kind = core::PacketKind::data;
-        legacy.range_id =
-            static_cast<std::size_t>(data->lease.range.value);
-        legacy.offset = data->offset;
-        legacy.payload = data->payload;
-    } catch (...) {
-        packet.complete();
-        set_error(std::make_error_code(std::errc::not_enough_memory));
-        return;
-    }
-    legacy.accounted_bytes =
-        core::global_packet_overhead(legacy.payload.size(), false);
-    const auto current = core::global_memory_accounting().add(
-        legacy.accounted_bytes);
-    session_.telemetry_session_.record_memory_sample(current);
-    packet.complete();
-    handle_data_packet(std::move(legacy));
-}
-
-void PersistenceThread::handle_data_packet(core::DataPacket packet) {
-    auto* range = lookup_range(packet.range_id);
+    const auto range_id =
+        static_cast<std::size_t>(data->lease.range.value);
+    auto* range = lookup_range(range_id);
     if (range == nullptr) {
-        release_packet_memory(packet);
+        packet.complete();
         set_error(make_error_code(DownloadErrc::internal_error));
         return;
     }
 
-    if (packet.offset == range->persisted_offset) {
+    if (data->offset == range->persisted_offset) {
         // 命中当前 expected offset 时，说明这批数据正好可以接到已经落盘的前沿后面，
         // 于是直接写入，并尝试把 map 里后续连续片段一并 drain 掉。
-        const auto append_error = append_bytes(*range, packet.offset, packet.payload, false);
-        release_packet_memory(packet);
+        const auto packet_size = data->payload.size();
+        const auto append_error = append_bytes(
+            *range, data->offset, data->payload, false);
+        packet.complete();
         if (append_error) {
             set_error(append_error);
             return;
         }
-        range->persisted_offset += static_cast<std::int64_t>(packet.size());
+        range->persisted_offset +=
+            static_cast<std::int64_t>(packet_size);
         update_finished_blocks(*range);
         drain_ordered_packets(*range, false);
     } else {
         // 回调线程不能阻塞等待缺口补齐，所以乱序包先进入 map。
         // Persistence 线程只要等到 expected offset 到达，就能把后续连续片段一起链式写下去。
-        packet.accounted_bytes += core::kMapNodeOverheadBytes;
-        const auto queued_memory =
-            core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
-        session_.telemetry_session_.record_memory_sample(queued_memory);
+        const auto packet_bytes =
+            data->payload.size() +
+            sizeof(flow::DataPacket) +
+            core::kMapNodeOverheadBytes;
+        if (const auto account_error =
+                packet.account_reorder_node();
+            account_error) {
+            packet.complete();
+            set_error(account_error);
+            return;
+        }
         ++current_out_of_order_packets_;
-        current_out_of_order_bytes_ += static_cast<std::int64_t>(packet.accounted_bytes);
-        range->out_of_order_queue.emplace(packet.offset, std::move(packet));
+        current_out_of_order_bytes_ +=
+            static_cast<std::int64_t>(packet_bytes);
+        auto* queue = lookup_out_of_order_queue(range_id);
+        if (queue == nullptr) {
+            packet.complete();
+            set_error(make_error_code(DownloadErrc::internal_error));
+            return;
+        }
+        const auto offset = data->offset;
+        const auto [position, inserted] =
+            queue->emplace(offset, std::move(packet));
+        static_cast<void>(position);
+        if (!inserted) {
+            --current_out_of_order_packets_;
+            current_out_of_order_bytes_ -=
+                static_cast<std::int64_t>(packet_bytes);
+            set_error(make_error_code(DownloadErrc::internal_error));
+            return;
+        }
         update_gap_flag(*range);
     }
 
@@ -228,6 +243,16 @@ core::RangeContext* PersistenceThread::lookup_range(const std::size_t range_id) 
         return nullptr;
     }
     return ranges_[range_id];
+}
+
+std::map<std::int64_t, flow::PacketLease>*
+PersistenceThread::lookup_out_of_order_queue(
+    const std::size_t range_id) const {
+    std::scoped_lock lock(ranges_mutex_);
+    if (range_id >= out_of_order_queues_.size()) {
+        return nullptr;
+    }
+    return out_of_order_queues_[range_id].get();
 }
 
 std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
@@ -375,27 +400,46 @@ void PersistenceThread::update_finished_blocks(const core::RangeContext& range) 
 void PersistenceThread::drain_ordered_packets(core::RangeContext& range, const bool sample_timing) {
     // 一旦 expected offset 对上，就尽量把 map 里后面连续的 packet 一次性清空。
     // 这样既能减少 map 常驻量，也能快速消除 gap pause。
-    while (!range.out_of_order_queue.empty()) {
-        auto next = range.out_of_order_queue.begin();
+    auto* queue = lookup_out_of_order_queue(range.range_id);
+    if (queue == nullptr) {
+        set_error(make_error_code(DownloadErrc::internal_error));
+        return;
+    }
+    while (!queue->empty()) {
+        auto next = queue->begin();
         if (next->first != range.persisted_offset) {
             break;
         }
 
         auto packet = std::move(next->second);
-        range.out_of_order_queue.erase(next);
+        queue->erase(next);
+        const auto* data = packet.data();
+        if (data == nullptr) {
+            packet.complete();
+            set_error(make_error_code(DownloadErrc::internal_error));
+            return;
+        }
+        const auto packet_size = data->payload.size();
+        const auto packet_bytes =
+            packet_size +
+            sizeof(flow::DataPacket) +
+            core::kMapNodeOverheadBytes;
         if (current_out_of_order_packets_ > 0) {
             --current_out_of_order_packets_;
         }
         current_out_of_order_bytes_ = std::max<std::int64_t>(0,
-            current_out_of_order_bytes_ - static_cast<std::int64_t>(packet.accounted_bytes));
+            current_out_of_order_bytes_ -
+                static_cast<std::int64_t>(packet_bytes));
 
-        const auto append_error = append_bytes(range, packet.offset, packet.payload, sample_timing);
-        release_packet_memory(packet);
+        const auto append_error = append_bytes(
+            range, data->offset, data->payload, sample_timing);
+        packet.complete();
         if (append_error) {
             set_error(append_error);
             return;
         }
-        range.persisted_offset += static_cast<std::int64_t>(packet.size());
+        range.persisted_offset +=
+            static_cast<std::int64_t>(packet_size);
         update_finished_blocks(range);
     }
 
@@ -403,14 +447,19 @@ void PersistenceThread::drain_ordered_packets(core::RangeContext& range, const b
 }
 
 void PersistenceThread::update_gap_flag(core::RangeContext& range) {
-    if (range.out_of_order_queue.empty()) {
+    const auto* queue = lookup_out_of_order_queue(range.range_id);
+    if (queue == nullptr) {
+        set_error(make_error_code(DownloadErrc::internal_error));
+        return;
+    }
+    if (queue->empty()) {
         range.pause_for_gap.store(false, std::memory_order_release);
         return;
     }
 
     // gap 太大说明这个 range 前面有长时间补不上的洞，再继续接收后续数据只会
     // 无限堆积内存，所以让 Orchestrator 暂停这个 handle，等缺口被补齐后再恢复。
-    const auto gap = range.out_of_order_queue.begin()->first - range.persisted_offset;
+    const auto gap = queue->begin()->first - range.persisted_offset;
     range.pause_for_gap.store(gap > policy_.max_gap_bytes,
         std::memory_order_release);
 }
@@ -571,18 +620,18 @@ PersistenceThread::build_crc_samples(const core::MetadataState& state) const {
     return samples;
 }
 
-void PersistenceThread::release_packet_memory(const core::DataPacket& packet) noexcept {
-    // 包的内存直到 Persistence 真正处理完成后才释放，这样全局内存会计能准确反映
-    // “还没落盘的数据究竟占了多少内存”。
-    const auto released_memory = core::global_memory_accounting().subtract(packet.accounted_bytes);
-    static_cast<void>(released_memory);
-}
-
 void PersistenceThread::set_error(const std::error_code error) {
-    std::scoped_lock lock(error_mutex_);
-    if (!error_) {
-        // 只保留第一个错误，后续错误通常只是连带症状；这样调用方看到的根因更稳定。
-        error_ = error;
+    auto should_fail_flow = false;
+    {
+        std::scoped_lock lock(error_mutex_);
+        if (!error_) {
+            error_ = error;
+            should_fail_flow = true;
+        }
+    }
+    if (should_fail_flow) {
+        const auto fail_error = packet_consumer_.fail(error);
+        static_cast<void>(fail_error);
     }
 }
 

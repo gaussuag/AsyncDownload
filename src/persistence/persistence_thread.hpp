@@ -11,6 +11,8 @@
 
 #include <chrono>
 #include <future>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -58,9 +60,11 @@ private:
     void process_loop();
     // 按 packet.kind 分流到 data / range_complete / shutdown 三类处理路径。
     void handle_packet(flow::PacketLease packet);
-    void handle_data_packet(core::DataPacket packet);
+    void handle_data_packet(flow::PacketLease packet);
     void handle_range_complete(std::size_t range_id);
     [[nodiscard]] core::RangeContext* lookup_range(std::size_t range_id) const;
+    [[nodiscard]] std::map<std::int64_t, flow::PacketLease>*
+    lookup_out_of_order_queue(std::size_t range_id) const;
     // 把一段逻辑字节按对齐规则写入磁盘，必要时借助 tail buffer 补齐。
     [[nodiscard]] std::error_code append_bytes(core::RangeContext& range,
                                                std::int64_t offset,
@@ -89,8 +93,6 @@ private:
     // 为 VDL 之后仍 finished 的块生成 CRC 样本。
     [[nodiscard]] std::vector<core::BlockCrcSample>
     build_crc_samples(const core::MetadataState& state) const;
-    // 在 packet 彻底被消费后回收其内存会计。
-    void release_packet_memory(const core::DataPacket& packet) noexcept;
     // 只记录首个错误，后续错误当作连带症状忽略。
     void set_error(std::error_code error);
 
@@ -103,6 +105,8 @@ private:
     BS::thread_pool<>& workers_;
     mutable std::mutex ranges_mutex_;
     std::vector<core::RangeContext*> ranges_;
+    std::vector<std::unique_ptr<std::map<std::int64_t, flow::PacketLease>>>
+        out_of_order_queues_;
     std::thread worker_thread_;
     std::future<std::error_code> pending_flush_;
     std::chrono::steady_clock::time_point last_flush_time_{std::chrono::steady_clock::now()};
