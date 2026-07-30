@@ -381,6 +381,17 @@ void rebuild_bitmap_from_ranges(
         return make_error_code(
             DownloadErrc::internal_error);
     }
+    const auto event_lease =
+        std::visit(
+            [](const auto& current) {
+                return current.lease;
+            },
+            event);
+    if (event_lease != found->lease.id ||
+        token.lease != found->lease.id) {
+        return make_error_code(
+            DownloadErrc::internal_error);
+    }
     active.erase(found);
 
     const auto effect_error =
