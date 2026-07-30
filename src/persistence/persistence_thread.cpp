@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace asyncdownload::persistence {
@@ -19,15 +20,14 @@ namespace {
 
 PersistenceThread::PersistenceThread(core::SessionState& session,
                                      download::PersistencePolicy policy,
-                                     moodycamel::BlockingConcurrentQueue<
-                                         core::DataPacket>& data_queue,
+                                     flow::PacketConsumer& packet_consumer,
                                      core::AtomicBlockBitmap& bitmap,
                                      storage::FileWriter& file_writer,
                                      metadata::MetadataStore& metadata_store,
                                      BS::thread_pool<>& workers)
     : session_(session),
       policy_(std::move(policy)),
-      data_queue_(data_queue),
+      packet_consumer_(packet_consumer),
       bitmap_(bitmap),
       file_writer_(file_writer),
       metadata_store_(metadata_store),
@@ -60,9 +60,6 @@ void PersistenceThread::stop() {
     }
 
     stopping_ = true;
-    // shutdown 也走同一条队列，这样可以保证它排在已有数据包之后，
-    // 让线程先把前面已经入队的数据全部消费掉再退出。
-    data_queue_.enqueue(core::DataPacket{.kind = core::PacketKind::shutdown});
 }
 
 void PersistenceThread::join() {
@@ -92,13 +89,17 @@ void PersistenceThread::process_loop() {
     // DataPacket 收敛成一条严格有序、按对齐规则落盘、并能周期性生成恢复元数据
     // 的持久化流水线。
     while (true) {
-        core::DataPacket packet;
-        if (data_queue_.wait_dequeue_timed(packet, 100000)) {
-            const auto kind = packet.kind;
+        flow::PacketLease packet;
+        const auto received = packet_consumer_.receive(
+            packet, std::chrono::microseconds(100000));
+        if (received.code == flow::PacketReceiveCode::packet) {
             handle_packet(std::move(packet));
-            if (kind == core::PacketKind::shutdown) {
-                break;
-            }
+        } else if (received.code == flow::PacketReceiveCode::closed) {
+            maybe_schedule_flush(true);
+            break;
+        } else if (received.code == flow::PacketReceiveCode::failed) {
+            set_error(received.error);
+            break;
         }
 
         poll_pending_flush();
@@ -113,23 +114,54 @@ void PersistenceThread::process_loop() {
     wait_pending_flush();
 }
 
-void PersistenceThread::handle_packet(core::DataPacket packet) {
-    if (packet.kind == core::PacketKind::shutdown) {
-        // shutdown 不携带数据，但它会强制触发最后一次 flush，
-        // 从而把退出前最后那批写入推进到 metadata 和 VDL 里。
-        maybe_schedule_flush(true);
-        return;
-    }
-
+void PersistenceThread::handle_packet(flow::PacketLease packet) {
     // 只有真正开始处理这个 packet 时，它才算离开“网络未落盘积压”集合。
     session_.queued_packets.fetch_sub(1, std::memory_order_relaxed);
 
-    if (packet.kind == core::PacketKind::range_complete) {
-        handle_range_complete(packet.range_id);
+    if (packet.kind() == flow::PacketKind::control) {
+        const auto* control = packet.control();
+        if (control == nullptr ||
+            control->completion.range.value >
+                std::numeric_limits<std::size_t>::max()) {
+            packet.complete();
+            set_error(make_error_code(DownloadErrc::internal_error));
+            return;
+        }
+        const auto range_id =
+            static_cast<std::size_t>(control->completion.range.value);
+        packet.complete();
+        handle_range_complete(range_id);
         return;
     }
 
-    handle_data_packet(std::move(packet));
+    const auto* data = packet.data();
+    if (data == nullptr ||
+        data->lease.range.value >
+            std::numeric_limits<std::size_t>::max()) {
+        packet.complete();
+        set_error(make_error_code(DownloadErrc::internal_error));
+        return;
+    }
+
+    core::DataPacket legacy{};
+    try {
+        legacy.kind = core::PacketKind::data;
+        legacy.range_id =
+            static_cast<std::size_t>(data->lease.range.value);
+        legacy.offset = data->offset;
+        legacy.payload = data->payload;
+    } catch (...) {
+        packet.complete();
+        set_error(std::make_error_code(std::errc::not_enough_memory));
+        return;
+    }
+    legacy.accounted_bytes =
+        core::global_packet_overhead(legacy.payload.size(), false);
+    const auto current = core::global_memory_accounting().add(
+        legacy.accounted_bytes);
+    session_.telemetry_session_.record_memory_sample(current);
+    packet.complete();
+    handle_data_packet(std::move(legacy));
 }
 
 void PersistenceThread::handle_data_packet(core::DataPacket packet) {

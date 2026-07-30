@@ -4,17 +4,18 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include <concurrentqueue/blockingconcurrentqueue.h>
 #include <gtest/gtest.h>
 #include <thread-pool/BS_thread_pool.hpp>
 
 #include "core/block_bitmap.hpp"
 #include "core/memory_accounting.hpp"
 #include "core/models.hpp"
+#include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "storage/file_writer.hpp"
@@ -22,17 +23,62 @@
 namespace {
 
 void enqueue_data_packet(
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket>& queue,
+    asyncdownload::flow::PacketProducer& producer,
+    asyncdownload::flow::ProducerLane& lane,
     asyncdownload::core::SessionState& session,
-    asyncdownload::core::DataPacket packet) {
-    const auto accounted = asyncdownload::core::global_packet_overhead(
-        packet.payload.size(),
-        false);
-    packet.accounted_bytes = accounted;
-    const auto current_bytes = asyncdownload::core::global_memory_accounting().add(accounted);
-    static_cast<void>(current_bytes);
-    queue.enqueue(std::move(packet));
+    const asyncdownload::core::DataPacket& packet) {
+    const auto accepted = producer.accept(
+        lane,
+        {
+            {
+                {
+                    static_cast<std::uint64_t>(packet.range_id)
+                },
+                0
+            },
+            {0, session.total_size},
+            packet.offset,
+            packet.payload
+        });
+    ASSERT_TRUE(accepted.accepted());
+    if (accepted.published_bytes != 0) {
+        session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto flushed = producer.flush(lane);
+    ASSERT_TRUE(flushed.accepted());
+    if (flushed.published_bytes != 0) {
+        session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void enqueue_range_complete(
+    asyncdownload::flow::PacketProducer& producer,
+    asyncdownload::core::SessionState& session,
+    const std::size_t range_id) {
+    const auto published = producer.publish({
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {
+            {
+                static_cast<std::uint64_t>(range_id)
+            },
+            0
+        },
+        session.total_size
+    });
+    ASSERT_EQ(
+        published.code,
+        asyncdownload::flow::PacketPublishCode::published);
     session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::unique_ptr<asyncdownload::flow::PacketFlow> make_packet_flow(
+    asyncdownload::core::SessionState& session) {
+    std::unique_ptr<asyncdownload::flow::PacketFlow> packet_flow;
+    EXPECT_FALSE(asyncdownload::flow::PacketFlow::create(
+        session.effective_policy.flow_control(),
+        session.telemetry_session_,
+        packet_flow));
+    return packet_flow;
 }
 
 bool wait_for_condition(const std::function<bool()>& predicate,
@@ -99,8 +145,9 @@ void persist_single_range_at_tail_capacity(
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<
-        asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(
             session.total_size,
@@ -116,7 +163,7 @@ void persist_single_range_at_tail_capacity(
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         policy,
-        queue,
+        packet_flow->consumer(),
         bitmap,
         writer,
         store,
@@ -131,18 +178,15 @@ void persist_single_range_at_tail_capacity(
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(static_cast<std::size_t>(total_size), 0x5A);
-    enqueue_data_packet(queue, session, std::move(packet));
-
-    asyncdownload::core::DataPacket complete{};
-    complete.kind = asyncdownload::core::PacketKind::range_complete;
-    complete.range_id = 0;
-    queue.enqueue(std::move(complete));
-    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, packet);
+    enqueue_range_complete(packet_flow->producer(), session, 0);
 
     ASSERT_TRUE(wait_for_condition([&range]() {
         return range.marked_finished.load(std::memory_order_acquire);
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     EXPECT_FALSE(persistence.error());
@@ -211,7 +255,9 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
@@ -219,7 +265,7 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, queue, bitmap, writer, store, workers);
+        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -230,12 +276,14 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     packet.range_id = 0;
     packet.offset = 8 * 1024;
     packet.payload.assign(4096, 0x33);
-    enqueue_data_packet(queue, session, std::move(packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, packet);
 
     EXPECT_TRUE(wait_for_condition([&range]() {
         return range.pause_for_gap.load(std::memory_order_acquire);
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     writer.close();
@@ -268,7 +316,9 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
@@ -276,7 +326,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, queue, bitmap, writer, store, workers);
+        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -287,12 +337,14 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x11);
-    enqueue_data_packet(queue, session, std::move(packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, packet);
 
     EXPECT_TRUE(wait_for_condition([&bitmap]() {
         return bitmap.load(0) == asyncdownload::core::BlockState::downloading;
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     writer.close();
@@ -328,7 +380,9 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
@@ -336,7 +390,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, queue, bitmap, writer, store, workers);
+        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -347,7 +401,8 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x7A);
-    enqueue_data_packet(queue, session, std::move(packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, packet);
 
     EXPECT_EQ(session.queued_packets.load(std::memory_order_relaxed), 1U);
     EXPECT_TRUE(wait_for_condition([&session]() {
@@ -355,6 +410,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
             session.queued_packets.load(std::memory_order_acquire) == 0U;
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     writer.close();
@@ -390,7 +446,9 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
@@ -398,7 +456,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, queue, bitmap, writer, store, workers);
+        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -409,12 +467,14 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x55);
-    enqueue_data_packet(queue, session, std::move(packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, packet);
 
     EXPECT_TRUE(wait_for_condition([&session]() {
         return session.persisted_bytes.load(std::memory_order_acquire) == 4096;
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     writer.close();
@@ -422,7 +482,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 4096);
     const auto summary = session.telemetry_session_.final_summary();
-    EXPECT_EQ(summary.max_inflight_bytes, 0);
+    EXPECT_EQ(summary.max_inflight_bytes, 4096);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -451,7 +511,9 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     session.url = "http://127.0.0.1/test.bin";
     session.telemetry_session_.record_task_started();
 
-    moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
@@ -459,7 +521,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, queue, bitmap, writer, store, workers);
+        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -470,7 +532,8 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     tail_packet.range_id = 0;
     tail_packet.offset = 8 * 1024;
     tail_packet.payload.assign(4096, 0x44);
-    enqueue_data_packet(queue, session, std::move(tail_packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, tail_packet);
 
     ASSERT_TRUE(wait_for_condition([&range]() {
         return range.pause_for_gap.load(std::memory_order_acquire);
@@ -481,23 +544,21 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     head_packet.range_id = 0;
     head_packet.offset = 0;
     head_packet.payload.assign(8 * 1024, 0x22);
-    enqueue_data_packet(queue, session, std::move(head_packet));
+    enqueue_data_packet(
+        packet_flow->producer(), packet_lane, session, head_packet);
 
     EXPECT_TRUE(wait_for_condition([&range, &session]() {
         return !range.pause_for_gap.load(std::memory_order_acquire) &&
             session.persisted_bytes.load(std::memory_order_acquire) == 12 * 1024;
     }, std::chrono::milliseconds(1000)));
 
-    asyncdownload::core::DataPacket complete_packet{};
-    complete_packet.kind = asyncdownload::core::PacketKind::range_complete;
-    complete_packet.range_id = 0;
-    queue.enqueue(std::move(complete_packet));
-    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+    enqueue_range_complete(packet_flow->producer(), session, 0);
 
     EXPECT_TRUE(wait_for_condition([&range]() {
         return range.marked_finished.load(std::memory_order_acquire);
     }, std::chrono::milliseconds(1000)));
 
+    ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
     writer.close();

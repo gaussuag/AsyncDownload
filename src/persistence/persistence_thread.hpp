@@ -3,10 +3,10 @@
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
 #include "download/download_policy.hpp"
+#include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
 #include "storage/file_writer.hpp"
 
-#include <concurrentqueue/blockingconcurrentqueue.h>
 #include <thread-pool/BS_thread_pool.hpp>
 
 #include <chrono>
@@ -27,7 +27,7 @@ public:
     // 5. flush / metadata / VDL 更新
     PersistenceThread(core::SessionState& session,
                       download::PersistencePolicy policy,
-                      moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue,
+                      flow::PacketConsumer& packet_consumer,
                       core::AtomicBlockBitmap& bitmap,
                       storage::FileWriter& file_writer,
                       metadata::MetadataStore& metadata_store,
@@ -57,7 +57,7 @@ private:
     // 主循环：消费 packet、轮询 flush 结果、按阈值发起新的 flush。
     void process_loop();
     // 按 packet.kind 分流到 data / range_complete / shutdown 三类处理路径。
-    void handle_packet(core::DataPacket packet);
+    void handle_packet(flow::PacketLease packet);
     void handle_data_packet(core::DataPacket packet);
     void handle_range_complete(std::size_t range_id);
     [[nodiscard]] core::RangeContext* lookup_range(std::size_t range_id) const;
@@ -96,7 +96,7 @@ private:
 
     core::SessionState& session_;
     const download::PersistencePolicy policy_;
-    moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue_;
+    flow::PacketConsumer& packet_consumer_;
     core::AtomicBlockBitmap& bitmap_;
     storage::FileWriter& file_writer_;
     metadata::MetadataStore& metadata_store_;
