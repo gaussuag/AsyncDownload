@@ -201,21 +201,22 @@ void invoke_progress(core::SessionState& session,
 }
 
 [[nodiscard]] bool metadata_matches(const core::MetadataState& state,
-                                    const DownloadRequest& request,
+                                    const std::string& url,
+                                    const RecoveryIdentityPolicy& policy,
                                     const core::RemoteProbeResult& probe,
                                     const core::SessionPaths& paths) noexcept {
     // 恢复条件必须同时满足“本地任务身份一致”和“远端资源身份一致”。
     // 只要 URL、路径、总大小、对齐参数、ETag、Last-Modified 有冲突，就宁可重下，
     // 也不冒险把旧状态接到新资源上。
-    if (state.url != request.url ||
+    if (state.url != url ||
         state.output_path != paths.output_path ||
         state.temporary_path != paths.temporary_path ||
         state.total_size != probe.total_size) {
         return false;
     }
 
-    if (state.block_size != request.options.block_size ||
-        state.io_alignment != request.options.io_alignment) {
+    if (state.block_size != policy.block_bytes ||
+        state.io_alignment != policy.io_alignment_bytes) {
         return false;
     }
 
@@ -975,7 +976,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         const auto temp_exists = std::filesystem::exists(session.paths.temporary_path);
         const auto can_resume = temp_exists && loaded_metadata.has_value() &&
-            metadata_matches(*loaded_metadata, request, probe_result, session.paths);
+            metadata_matches(
+                *loaded_metadata,
+                request.url,
+                effective_policy.recovery_identity(),
+                probe_result,
+                session.paths);
 
         // FileWriter 总是绑定到 .part 文件；若可以恢复则保留现有临时文件，
         // 否则按新任务语义重新打开并预分配。
