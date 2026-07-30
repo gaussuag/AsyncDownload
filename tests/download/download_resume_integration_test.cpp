@@ -1055,6 +1055,7 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
     stop_child(server, 0);
 
     ASSERT_TRUE(result.ok()) << result.error.message();
+    EXPECT_GT(result.completed_ranges, 0U);
     EXPECT_GT(result.performance.average_network_bytes_per_second, 0.0);
     EXPECT_GT(result.performance.average_disk_bytes_per_second, 0.0);
     EXPECT_GE(result.performance.time_to_first_byte_ms, 0);
@@ -1103,6 +1104,7 @@ TEST(DownloadIntegrationTest, ReportsDetailedProgressSnapshot) {
         static_cast<std::int64_t>(std::filesystem::file_size(source_file)));
     EXPECT_EQ(captured.back().persisted_bytes,
         static_cast<std::int64_t>(std::filesystem::file_size(source_file)));
+    EXPECT_EQ(captured.back().paused_ranges, 0U);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);

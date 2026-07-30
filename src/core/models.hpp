@@ -68,8 +68,6 @@ struct RangeContext {
     // status 是给调度、进度展示和恢复快照看的粗粒度状态。
     std::atomic<std::uint8_t> status{static_cast<std::uint8_t>(RangeStatus::empty)};
     std::atomic<bool> pause_for_gap{false};
-    // completion_notified 防止同一个 range 被重复发送 range_complete 控制消息。
-    std::atomic<bool> completion_notified{false};
     // marked_finished 代表 Persistence 已经确认该 range 的最终收尾完成。
     std::atomic<bool> marked_finished{false};
     // persisted_offset 只由 Persistence 线程推进，表示这个 range 已经按顺序

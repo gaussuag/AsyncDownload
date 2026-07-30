@@ -91,26 +91,6 @@ private:
     bool initialized_ = false;
 };
 
-void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept;
-
-void update_transfer_pause_state(TransferHandle& transfer) noexcept {
-    if (transfer.range == nullptr) {
-        return;
-    }
-
-    const auto packet_paused =
-        transfer.packet_producer != nullptr &&
-        transfer.packet_producer->paused(transfer.packet_lane);
-    if (packet_paused ||
-        transfer.paused_by_gap ||
-        transfer.paused_by_window_boundary) {
-        mark_range_status(*transfer.range, core::RangeStatus::paused);
-        return;
-    }
-
-    mark_range_status(*transfer.range, core::RangeStatus::downloading);
-}
-
 void record_first_network_byte(core::SessionState& session,
                                const std::size_t bytes) noexcept {
     if (bytes == 0) {
@@ -135,13 +115,18 @@ void record_first_network_byte(core::SessionState& session,
             flow_snapshot.published_data_bytes);
 }
 
-void invoke_progress(core::SessionState& session,
-                     const std::vector<std::unique_ptr<core::RangeContext>>& ranges,
-                     const std::vector<TransferHandle>& handles) noexcept {
+[[nodiscard]] std::error_code invoke_progress(
+    core::SessionState& session,
+    range::RangeLifecycle& lifecycle,
+    const std::vector<TransferHandle>& handles) noexcept {
     if (!session.progress_callback) {
-        return;
+        return {};
     }
 
+    const auto lifecycle_snapshot = lifecycle.snapshot();
+    if (lifecycle_snapshot.error) {
+        return lifecycle_snapshot.error;
+    }
     auto snapshot = session.telemetry_session_.current_snapshot();
     const auto flow_snapshot = handles.empty() ||
             handles.front().packet_producer == nullptr ?
@@ -159,10 +144,30 @@ void invoke_progress(core::SessionState& session,
     snapshot.memory_bytes = flow_snapshot.accounted_bytes;
     snapshot.resumed = session.resumed;
 
-    for (const auto& range : ranges) {
-        const auto status = static_cast<core::RangeStatus>(
-            range->status.load(std::memory_order_acquire));
-        if (status == core::RangeStatus::paused) {
+    for (const auto& lifecycle_range :
+         lifecycle_snapshot.value.ranges) {
+        const auto transfer_paused = std::any_of(
+            handles.begin(),
+            handles.end(),
+            [&lifecycle_range](
+                const TransferHandle& handle) {
+                const auto id = handle.lease.has_value() ?
+                    std::optional<range::RangeId>{
+                        handle.lease->id.range
+                    } :
+                    handle.pending_lease.has_value() ?
+                        std::optional<range::RangeId>{
+                            handle.pending_lease->lease.id.range
+                        } :
+                        std::nullopt;
+                return id == lifecycle_range.id &&
+                    (handle.paused_by_window_boundary ||
+                     (handle.packet_producer != nullptr &&
+                      handle.packet_producer->paused(
+                          handle.packet_lane)));
+            });
+        if (lifecycle_range.gap_blocked ||
+            transfer_paused) {
             ++snapshot.paused_ranges;
         }
     }
@@ -177,6 +182,7 @@ void invoke_progress(core::SessionState& session,
         session.progress_callback(snapshot);
     } catch (...) {
     }
+    return {};
 }
 
 [[nodiscard]] bool metadata_matches(const core::MetadataState& state,
@@ -274,18 +280,18 @@ void rebuild_bitmap_from_snapshots(core::AtomicBlockBitmap& bitmap,
 
 void rebuild_bitmap_from_ranges(
     core::AtomicBlockBitmap& bitmap,
-    const std::vector<std::unique_ptr<core::RangeContext>>& ranges,
+    const std::vector<range::RangeSnapshot>& ranges,
     const std::size_t block_size,
     const std::int64_t total_size) noexcept {
     // 正常退出时也做同样的投影，确保最终结果以 Persistence 线程实际推进过的
     // persisted_offset 为准，而不是以中途某个旧快照为准。
     for (const auto& range : ranges) {
-        if (!range || range->persisted_offset <= range->start_offset) {
+        if (range.persisted_through <= range.bytes.begin) {
             continue;
         }
 
-        bitmap.mark_finished_range(range->start_offset,
-            range->persisted_offset,
+        bitmap.mark_finished_range(range.bytes.begin,
+            range.persisted_through,
             block_size,
             total_size);
     }
@@ -577,10 +583,6 @@ void rollback_inflight_window(TransferHandle& transfer) noexcept {
     return {};
 }
 
-void mark_range_status(core::RangeContext& range, const core::RangeStatus status) noexcept {
-    range.status.store(static_cast<std::uint8_t>(status), std::memory_order_release);
-}
-
 [[nodiscard]] bool response_is_valid(const core::SessionState& session,
                                      const TransferHandle& transfer) noexcept {
     // Range 模式下，除非这个请求覆盖整个文件，否则必须看到 206。
@@ -670,9 +672,6 @@ void update_speed(TransferHandle& transfer) noexcept {
     projection.current_offset.store(
         lease.bytes.end,
         std::memory_order_release);
-    mark_range_status(
-        projection,
-        core::RangeStatus::downloading);
 
     transfer.range = &projection;
     transfer.lease = lease;
@@ -720,7 +719,6 @@ void update_speed(TransferHandle& transfer) noexcept {
                 if (current->packet_error) {
                     return 0;
                 }
-                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
 
@@ -731,7 +729,6 @@ void update_speed(TransferHandle& transfer) noexcept {
                     telemetry::TelemetryPauseReason::none, false);
             }
             current->paused_by_window_boundary = true;
-            update_transfer_pause_state(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
 
@@ -760,14 +757,12 @@ void update_speed(TransferHandle& transfer) noexcept {
         if (!admission.accepted()) {
             if (admission.code ==
                 flow::PacketAdmissionCode::memory_budget_exhausted) {
-                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
             if (admission.code ==
                     flow::PacketAdmissionCode::packet_budget_exhausted ||
                 admission.code ==
                     flow::PacketAdmissionCode::backend_temporarily_unavailable) {
-                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
             current->packet_error = admission.error ?
@@ -775,17 +770,6 @@ void update_speed(TransferHandle& transfer) noexcept {
                 make_error_code(DownloadErrc::internal_error);
             return 0;
         }
-        if ((admission.active_pause_mask &
-             static_cast<std::uint8_t>(
-                 flow::PacketPauseReason::memory)) != 0) {
-            update_transfer_pause_state(*current);
-        }
-        if ((admission.active_pause_mask &
-             static_cast<std::uint8_t>(
-                 flow::PacketPauseReason::queue)) != 0) {
-            update_transfer_pause_state(*current);
-        }
-
         record_first_network_byte(*current->session, allowed);
         current->next_offset += static_cast<std::int64_t>(allowed);
         current->request_bytes += static_cast<std::int64_t>(allowed);
@@ -817,31 +801,50 @@ void update_speed(TransferHandle& transfer) noexcept {
     return {};
 }
 
-void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
+[[nodiscard]] std::error_code apply_gap_pauses(
+    std::vector<TransferHandle>& handles,
+    range::RangeLifecycle& lifecycle) noexcept {
+    const auto snapshot = lifecycle.snapshot();
+    if (snapshot.error) {
+        return snapshot.error;
+    }
     // gap pause 的信号来自 Persistence 线程，它比网络层更早知道某个 range 前面
     // 是否已经堆出了过大的洞。
     for (auto& handle : handles) {
-        if (!handle.in_multi || handle.range == nullptr) {
+        if (!handle.in_multi ||
+            handle.range == nullptr ||
+            !handle.lease.has_value()) {
             continue;
         }
 
-        const auto pause_for_gap = handle.range->pause_for_gap.load(std::memory_order_acquire);
+        const auto found = std::find_if(
+            snapshot.value.ranges.begin(),
+            snapshot.value.ranges.end(),
+            [&handle](
+                const range::RangeSnapshot& current) {
+                return current.id ==
+                    handle.lease->id.range;
+            });
+        if (found == snapshot.value.ranges.end()) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        const auto pause_for_gap = found->gap_blocked;
         if (pause_for_gap && !handle.paused_by_gap) {
             handle.session->telemetry_session_.record_pause(
                 telemetry::TelemetryPauseReason::gap, false);
             handle.paused_by_gap = true;
-            update_transfer_pause_state(handle);
             curl_easy_pause(handle.easy, CURLPAUSE_RECV);
         } else if (!pause_for_gap && handle.paused_by_gap) {
             handle.paused_by_gap = false;
             if (!handle.packet_producer->paused(
                     handle.packet_lane) &&
                 !handle.paused_by_window_boundary) {
-                update_transfer_pause_state(handle);
                 curl_easy_pause(handle.easy, CURLPAUSE_CONT);
             }
         }
     }
+    return {};
 }
 
 [[nodiscard]] std::error_code reconcile_packet_flow(
@@ -887,7 +890,6 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
             found->range == nullptr) {
             return make_error_code(DownloadErrc::internal_error);
         }
-        update_transfer_pause_state(*found);
         if (action.kind ==
             flow::PacketPauseActionKind::pause_receive) {
             curl_easy_pause(found->easy, CURLPAUSE_RECV);
@@ -916,9 +918,6 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
         [&transfer, &lifecycle](
             const std::error_code error) noexcept {
             rollback_inflight_window(transfer);
-            mark_range_status(
-                *transfer.range,
-                core::RangeStatus::failed);
             const auto applied = lifecycle.apply(
                 range::LeaseFailed{
                     transfer.lease->id,
@@ -950,9 +949,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
             make_error_code(DownloadErrc::http_transfer_failed));
     }
 
-    transfer.range->pause_for_gap.store(false, std::memory_order_release);
     transfer.paused_by_window_boundary = false;
-    update_transfer_pause_state(transfer);
 
     const auto applied = lifecycle.apply(
         range::LeaseSucceeded{
@@ -960,13 +957,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
             transfer.next_offset
         });
     if (applied.error) {
-        mark_range_status(
-            *transfer.range,
-            core::RangeStatus::failed);
         return applied.error;
-    }
-    if (applied.scheduler_may_run) {
-        mark_range_status(*transfer.range, core::RangeStatus::empty);
     }
     for (std::size_t index = 0;
          index < applied.effects.size;
@@ -1677,7 +1668,17 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
             // gap pause 和 memory backpressure 都是在事件循环里集中执行，避免在
             // write callback 里直接操作其他 handle，保持控制流简单。
-            apply_gap_pauses(handles);
+            if (const auto gap_error =
+                    apply_gap_pauses(
+                        handles,
+                        *lifecycle);
+                gap_error) {
+                failure = gap_error;
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
             if (const auto reconcile_error =
                     reconcile_packet_flow(
                         handles,
@@ -1735,7 +1736,18 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
             const auto now = Clock::now();
             if (now >= emit_progress_at) {
-                invoke_progress(session, ranges, handles);
+                if (const auto progress_error =
+                        invoke_progress(
+                            session,
+                            *lifecycle,
+                            handles);
+                    progress_error) {
+                    failure = progress_error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
                 emit_progress_at = now + std::chrono::milliseconds(200);
             }
 
@@ -1808,15 +1820,32 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     persistence_error;
             }
         }
+        const auto final_lifecycle_snapshot =
+            lifecycle->snapshot();
+        if (!failure && final_lifecycle_snapshot.error) {
+            failure = final_lifecycle_snapshot.error;
+        }
+        if (!failure &&
+            !final_lifecycle_snapshot.value.all_finished) {
+            failure = make_error_code(
+                DownloadErrc::internal_error);
+        }
 
         // Persistence 线程拥有每个 range 的真正写盘前沿；停下来之后再做一次 bitmap
         // 重建，可以把最终结果对齐到落盘状态。
         rebuild_bitmap_from_ranges(bitmap,
-            ranges,
+            final_lifecycle_snapshot.value.ranges,
             session.effective_policy.persistence().block_bytes,
             session.total_size);
 
-        invoke_progress(session, ranges, handles);
+        if (const auto progress_error =
+                invoke_progress(
+                    session,
+                    *lifecycle,
+                    handles);
+            !failure && progress_error) {
+            failure = progress_error;
+        }
 
         cleanup_network_resources(multi, handles);
         failure = finalize_storage_phase(file_writer,
@@ -1840,11 +1869,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.persisted_bytes = sum_finished_bytes(bitmap,
             session.effective_policy.persistence().block_bytes,
             session.total_size);
-        result.completed_ranges = static_cast<std::size_t>(std::count_if(ranges.begin(),
-            ranges.end(),
-            [](const std::unique_ptr<core::RangeContext>& range) {
-                return range->marked_finished.load(std::memory_order_acquire);
-            }));
+        result.completed_ranges =
+            final_lifecycle_snapshot.value.finished_ranges;
         result.resumed = session.resumed;
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
