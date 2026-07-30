@@ -26,6 +26,20 @@ public:
     void record_task_completed(
         TelemetryClock::time_point timestamp = TelemetryClock::now()) noexcept;
 
+    void record_download_delta_at(
+        std::uint64_t bytes,
+        TelemetryClock::time_point timestamp) noexcept;
+    void record_persist_delta_at(
+        std::uint64_t bytes,
+        TelemetryClock::time_point timestamp) noexcept;
+    void record_pause_at(
+        TelemetryPauseReason reason,
+        bool is_queue_full,
+        TelemetryClock::time_point timestamp) noexcept;
+    void record_memory_sample_at(
+        std::uint64_t memory_bytes,
+        TelemetryClock::time_point timestamp) noexcept;
+
     [[nodiscard]] ProgressSnapshot current_snapshot() const noexcept;
     [[nodiscard]] PerformanceSummary final_summary(
         TelemetryClock::time_point now = TelemetryClock::now()) const noexcept;

@@ -183,4 +183,78 @@ TEST(TelemetrySessionTest, SecondStartBeginsCleanObservationEpoch) {
     EXPECT_EQ(summary.packets_enqueued_total, 0U);
 }
 
+TEST(TelemetrySessionTest, DeterministicVariantsPreserveEmaFormula) {
+    TelemetrySession session;
+    const auto start = TelemetryClock::time_point{std::chrono::seconds(1)};
+
+    session.record_task_started(start);
+    session.record_download_delta_at(
+        100U,
+        start + std::chrono::seconds(1));
+    session.record_download_delta_at(
+        200U,
+        start + std::chrono::seconds(2));
+    session.record_persist_delta_at(
+        80U,
+        start + std::chrono::milliseconds(1500));
+    session.record_persist_delta_at(
+        120U,
+        start + std::chrono::seconds(3));
+
+    const auto snapshot = session.current_snapshot();
+    EXPECT_DOUBLE_EQ(snapshot.network_bytes_per_second, 200.0);
+    EXPECT_DOUBLE_EQ(snapshot.disk_bytes_per_second, 80.0);
+}
+
+TEST(TelemetrySessionTest, OutOfOrderDeltaKeepsExistingTimeRule) {
+    TelemetrySession session;
+    const auto start = TelemetryClock::time_point{std::chrono::seconds(1)};
+
+    session.record_task_started(start);
+    session.record_download_delta_at(
+        100U,
+        start + std::chrono::seconds(2));
+    session.record_download_delta_at(
+        200U,
+        start + std::chrono::seconds(1));
+    EXPECT_DOUBLE_EQ(
+        session.current_snapshot().network_bytes_per_second,
+        0.0);
+
+    session.record_download_delta_at(
+        100U,
+        start + std::chrono::seconds(2));
+    const auto snapshot = session.current_snapshot();
+    EXPECT_DOUBLE_EQ(snapshot.network_bytes_per_second, 100.0);
+    EXPECT_EQ(snapshot.downloaded_bytes, 400);
+}
+
+TEST(TelemetrySessionTest, DeterministicVariantsUseSuppliedEventTimes) {
+    TelemetrySession session;
+    const auto start = TelemetryClock::time_point{std::chrono::seconds(1)};
+
+    session.record_task_started(start);
+    session.record_download_delta_at(
+        300U,
+        start + std::chrono::seconds(1));
+    session.record_persist_delta_at(
+        100U,
+        start + std::chrono::seconds(2));
+    session.record_pause_at(
+        TelemetryPauseReason::memory_pressure,
+        false,
+        start + std::chrono::seconds(3));
+    session.record_memory_sample_at(
+        2048U,
+        start + std::chrono::seconds(4));
+    session.record_task_completed(start + std::chrono::seconds(2));
+
+    const auto summary =
+        session.final_summary(start + std::chrono::seconds(100));
+    EXPECT_DOUBLE_EQ(summary.average_network_bytes_per_second, 75.0);
+    EXPECT_DOUBLE_EQ(summary.average_disk_bytes_per_second, 25.0);
+    EXPECT_EQ(summary.total_pause_count, 1U);
+    EXPECT_EQ(summary.max_memory_bytes, 2048U);
+}
+
 }

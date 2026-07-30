@@ -27,6 +27,23 @@ using SessionPauseMember =
     void (TelemetrySession::*)(TelemetryPauseReason, bool) noexcept;
 using SessionMemoryMember =
     void (TelemetrySession::*)(std::uint64_t) noexcept;
+using SessionDownloadAtMember =
+    void (TelemetrySession::*)(
+        std::uint64_t,
+        TelemetryClock::time_point) noexcept;
+using SessionPersistAtMember =
+    void (TelemetrySession::*)(
+        std::uint64_t,
+        TelemetryClock::time_point) noexcept;
+using SessionPauseAtMember =
+    void (TelemetrySession::*)(
+        TelemetryPauseReason,
+        bool,
+        TelemetryClock::time_point) noexcept;
+using SessionMemoryAtMember =
+    void (TelemetrySession::*)(
+        std::uint64_t,
+        TelemetryClock::time_point) noexcept;
 using SessionCompletedMember =
     void (TelemetrySession::*)(TelemetryClock::time_point) noexcept;
 using SessionSnapshotMember =
@@ -88,6 +105,22 @@ static_assert(std::is_same_v<
     decltype(static_cast<SessionMemoryMember>(
         &TelemetrySession::record_memory_sample)),
     SessionMemoryMember>);
+static_assert(std::is_same_v<
+    decltype(static_cast<SessionDownloadAtMember>(
+        &TelemetrySession::record_download_delta_at)),
+    SessionDownloadAtMember>);
+static_assert(std::is_same_v<
+    decltype(static_cast<SessionPersistAtMember>(
+        &TelemetrySession::record_persist_delta_at)),
+    SessionPersistAtMember>);
+static_assert(std::is_same_v<
+    decltype(static_cast<SessionPauseAtMember>(
+        &TelemetrySession::record_pause_at)),
+    SessionPauseAtMember>);
+static_assert(std::is_same_v<
+    decltype(static_cast<SessionMemoryAtMember>(
+        &TelemetrySession::record_memory_sample_at)),
+    SessionMemoryAtMember>);
 static_assert(std::is_same_v<
     decltype(static_cast<SessionCompletedMember>(
         &TelemetrySession::record_task_completed)),
@@ -154,8 +187,14 @@ static_assert(
 TEST(TelemetryPublicCompatibilityTest, DefaultConstructsBothPublicClasses) {
     TelemetrySession session;
     TelemetryCollector collector;
+    const auto timestamp = TelemetryClock::time_point{};
 
-    EXPECT_EQ(session.final_summary().total_pause_count, 0U);
+    session.record_task_started(timestamp);
+    session.record_download_delta_at(1U, timestamp);
+    session.record_persist_delta_at(1U, timestamp);
+    session.record_pause_at(TelemetryPauseReason::gap, false, timestamp);
+    session.record_memory_sample_at(1U, timestamp);
+    EXPECT_EQ(session.final_summary().total_pause_count, 1U);
     EXPECT_EQ(collector.final_summary().total_pause_count, 0U);
 }
 
