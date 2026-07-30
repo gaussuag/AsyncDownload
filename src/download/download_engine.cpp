@@ -2,7 +2,6 @@
 
 #include "asyncdownload/error.hpp"
 #include "core/block_bitmap.hpp"
-#include "core/crc32.hpp"
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
 #include "download/download_policy.hpp"
@@ -12,6 +11,7 @@
 #include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "range/range_lifecycle.hpp"
+#include "recovery/recovery_checkpoint.hpp"
 #include "storage/file_writer.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
@@ -22,7 +22,6 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
 #include <limits>
 #include <new>
 #include <optional>
@@ -184,60 +183,6 @@ void record_first_network_byte(core::SessionState& session,
     return {};
 }
 
-[[nodiscard]] bool metadata_matches(const core::MetadataState& state,
-                                    const std::string& url,
-                                    const RecoveryIdentityPolicy& policy,
-                                    const core::RemoteProbeResult& probe,
-                                    const core::SessionPaths& paths) noexcept {
-    // 恢复条件必须同时满足“本地任务身份一致”和“远端资源身份一致”。
-    // 只要 URL、路径、总大小、对齐参数、ETag、Last-Modified 有冲突，就宁可重下，
-    // 也不冒险把旧状态接到新资源上。
-    if (state.url != url ||
-        state.output_path != paths.output_path ||
-        state.temporary_path != paths.temporary_path ||
-        state.total_size != probe.total_size) {
-        return false;
-    }
-
-    if (state.block_size != policy.block_bytes ||
-        state.io_alignment != policy.io_alignment_bytes) {
-        return false;
-    }
-
-    if (!probe.etag.empty() && !state.etag.empty() && probe.etag != state.etag) {
-        return false;
-    }
-
-    if (!probe.last_modified.empty() &&
-        !state.last_modified.empty() &&
-        probe.last_modified != state.last_modified) {
-        return false;
-    }
-
-    return true;
-}
-
-[[nodiscard]] bool metadata_proves_complete(
-    const core::MetadataState& state,
-    const RecoveryIdentityPolicy& policy) noexcept {
-    if (state.total_size <= 0 ||
-        state.vdl_offset < state.total_size) {
-        return false;
-    }
-
-    const auto expected_blocks = core::required_block_count(
-        state.total_size,
-        policy.block_bytes);
-    return state.bitmap_states.size() == expected_blocks &&
-        std::all_of(
-            state.bitmap_states.begin(),
-            state.bitmap_states.end(),
-            [](const std::uint8_t value) {
-                return value ==
-                    static_cast<std::uint8_t>(core::BlockState::finished);
-            });
-}
-
 [[nodiscard]] std::int64_t sum_finished_bytes(const core::AtomicBlockBitmap& bitmap,
                                               const std::size_t block_size,
                                               const std::int64_t total_size) noexcept {
@@ -256,25 +201,6 @@ void record_first_network_byte(core::SessionState& session,
     }
 
     return total;
-}
-
-void rebuild_bitmap_from_snapshots(core::AtomicBlockBitmap& bitmap,
-                                   const std::vector<core::RangeStateSnapshot>& ranges,
-                                   const std::size_t block_size,
-                                   const std::int64_t total_size) noexcept {
-    // metadata 里的 range 快照记录了各个 range 已经推进到哪里。
-    // 恢复时把这些 persisted_offset 再投影回 bitmap，可以补齐仅靠旧 bitmap 快照
-    // 还未完全表达出来的 finished 区域。
-    for (const auto& range : ranges) {
-        if (range.persisted_offset <= range.start_offset) {
-            continue;
-        }
-
-        bitmap.mark_finished_range(range.start_offset,
-            range.persisted_offset,
-            block_size,
-            total_size);
-    }
 }
 
 void rebuild_bitmap_from_ranges(
@@ -432,46 +358,6 @@ void rebuild_bitmap_from_ranges(
                 DownloadErrc::internal_error);
         }
     }
-}
-
-[[nodiscard]] std::error_code validate_resumed_blocks(const core::MetadataState& state,
-                                                      storage::FileWriter& file_writer,
-                                                      core::AtomicBlockBitmap& bitmap) noexcept {
-    const auto block_size = static_cast<std::int64_t>(state.block_size);
-
-    // 恢复时只复查 VDL 之后的 finished block：
-    // VDL 之前已经由“最长连续安全前沿”兜底；VDL 之后则必须依赖 CRC 样本确认。
-    for (std::size_t index = 0; index < bitmap.block_count(); ++index) {
-        if (bitmap.load(index) != core::BlockState::finished) {
-            continue;
-        }
-
-        const auto offset = static_cast<std::int64_t>(index) * block_size;
-        if (offset < state.vdl_offset) {
-            continue;
-        }
-
-        const auto sample_it = std::find_if(state.crc_samples.begin(), state.crc_samples.end(),
-            [offset](const core::BlockCrcSample& sample) {
-                return sample.offset == offset;
-            });
-        if (sample_it == state.crc_samples.end()) {
-            bitmap.store(index, core::BlockState::empty);
-            continue;
-        }
-
-        std::vector<std::byte> bytes;
-        const auto read_error = file_writer.read(offset, sample_it->length, bytes);
-        if (read_error) {
-            return read_error;
-        }
-
-        if (core::crc32(bytes) != sample_it->crc32) {
-            bitmap.store(index, core::BlockState::empty);
-        }
-    }
-
-    return {};
 }
 
 [[nodiscard]] std::error_code publish_range_complete(
@@ -1055,87 +941,54 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.task_started_at = run_started;
         session.telemetry_session_.record_task_started(run_started);
 
-        metadata::MetadataStore metadata_store(session.paths.metadata_path);
-        storage::FileWriter file_writer;
-
-        // 先读历史 metadata，再结合远端 probe 结果判断这次到底是恢复下载还是重新开始。
-        const auto [metadata_error, loaded_metadata] = metadata_store.load();
-        if (metadata_error) {
-            result.error = metadata_error;
-            result.performance = build_performance_summary(session, Clock::now());
+        recovery::RecoveryOpenRequest recovery_request{};
+        recovery_request.paths = session.paths;
+        recovery_request.remote.url = request.url;
+        recovery_request.remote.total_size =
+            probe_result.total_size;
+        recovery_request.remote.accept_ranges =
+            probe_result.accept_ranges;
+        recovery_request.remote.etag =
+            probe_result.etag;
+        recovery_request.remote.last_modified =
+            probe_result.last_modified;
+        recovery_request.policy =
+            session.effective_policy.recovery_identity();
+        recovery_request.overwrite_existing =
+            session.effective_policy.persistence().
+                overwrite_existing;
+        auto recovery_open =
+            recovery::RecoveryCheckpoint::open(
+                recovery_request);
+        if (recovery_open.error ||
+            recovery_open.checkpoint == nullptr) {
+            result.error = recovery_open.error ?
+                recovery_open.error :
+                make_error_code(
+                    DownloadErrc::internal_error);
+            result.performance =
+                build_performance_summary(
+                    session,
+                    Clock::now());
             return result;
         }
-
-        const auto temp_exists =
-            std::filesystem::exists(session.paths.temporary_path);
-        auto can_resume = false;
-        if (temp_exists &&
-            loaded_metadata.has_value() &&
-            metadata_matches(
-                *loaded_metadata,
-                request.url,
-                session.effective_policy.recovery_identity(),
-                probe_result,
-                session.paths)) {
-            can_resume =
-                session.effective_policy.recovery_identity().
-                    allow_sparse_resume ||
-                metadata_proves_complete(
-                    *loaded_metadata,
-                    session.effective_policy.recovery_identity());
-        }
-
-        // FileWriter 总是绑定到 .part 文件；若可以恢复则保留现有临时文件，
-        // 否则按新任务语义重新打开并预分配。
-        auto open_error = file_writer.open(session.paths.temporary_path,
-            session.total_size,
-            can_resume,
-            session.effective_policy.persistence().overwrite_existing);
-        if (open_error) {
-            result.error = open_error;
-            result.performance = build_performance_summary(session, Clock::now());
-            return result;
-        }
-
-        core::AtomicBlockBitmap bitmap(core::required_block_count(session.total_size,
-            session.effective_policy.persistence().block_bytes));
-        if (can_resume) {
-            // 恢复路径的关键目标不是“完全信任旧状态”，而是先把旧状态还原成一个
-            // 可验证的候选快照，再用 VDL 和 CRC 把不可信部分剔掉。
-            bitmap.restore(loaded_metadata->bitmap_states);
-            // DOWNLOADING 代表上次进程退出时还没形成可恢复的稳定状态，重启后必须
-            // 先回到 EMPTY，再结合 VDL/CRC 重新判断哪些块可信。
-            bitmap.reset_transient_states();
-            rebuild_bitmap_from_snapshots(bitmap,
-                loaded_metadata->ranges,
-                session.effective_policy.persistence().block_bytes,
-                session.total_size);
-            const auto validation_error = validate_resumed_blocks(*loaded_metadata,
-                file_writer,
-                bitmap);
-            if (validation_error) {
-                result.error = validation_error;
-                file_writer.close();
-                result.performance = build_performance_summary(session, Clock::now());
-                return result;
-            }
-
-            session.resumed = true;
-        } else {
-            // 如果不能恢复，就把旧 metadata 清掉，避免后面把一个全新的下载任务
-            // 和历史状态混在一起。
-            const auto remove_metadata_error = metadata_store.remove();
-            static_cast<void>(remove_metadata_error);
-        }
-
-        // 这里把“已经确认安全存在于磁盘上的字节数”重新投影回 SessionState，
-        // 这样进度回调、背压显示和最终结果都会从正确的恢复点继续。
-        const auto finished_bytes = sum_finished_bytes(bitmap,
-            session.effective_policy.persistence().block_bytes,
-            session.total_size);
-        const auto safe_vdl = bitmap.contiguous_finished_bytes(
-            session.effective_policy.persistence().block_bytes,
-            session.total_size);
+        auto recovery_checkpoint =
+            std::move(recovery_open.checkpoint);
+        auto& file_writer =
+            recovery_checkpoint->legacy_file_writer();
+        auto& metadata_store =
+            recovery_checkpoint->legacy_metadata_store();
+        core::AtomicBlockBitmap bitmap(
+            recovery_open.restored.bitmap_states.size());
+        bitmap.restore(
+            recovery_open.restored.bitmap_states);
+        session.resumed =
+            recovery_open.restored.disposition !=
+            recovery::RecoveryDisposition::fresh;
+        const auto finished_bytes =
+            recovery_open.restored.trusted_bytes;
+        const auto safe_vdl =
+            recovery_open.restored.safe_vdl;
         session.recovery_initial_trusted_bytes = finished_bytes;
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
@@ -1155,7 +1008,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.total_bytes = session.total_size;
             result.downloaded_bytes = finished_bytes;
             result.persisted_bytes = finished_bytes;
-            result.completed_ranges = bitmap.block_count();
+            result.completed_ranges =
+                recovery_open.restored.completed_ranges;
             result.resumed = session.resumed;
             session.telemetry_session_.record_task_completed(Clock::now());
             result.performance = build_performance_summary(session, Clock::now());

@@ -1,16 +1,21 @@
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include "asyncdownload/error.hpp"
+#include "core/crc32.hpp"
 #include "download/download_policy.hpp"
+#include "metadata/metadata_store.hpp"
 #include "recovery/metadata_codec.hpp"
 #include "recovery/recovery_checkpoint.hpp"
 
@@ -69,6 +74,67 @@ RecoveryOpenRequest fresh_request(
     request.policy.allow_sparse_resume = true;
     request.overwrite_existing = true;
     return request;
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+part_contents() {
+    std::vector<std::uint8_t> bytes(8192);
+    for (std::size_t index = 0;
+         index < bytes.size();
+         ++index) {
+        bytes[index] = static_cast<std::uint8_t>(
+            index % 251);
+    }
+    return bytes;
+}
+
+void write_part(
+    const std::filesystem::path& path,
+    const std::vector<std::uint8_t>& bytes) {
+    std::ofstream stream(
+        path,
+        std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.is_open());
+    stream.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    stream.close();
+    ASSERT_TRUE(stream.good());
+}
+
+[[nodiscard]] asyncdownload::core::MetadataState
+candidate_state(
+    const asyncdownload::recovery::
+        RecoveryOpenRequest& request) {
+    asyncdownload::core::MetadataState state{};
+    state.url = request.remote.url;
+    state.output_path = request.paths.output_path;
+    state.temporary_path =
+        request.paths.temporary_path;
+    state.total_size = request.remote.total_size;
+    state.vdl_offset = 4096;
+    state.accept_ranges =
+        request.remote.accept_ranges;
+    state.resumed = true;
+    state.etag = request.remote.etag;
+    state.last_modified =
+        request.remote.last_modified;
+    state.block_size = request.policy.block_bytes;
+    state.io_alignment =
+        request.policy.io_alignment_bytes;
+    state.bitmap_states = {2, 0};
+    return state;
+}
+
+void save_candidate(
+    const asyncdownload::recovery::
+        RecoveryOpenRequest& request,
+    const asyncdownload::core::MetadataState& state,
+    const std::vector<std::uint8_t>& bytes) {
+    write_part(request.paths.temporary_path, bytes);
+    asyncdownload::metadata::MetadataStore store(
+        request.paths.metadata_path);
+    ASSERT_FALSE(store.save(state));
 }
 
 }
@@ -207,4 +273,312 @@ TEST(
         reinterpret_cast<char*>(actual.data()),
         static_cast<std::streamsize>(actual.size()));
     EXPECT_EQ(actual, payload);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    RestoresShortBitmapAndResetsDownloading) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_short_bitmap");
+    auto request = fresh_request(temp.path());
+    request.remote.etag = "remote-etag";
+    request.remote.last_modified = "remote-date";
+    auto state = candidate_state(request);
+    state.etag.clear();
+    state.last_modified.clear();
+    state.accept_ranges = false;
+    state.resumed = false;
+    state.bitmap_states = {1};
+    state.vdl_offset = 0;
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.disposition,
+        asyncdownload::recovery::
+            RecoveryDisposition::resumed);
+    EXPECT_EQ(
+        opened.restored.bitmap_states,
+        (std::vector<std::uint8_t>{0, 0}));
+    EXPECT_EQ(opened.restored.trusted_bytes, 0);
+    EXPECT_EQ(opened.restored.safe_vdl, 0);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    RequiresExactCoreIdentityAndRejectsConflicts) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_identity_matrix");
+    constexpr std::array<std::string_view, 8>
+        cases{
+            "url",
+            "output",
+            "temporary",
+            "size",
+            "block",
+            "alignment",
+            "etag",
+            "last_modified"
+        };
+
+    for (std::size_t index = 0;
+         index < cases.size();
+         ++index) {
+        SCOPED_TRACE(cases[index]);
+        const auto root =
+            temp.path() /
+            std::string(cases[index]);
+        std::error_code ec;
+        std::filesystem::create_directories(root, ec);
+        ASSERT_FALSE(ec);
+        auto request = fresh_request(root);
+        auto state = candidate_state(request);
+        switch (index) {
+        case 0:
+            state.url =
+                "https://example.com/other.bin";
+            break;
+        case 1:
+            state.output_path =
+                root / "other.bin";
+            break;
+        case 2:
+            state.temporary_path =
+                root / "other.bin.part";
+            break;
+        case 3:
+            state.total_size = 4096;
+            break;
+        case 4:
+            state.block_size = 2048;
+            break;
+        case 5:
+            state.io_alignment = 2048;
+            break;
+        case 6:
+            request.remote.etag = "remote-etag";
+            state.etag = "other-etag";
+            break;
+        case 7:
+            request.remote.last_modified =
+                "remote-date";
+            state.last_modified = "other-date";
+            break;
+        default:
+            FAIL();
+        }
+        save_candidate(
+            request,
+            state,
+            part_contents());
+
+        auto opened =
+            asyncdownload::recovery::
+                RecoveryCheckpoint::open(request);
+
+        ASSERT_FALSE(opened.error);
+        ASSERT_NE(opened.checkpoint, nullptr);
+        EXPECT_EQ(
+            opened.restored.disposition,
+            asyncdownload::recovery::
+                RecoveryDisposition::fresh);
+    }
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    ProjectsLegacyPersistedOffsetsWithoutStatus) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_projection");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {0};
+    state.vdl_offset = 4096;
+    state.ranges.push_back({
+        3,
+        0,
+        8191,
+        8192,
+        4096,
+        4
+    });
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.bitmap_states,
+        (std::vector<std::uint8_t>{2, 0}));
+    EXPECT_EQ(opened.restored.trusted_bytes, 4096);
+    EXPECT_EQ(opened.restored.safe_vdl, 4096);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    MissingCrcBeyondVdlRollsBackOnlyThatBlock) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_missing_crc");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 2};
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.bitmap_states,
+        (std::vector<std::uint8_t>{2, 0}));
+    EXPECT_EQ(opened.restored.trusted_bytes, 4096);
+    EXPECT_EQ(opened.restored.safe_vdl, 4096);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    MismatchedCrcBeyondVdlRollsBackOnlyThatBlock) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_bad_crc");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 2};
+    state.crc_samples.push_back({
+        4096,
+        0,
+        4096
+    });
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.bitmap_states,
+        (std::vector<std::uint8_t>{2, 0}));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    ValidCrcCanProduceCompleteCheckpoint) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_valid_crc");
+    const auto request = fresh_request(temp.path());
+    const auto bytes = part_contents();
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 2};
+    const auto tail = std::span<const std::uint8_t>(
+        bytes.data() + 4096,
+        4096);
+    state.crc_samples.push_back({
+        4096,
+        asyncdownload::core::crc32(
+            std::as_bytes(tail)),
+        4096
+    });
+    save_candidate(request, state, bytes);
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.disposition,
+        asyncdownload::recovery::
+            RecoveryDisposition::complete);
+    EXPECT_EQ(
+        opened.restored.bitmap_states,
+        (std::vector<std::uint8_t>{2, 2}));
+    EXPECT_EQ(opened.restored.trusted_bytes, 8192);
+    EXPECT_EQ(opened.restored.safe_vdl, 8192);
+    EXPECT_EQ(opened.restored.completed_ranges, 2U);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    ConflictingIdentityRestartsFresh) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_identity");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.url = "https://example.com/other.bin";
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.disposition,
+        asyncdownload::recovery::
+            RecoveryDisposition::fresh);
+    EXPECT_EQ(opened.restored.trusted_bytes, 0);
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.metadata_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    CrcReadFailurePreservesCandidateArtifacts) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_crc_read");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 2};
+    state.crc_samples.push_back({
+        4096,
+        0,
+        8192
+    });
+    save_candidate(
+        request,
+        state,
+        part_contents());
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    EXPECT_EQ(
+        opened.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                file_read_failed));
+    EXPECT_EQ(opened.checkpoint, nullptr);
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.temporary_path));
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.metadata_path));
 }
