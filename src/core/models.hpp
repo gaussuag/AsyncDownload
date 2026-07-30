@@ -15,6 +15,8 @@
 
 namespace asyncdownload::core {
 
+inline constexpr std::size_t TAIL_BUFFER_CAPACITY_BYTES = 4096;
+
 enum class PacketKind : std::uint8_t {
     // 真正的下载数据包。
     data = 0,
@@ -62,7 +64,7 @@ struct DataPacket {
 struct TailBuffer {
     // Persistence 线程只会把完整对齐块直接写盘，不满 4KB 的尾巴先暂存在这里，
     // 等后续数据补齐或 range 结束时再一起刷到磁盘。
-    std::array<std::uint8_t, 4096> data{};
+    std::array<std::uint8_t, TAIL_BUFFER_CAPACITY_BYTES> data{};
     std::size_t length = 0;
     std::int64_t offset = 0;
 };
