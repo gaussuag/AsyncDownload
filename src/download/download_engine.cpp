@@ -5,9 +5,9 @@
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
 #include "download/download_policy.hpp"
-#include "download/http_probe.hpp"
 #include "download/range_scheduler.hpp"
 #include "flow/packet_flow.hpp"
+#include "http/http_transfer.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "range/range_lifecycle.hpp"
 #include "recovery/recovery_checkpoint.hpp"
@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
@@ -70,21 +71,6 @@ struct TransferHandle {
     CURLcode curl_result = CURLE_OK;
     std::error_code packet_error;
     Clock::time_point request_started{};
-};
-
-class CurlGlobal {
-public:
-    CurlGlobal() noexcept {
-        static const auto init_result = curl_global_init(CURL_GLOBAL_DEFAULT);
-        initialized_ = init_result == CURLE_OK;
-    }
-
-    [[nodiscard]] bool ok() const noexcept {
-        return initialized_;
-    }
-
-private:
-    bool initialized_ = false;
 };
 
 void record_first_network_byte(core::SessionState& session,
@@ -871,27 +857,37 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         const auto run_started = Clock::now();
-        // libcurl 的全局初始化只需要做一次，但这里仍通过轻量 RAII 包装保证
-        // 当前进程在真正进入下载主链前已经具备可工作的网络环境。
-        CurlGlobal curl_global;
-        if (!curl_global.ok()) {
-            result.error = make_error_code(DownloadErrc::http_init_failed);
+        std::unique_ptr<http::HttpTransferPort>
+            http_transfer_port;
+        const auto http_port_error =
+            http::create_curl_http_transfer_port(
+                http_transfer_port);
+        if (http_port_error ||
+            http_transfer_port == nullptr) {
+            result.error = http_port_error
+                ? http_port_error
+                : make_error_code(
+                    DownloadErrc::http_init_failed);
             return result;
         }
 
-        // 先做远端探测，拿到文件大小、Range 能力、ETag、Last-Modified。
-        // 后面的恢复判定、分片调度和完整性校验都依赖这一步的结果。
-        HttpProbe probe;
-        const auto probe_result = probe.probe(request.url);
-        if (probe_result.error) {
-            result.error = probe_result.error;
+        const auto probe_result =
+            http_transfer_port->probe(
+                {request.url});
+        if (!probe_result.ok()) {
+            result.error = probe_result.failure.error
+                ? probe_result.failure.error
+                : make_error_code(
+                    DownloadErrc::http_probe_failed);
             return result;
         }
+        const auto& remote_facts =
+            *probe_result.facts;
         const auto effective_policy_result = bind_remote_facts(
             *validated_policy.value,
             RemoteObjectFacts{
-                probe_result.total_size,
-                probe_result.accept_ranges
+                remote_facts.total_size,
+                remote_facts.accept_ranges
             });
         if (!effective_policy_result.ok()) {
             result.error = effective_policy_result.failure.error;
@@ -903,8 +899,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.paths.temporary_path = core::make_temporary_path(request.output_path);
         session.paths.metadata_path = core::make_metadata_path(request.output_path);
         session.url = request.url;
-        session.etag = probe_result.etag;
-        session.last_modified = probe_result.last_modified;
+        session.etag = remote_facts.etag;
+        session.last_modified =
+            remote_facts.last_modified;
         session.progress_callback = request.progress_callback;
         session.task_started_at = run_started;
         session.telemetry_session_.record_task_started(run_started);
@@ -913,13 +910,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         recovery_request.paths = session.paths;
         recovery_request.remote.url = request.url;
         recovery_request.remote.total_size =
-            probe_result.total_size;
+            remote_facts.total_size;
         recovery_request.remote.accept_ranges =
-            probe_result.accept_ranges;
+            remote_facts.accept_ranges;
         recovery_request.remote.etag =
-            probe_result.etag;
+            remote_facts.etag;
         recovery_request.remote.last_modified =
-            probe_result.last_modified;
+            remote_facts.last_modified;
         recovery_request.policy =
             session.effective_policy.recovery_identity();
         recovery_request.overwrite_existing =
