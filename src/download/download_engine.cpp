@@ -388,7 +388,7 @@ void mark_range_status(core::RangeContext& range, const core::RangeStatus status
                                      const TransferHandle& transfer) noexcept {
     // Range 模式下，除非这个请求覆盖整个文件，否则必须看到 206。
     // 否则服务端可能忽略了 Range 头，继续下载会把数据布局全部打乱。
-    if (session.accept_ranges) {
+    if (session.effective_policy.scheduling().issue_range_requests) {
         if (transfer.request_start == 0 && transfer.request_end >= session.total_size - 1) {
             return transfer.response_code == 200 || transfer.response_code == 206;
         }
@@ -624,7 +624,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     curl_easy_setopt(transfer.easy, CURLOPT_FORBID_REUSE, 1L);
     curl_easy_setopt(transfer.easy, CURLOPT_PIPEWAIT, 0L);
 
-    if (session.accept_ranges) {
+    if (session.effective_policy.scheduling().issue_range_requests) {
         transfer.range_header = std::to_string(transfer.request_start) + "-" +
             std::to_string(transfer.request_end);
         curl_easy_setopt(transfer.easy, CURLOPT_RANGE, transfer.range_header.c_str());
@@ -892,12 +892,14 @@ std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
                                        metadata::MetadataStore& metadata_store,
                                        const core::SessionState& session,
                                        const core::AtomicBlockBitmap& bitmap,
-                                       const bool overwrite_existing,
                                        std::error_code failure) noexcept {
-    const auto completed_bytes = bitmap.contiguous_finished_bytes(session.options.block_size,
+    const auto completed_bytes = bitmap.contiguous_finished_bytes(
+        session.effective_policy.persistence().block_bytes,
         session.total_size);
     if (!failure && completed_bytes >= session.total_size) {
-        auto finalize_error = file_writer.finalize(session.paths.output_path, overwrite_existing);
+        auto finalize_error = file_writer.finalize(
+            session.paths.output_path,
+            session.effective_policy.persistence().overwrite_existing);
         if (finalize_error) {
             return finalize_error;
         }
@@ -968,18 +970,14 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.error = effective_policy_result.failure.error;
             return result;
         }
-        const auto& effective_policy = *effective_policy_result.value;
-
-        core::SessionState session{};
+        core::SessionState session(
+            std::move(*effective_policy_result.value));
         session.paths.output_path = request.output_path;
         session.paths.temporary_path = core::make_temporary_path(request.output_path);
         session.paths.metadata_path = core::make_metadata_path(request.output_path);
         session.url = request.url;
         session.etag = probe_result.etag;
         session.last_modified = probe_result.last_modified;
-        session.options = effective_policy.raw_options();
-        session.total_size = effective_policy.remote_facts().total_size;
-        session.accept_ranges = effective_policy.remote_facts().accept_ranges;
         session.progress_callback = request.progress_callback;
         session.task_started_at = run_started;
         session.telemetry_session_.record_task_started(run_started);
@@ -1003,14 +1001,15 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             metadata_matches(
                 *loaded_metadata,
                 request.url,
-                effective_policy.recovery_identity(),
+                session.effective_policy.recovery_identity(),
                 probe_result,
                 session.paths)) {
             can_resume =
-                effective_policy.recovery_identity().allow_sparse_resume ||
+                session.effective_policy.recovery_identity().
+                    allow_sparse_resume ||
                 metadata_proves_complete(
                     *loaded_metadata,
-                    effective_policy.recovery_identity());
+                    session.effective_policy.recovery_identity());
         }
 
         // FileWriter 总是绑定到 .part 文件；若可以恢复则保留现有临时文件，
@@ -1018,7 +1017,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         auto open_error = file_writer.open(session.paths.temporary_path,
             session.total_size,
             can_resume,
-            request.options.overwrite_existing);
+            session.effective_policy.persistence().overwrite_existing);
         if (open_error) {
             result.error = open_error;
             result.performance = build_performance_summary(session, Clock::now());
@@ -1026,7 +1025,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         core::AtomicBlockBitmap bitmap(core::required_block_count(session.total_size,
-            session.options.block_size));
+            session.effective_policy.persistence().block_bytes));
         if (can_resume) {
             // 恢复路径的关键目标不是“完全信任旧状态”，而是先把旧状态还原成一个
             // 可验证的候选快照，再用 VDL 和 CRC 把不可信部分剔掉。
@@ -1036,7 +1035,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             bitmap.reset_transient_states();
             rebuild_bitmap_from_snapshots(bitmap,
                 loaded_metadata->ranges,
-                session.options.block_size,
+                session.effective_policy.persistence().block_bytes,
                 session.total_size);
             const auto validation_error = validate_resumed_blocks(*loaded_metadata,
                 file_writer,
@@ -1059,9 +1058,10 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         // 这里把“已经确认安全存在于磁盘上的字节数”重新投影回 SessionState，
         // 这样进度回调、背压显示和最终结果都会从正确的恢复点继续。
         const auto finished_bytes = sum_finished_bytes(bitmap,
-            session.options.block_size,
+            session.effective_policy.persistence().block_bytes,
             session.total_size);
-        const auto safe_vdl = bitmap.contiguous_finished_bytes(session.options.block_size,
+        const auto safe_vdl = bitmap.contiguous_finished_bytes(
+            session.effective_policy.persistence().block_bytes,
             session.total_size);
         session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
@@ -1071,7 +1071,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             // 恢复后如果发现整个文件其实已经完整可靠，就直接 finalize，
             // 不再走任何网络或持久化线程。
             auto finalize_error = file_writer.finalize(session.paths.output_path,
-                request.options.overwrite_existing);
+                session.effective_policy.persistence().overwrite_existing);
             if (finalize_error) {
                 result.error = finalize_error;
                 return result;
@@ -1092,7 +1092,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         // 调度器基于当前 bitmap 生成“还需要下载哪些区间”。
         // 对全新任务来说是整文件切片；对恢复任务来说则只会覆盖未完成区域。
         RangeScheduler scheduler(
-            effective_policy.scheduling(),
+            session.effective_policy.scheduling(),
             session.total_size);
         auto ranges = scheduler.build_initial_ranges(bitmap);
         std::deque<core::RangeContext*> pending_ranges;
@@ -1105,13 +1105,14 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         constexpr std::size_t kQueueExplicitProducers = 1;
         constexpr std::size_t kQueueImplicitProducers = 1;
         DataQueue data_queue(
-            effective_policy.flow_control().packet_budget,
+            session.effective_policy.flow_control().packet_budget,
             kQueueExplicitProducers,
             kQueueImplicitProducers);
         DataQueue::producer_token_t network_queue_producer(data_queue);
-        BS::thread_pool<> workers(effective_policy.scheduling().connection_limit);
+        BS::thread_pool<> workers(
+            session.effective_policy.scheduling().connection_limit);
         persistence::PersistenceThread persistence(session,
-            effective_policy.persistence(),
+            session.effective_policy.persistence(),
             data_queue,
             bitmap,
             file_writer,
@@ -1135,18 +1136,20 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-            static_cast<long>(effective_policy.scheduling().connection_limit));
+            static_cast<long>(
+                session.effective_policy.scheduling().connection_limit));
         curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-            static_cast<long>(effective_policy.scheduling().connection_limit));
+            static_cast<long>(
+                session.effective_policy.scheduling().connection_limit));
 
         std::vector<TransferHandle> handles(
-            effective_policy.scheduling().connection_limit);
+            session.effective_policy.scheduling().connection_limit);
         std::error_code failure;
         for (auto& handle : handles) {
             handle.session = &session;
             handle.data_queue = &data_queue;
             handle.data_queue_producer = &network_queue_producer;
-            handle.flow_control = effective_policy.flow_control();
+            handle.flow_control = session.effective_policy.flow_control();
             handle.easy = curl_easy_init();
             if (handle.easy == nullptr) {
                 failure = make_error_code(DownloadErrc::http_init_failed);
@@ -1221,10 +1224,10 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             apply_gap_pauses(handles);
             apply_memory_backpressure(
                 handles,
-                effective_policy.flow_control());
+                session.effective_policy.flow_control());
             resume_paused_transfers(
                 handles,
-                effective_policy.flow_control());
+                session.effective_policy.flow_control());
 
             int running_handles = 0;
             const auto perform_status = curl_multi_perform(multi, &running_handles);
@@ -1307,7 +1310,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         // 重建，可以把最终结果对齐到落盘状态。
         rebuild_bitmap_from_ranges(bitmap,
             ranges,
-            session.options.block_size,
+            session.effective_policy.persistence().block_bytes,
             session.total_size);
 
         invoke_progress(session, ranges, handles);
@@ -1317,7 +1320,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             metadata_store,
             session,
             bitmap,
-            request.options.overwrite_existing,
             failure);
 
         // DownloadResult 主要面向调用方总结最终状态，因此在这里统一从 session 和
@@ -1326,7 +1328,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.total_bytes = session.total_size;
         result.downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
         result.persisted_bytes = sum_finished_bytes(bitmap,
-            session.options.block_size,
+            session.effective_policy.persistence().block_bytes,
             session.total_size);
         result.completed_ranges = static_cast<std::size_t>(std::count_if(ranges.begin(),
             ranges.end(),

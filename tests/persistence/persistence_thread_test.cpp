@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <thread>
@@ -46,6 +47,32 @@ bool wait_for_condition(const std::function<bool()>& predicate,
     return predicate();
 }
 
+asyncdownload::download::EffectiveDownloadPolicy make_effective_policy(
+    const asyncdownload::download::PersistencePolicy& policy,
+    const std::int64_t total_size) {
+    asyncdownload::DownloadOptions options{};
+    options.block_size = policy.block_bytes;
+    options.io_alignment = policy.io_alignment_bytes;
+    options.max_gap_bytes =
+        static_cast<std::size_t>(policy.max_gap_bytes);
+    options.flush_threshold_bytes = policy.flush_threshold_bytes;
+    options.flush_interval = policy.flush_interval;
+    options.overwrite_existing = policy.overwrite_existing;
+
+    const auto validated =
+        asyncdownload::download::validate_download_options(options);
+    if (!validated.ok()) {
+        std::abort();
+    }
+    auto effective = asyncdownload::download::bind_remote_facts(
+        *validated.value,
+        {total_size, true});
+    if (!effective.ok()) {
+        std::abort();
+    }
+    return std::move(*effective.value);
+}
+
 void persist_single_range_at_tail_capacity(
     const std::filesystem::path& temp_root,
     const std::int64_t total_size) {
@@ -64,13 +91,12 @@ void persist_single_range_at_tail_capacity(
         asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, total_size));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = total_size;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<
@@ -177,13 +203,12 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 12 * 1024));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = 12 * 1024;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
@@ -235,13 +260,12 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 12 * 1024));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = 12 * 1024;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
@@ -296,13 +320,12 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 4096));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = 4096;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
@@ -359,13 +382,12 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 4096));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = 4096;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
@@ -421,13 +443,12 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
 
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 12 * 1024));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.total_size = 12 * 1024;
-    session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);

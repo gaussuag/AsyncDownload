@@ -1,11 +1,32 @@
-#include "core/models.hpp"
+#include <chrono>
+#include <cstdlib>
+#include <utility>
 
 #include <gtest/gtest.h>
 
+#include "download/download_policy.hpp"
+#include "core/models.hpp"
+
 namespace {
 
+asyncdownload::download::EffectiveDownloadPolicy make_effective_policy() {
+    const auto validated =
+        asyncdownload::download::validate_download_options(
+            asyncdownload::DownloadOptions{});
+    if (!validated.ok()) {
+        std::abort();
+    }
+    auto effective = asyncdownload::download::bind_remote_facts(
+        *validated.value,
+        {1, true});
+    if (!effective.ok()) {
+        std::abort();
+    }
+    return std::move(*effective.value);
+}
+
 TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryFromEventStream) {
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(make_effective_policy());
 
     session.telemetry_session_.record_task_started();
     session.telemetry_session_.record_first_byte_received();
@@ -35,7 +56,7 @@ TEST(TelemetryEventEmissionTest, SessionTelemetryProducesSummaryFromEventStream)
 }
 
 TEST(TelemetryEventEmissionTest, SessionTelemetryUsesExplicitTaskTimestampsForAverages) {
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(make_effective_policy());
 
     const auto started_at = asyncdownload::telemetry::TelemetryClock::now();
     const auto first_byte_at = started_at + std::chrono::milliseconds(250);
@@ -55,7 +76,7 @@ TEST(TelemetryEventEmissionTest, SessionTelemetryUsesExplicitTaskTimestampsForAv
 }
 
 TEST(TelemetryEventEmissionTest, SessionTelemetrySnapshotAdvancesFromEvents) {
-    asyncdownload::core::SessionState session{};
+    asyncdownload::core::SessionState session(make_effective_policy());
 
     session.telemetry_session_.record_task_started();
     session.telemetry_session_.record_download_delta(4096U);

@@ -2,6 +2,7 @@
 
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "asyncdownload/types.hpp"
+#include "download/download_policy.hpp"
 
 #include <array>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace asyncdownload::core {
@@ -151,14 +153,18 @@ struct SessionPaths {
 };
 
 struct SessionState {
+    explicit SessionState(
+        download::EffectiveDownloadPolicy policy) noexcept
+        : effective_policy(std::move(policy)),
+          total_size(effective_policy.remote_facts().total_size) {}
+
     // SessionState 是整个下载任务的共享上下文，网络层和持久化层都围绕它协作。
     SessionPaths paths;
     std::string url;
     std::string etag;
     std::string last_modified;
-    DownloadOptions options;
+    download::EffectiveDownloadPolicy effective_policy;
     std::int64_t total_size = 0;
-    bool accept_ranges = false;
     bool resumed = false;
     // downloaded_bytes 统计已从网络接收的数据，persisted_bytes 统计已物理落盘的数据。
     std::atomic<std::int64_t> downloaded_bytes{0};

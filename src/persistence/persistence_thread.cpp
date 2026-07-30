@@ -468,7 +468,8 @@ core::MetadataState PersistenceThread::build_metadata_state() const {
     state.output_path = session_.paths.output_path;
     state.temporary_path = session_.paths.temporary_path;
     state.total_size = session_.total_size;
-    state.accept_ranges = session_.accept_ranges;
+    state.accept_ranges =
+        session_.effective_policy.remote_facts().accept_ranges;
     state.resumed = session_.resumed;
     state.etag = session_.etag;
     state.last_modified = session_.last_modified;
