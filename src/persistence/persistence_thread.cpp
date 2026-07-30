@@ -5,6 +5,7 @@
 #include "core/constants.hpp"
 #include "range/range_fault_adapter.hpp"
 #include "recovery/recovery_checkpoint.hpp"
+#include "recovery/recovery_fault_adapter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -140,7 +141,6 @@ void PersistenceThread::process_loop() {
         if (received.code == flow::PacketReceiveCode::packet) {
             handle_packet(std::move(packet));
         } else if (received.code == flow::PacketReceiveCode::closed) {
-            maybe_schedule_flush(true);
             break;
         } else if (received.code == flow::PacketReceiveCode::failed) {
             set_error(received.error);
@@ -157,6 +157,7 @@ void PersistenceThread::process_loop() {
     // 主循环退出并不代表最后一轮 flush 已经完成，所以这里还要等待挂起中的
     // flush/meta 任务结束，确保退出时磁盘和 metadata 是同一个版本。
     drain_buffered_packets();
+    maybe_schedule_flush(true);
     wait_pending_flush();
 }
 
@@ -790,18 +791,30 @@ void PersistenceThread::update_gap_flag(
 }
 
 void PersistenceThread::maybe_schedule_flush(const bool force) {
+    if (force) {
+        force_checkpoint_pending_ = true;
+    }
     if (error()) {
         return;
     }
 
     if (pending_flush_.valid()) {
-        return;
+        if (pending_flush_.wait_for(
+                std::chrono::milliseconds(0)) !=
+            std::future_status::ready) {
+            return;
+        }
+        const auto result = pending_flush_.get();
+        publish_commit_result(result);
+        if (error()) {
+            return;
+        }
     }
 
     const auto now = std::chrono::steady_clock::now();
     const auto interval_elapsed =
         now - last_flush_time_ >= policy_.flush_interval;
-    if (!force &&
+    if (!force_checkpoint_pending_ &&
         bytes_since_flush_ < policy_.flush_threshold_bytes &&
         !interval_elapsed) {
         return;
@@ -819,20 +832,42 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
                     DownloadErrc::internal_error));
         return;
     }
-    pending_generation_ =
+    const auto generation =
         next_checkpoint_generation_;
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+    if (recovery::detail::recovery_fault_plan().
+            fail_next_checkpoint_submit.exchange(
+                false,
+                std::memory_order_acq_rel)) {
+        set_error(std::make_error_code(
+            std::errc::not_enough_memory));
+        return;
+    }
+#endif
+    try {
+        pending_flush_ = workers_.submit_task(
+            [this, checkpoint =
+                 std::move(prepared.checkpoint)]() mutable {
+                return checkpoint_.commit(
+                    std::move(checkpoint));
+            });
+    } catch (const std::bad_alloc&) {
+        set_error(std::make_error_code(
+            std::errc::not_enough_memory));
+        return;
+    } catch (...) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    pending_generation_ = generation;
     next_checkpoint_generation_ =
-        next_checkpoint_generation_ ==
+        generation ==
                 std::numeric_limits<
                     recovery::CheckpointGeneration>::max() ?
             0 :
-            next_checkpoint_generation_ + 1;
-    pending_flush_ = workers_.submit_task(
-        [this, checkpoint =
-             std::move(prepared.checkpoint)]() mutable {
-            return checkpoint_.commit(
-                std::move(checkpoint));
-        });
+            generation + 1;
+    force_checkpoint_pending_ = false;
     bytes_since_flush_ = 0;
     last_flush_time_ = now;
 }
@@ -851,12 +886,20 @@ void PersistenceThread::poll_pending_flush() {
 }
 
 void PersistenceThread::wait_pending_flush() {
-    if (!pending_flush_.valid()) {
-        return;
+    while (pending_flush_.valid() ||
+           force_checkpoint_pending_) {
+        if (pending_flush_.valid()) {
+            const auto result = pending_flush_.get();
+            publish_commit_result(result);
+            if (error()) {
+                return;
+            }
+        }
+        maybe_schedule_flush(false);
+        if (error()) {
+            return;
+        }
     }
-
-    const auto result = pending_flush_.get();
-    publish_commit_result(result);
 }
 
 std::vector<recovery::RecoveryRangeFact>

@@ -29,12 +29,14 @@
 namespace {
 
 asyncdownload::download::EffectiveDownloadPolicy
-effective_policy(const std::int64_t total_size) {
+effective_policy(
+    const std::int64_t total_size,
+    const std::size_t flush_threshold = 4096) {
     asyncdownload::DownloadOptions options{};
     options.block_size = 4096;
     options.io_alignment = 4096;
     options.max_gap_bytes = 4096;
-    options.flush_threshold_bytes = 4096;
+    options.flush_threshold_bytes = flush_threshold;
     options.flush_interval =
         std::chrono::seconds(60);
     const auto validated =
@@ -798,4 +800,489 @@ TEST_F(
         std::filesystem::path(
             open_request.paths.metadata_path.string() +
             ".tmp")));
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    RangeCompletionDuringPendingCommitCreatesSuccessor) {
+    auto open_request = request();
+    open_request.remote.total_size = 6144;
+    asyncdownload::core::SessionState session(
+        effective_policy(6144));
+    session.paths = open_request.paths;
+    session.url = open_request.remote.url;
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    std::unique_ptr<asyncdownload::flow::PacketFlow>
+        packet_flow;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        session.effective_policy.flow_control(),
+        session.telemetry_session_,
+        packet_flow));
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(
+        packet_flow->producer().open_lane(lane));
+    asyncdownload::core::AtomicBlockBitmap bitmap(2);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread
+        persistence(
+            session,
+            session.effective_policy.persistence(),
+            packet_flow->consumer(),
+            bitmap,
+            *opened.checkpoint,
+            workers,
+            1);
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    ASSERT_FALSE(
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 6144},
+                0,
+                facts.publisher()
+            }).error);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            1,
+            std::memory_order_release);
+    persistence.start();
+    const auto first_accepted =
+        packet_flow->producer().accept(
+            lane,
+            {
+                {{0}, 1},
+                {0, 6144},
+                0,
+                std::vector<std::uint8_t>(
+                    4096,
+                    0x31)
+            });
+    const auto first_flushed =
+        packet_flow->producer().flush(lane);
+    const auto first_barrier = wait_for(
+        [&fault_plan]() {
+            return fault_plan.
+                part_flush_completed_generation.load(
+                    std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(2));
+    auto second_accepted =
+        asyncdownload::flow::PacketAdmission{};
+    auto second_flushed =
+        asyncdownload::flow::PacketAdmission{};
+    auto completion =
+        asyncdownload::flow::PacketPublishResult{};
+    if (first_barrier) {
+        second_accepted =
+            packet_flow->producer().accept(
+                lane,
+                {
+                    {{0}, 1},
+                    {0, 6144},
+                    4096,
+                    std::vector<std::uint8_t>(
+                        2048,
+                        0x42)
+                });
+        second_flushed =
+            packet_flow->producer().flush(lane);
+        completion =
+            packet_flow->producer().publish({
+                asyncdownload::flow::
+                    ControlPacketKind::range_complete,
+                {{0}, 1},
+                6144
+            });
+    }
+    const auto range_committed = wait_for(
+        [&facts]() {
+            const auto snapshot =
+                facts.read_since(0);
+            return snapshot.has_value() &&
+                snapshot->committed_generation == 1;
+        },
+        std::chrono::seconds(2));
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            2,
+            std::memory_order_release);
+    const auto successor_seen = wait_for(
+        [&fault_plan]() {
+            return fault_plan.
+                part_flush_completed_generation.load(
+                    std::memory_order_acquire) == 2;
+        },
+        std::chrono::seconds(2));
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            0,
+            std::memory_order_release);
+    const auto close_error =
+        packet_flow->producer().close();
+    persistence.stop();
+    persistence.join();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    const auto [load_error, state] = store.load();
+
+    EXPECT_TRUE(first_accepted.accepted());
+    EXPECT_TRUE(first_flushed.accepted());
+    EXPECT_TRUE(first_barrier);
+    EXPECT_TRUE(second_accepted.accepted());
+    EXPECT_TRUE(second_flushed.accepted());
+    EXPECT_EQ(
+        completion.code,
+        asyncdownload::flow::
+            PacketPublishCode::published);
+    EXPECT_TRUE(range_committed);
+    EXPECT_TRUE(successor_seen);
+    EXPECT_FALSE(close_error);
+    EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(
+        session.vdl_offset.load(
+            std::memory_order_acquire),
+        6144);
+    ASSERT_FALSE(load_error);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->vdl_offset, 6144);
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    ShutdownDuringPendingCommitCreatesSuccessor) {
+    auto open_request = request();
+    asyncdownload::core::SessionState session(
+        effective_policy(8192, 16384));
+    session.paths = open_request.paths;
+    session.url = open_request.remote.url;
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    std::unique_ptr<asyncdownload::flow::PacketFlow>
+        packet_flow;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        session.effective_policy.flow_control(),
+        session.telemetry_session_,
+        packet_flow));
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(
+        packet_flow->producer().open_lane(lane));
+    asyncdownload::core::AtomicBlockBitmap bitmap(2);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread
+        persistence(
+            session,
+            session.effective_policy.persistence(),
+            packet_flow->consumer(),
+            bitmap,
+            *opened.checkpoint,
+            workers,
+            2);
+    asyncdownload::range::RangeFactSlot first_facts(
+        {0},
+        0);
+    asyncdownload::range::RangeFactSlot second_facts(
+        {1},
+        0);
+    ASSERT_FALSE(
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 4096},
+                0,
+                first_facts.publisher()
+            }).error);
+    ASSERT_FALSE(
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {1},
+                {4096, 8192},
+                0,
+                second_facts.publisher()
+            }).error);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            1,
+            std::memory_order_release);
+    persistence.start();
+    const auto first_accepted =
+        packet_flow->producer().accept(
+            lane,
+            {
+                {{0}, 1},
+                {0, 4096},
+                0,
+                std::vector<std::uint8_t>(
+                    4096,
+                    0x51)
+            });
+    const auto first_flushed =
+        packet_flow->producer().flush(lane);
+    const auto first_completion =
+        packet_flow->producer().publish({
+            asyncdownload::flow::
+                ControlPacketKind::range_complete,
+            {{0}, 1},
+            4096
+        });
+    const auto first_barrier = wait_for(
+        [&fault_plan]() {
+            return fault_plan.
+                part_flush_completed_generation.load(
+                    std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(2));
+    auto second_accepted =
+        asyncdownload::flow::PacketAdmission{};
+    auto second_flushed =
+        asyncdownload::flow::PacketAdmission{};
+    if (first_barrier) {
+        second_accepted =
+            packet_flow->producer().accept(
+                lane,
+                {
+                    {{1}, 1},
+                    {4096, 8192},
+                    4096,
+                    std::vector<std::uint8_t>(
+                        4096,
+                        0x62)
+                });
+        second_flushed =
+            packet_flow->producer().flush(lane);
+    }
+    const auto second_persisted = wait_for(
+        [&session]() {
+            return session.persisted_bytes.load(
+                       std::memory_order_acquire) ==
+                8192;
+        },
+        std::chrono::seconds(2));
+    const auto second_completion =
+        packet_flow->producer().publish({
+            asyncdownload::flow::
+                ControlPacketKind::range_complete,
+            {{1}, 1},
+            8192
+        });
+    const auto close_error =
+        packet_flow->producer().close();
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            2,
+            std::memory_order_release);
+    const auto successor_seen = wait_for(
+        [&fault_plan]() {
+            return fault_plan.
+                part_flush_completed_generation.load(
+                    std::memory_order_acquire) == 2;
+        },
+        std::chrono::seconds(2));
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            0,
+            std::memory_order_release);
+    persistence.stop();
+    persistence.join();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    const auto [load_error, state] = store.load();
+
+    EXPECT_TRUE(first_accepted.accepted());
+    EXPECT_TRUE(first_flushed.accepted());
+    EXPECT_EQ(
+        first_completion.code,
+        asyncdownload::flow::
+            PacketPublishCode::published);
+    EXPECT_TRUE(first_barrier);
+    EXPECT_TRUE(second_accepted.accepted());
+    EXPECT_TRUE(second_flushed.accepted());
+    EXPECT_TRUE(second_persisted);
+    EXPECT_EQ(
+        second_completion.code,
+        asyncdownload::flow::
+            PacketPublishCode::published);
+    EXPECT_FALSE(close_error);
+    EXPECT_TRUE(successor_seen);
+    EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(
+        fault_plan.
+            part_flush_completed_generation.load(
+                std::memory_order_acquire),
+        2);
+    EXPECT_EQ(
+        session.vdl_offset.load(
+            std::memory_order_acquire),
+        8192);
+    ASSERT_FALSE(load_error);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->vdl_offset, 8192);
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    SuccessorSubmitFailureRetainsLastCheckpoint) {
+    auto open_request = request();
+    open_request.remote.total_size = 6144;
+    asyncdownload::core::SessionState session(
+        effective_policy(6144));
+    session.paths = open_request.paths;
+    session.url = open_request.remote.url;
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    std::unique_ptr<asyncdownload::flow::PacketFlow>
+        packet_flow;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        session.effective_policy.flow_control(),
+        session.telemetry_session_,
+        packet_flow));
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(
+        packet_flow->producer().open_lane(lane));
+    asyncdownload::core::AtomicBlockBitmap bitmap(2);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread
+        persistence(
+            session,
+            session.effective_policy.persistence(),
+            packet_flow->consumer(),
+            bitmap,
+            *opened.checkpoint,
+            workers,
+            1);
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    ASSERT_FALSE(
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 6144},
+                0,
+                facts.publisher()
+            }).error);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            1,
+            std::memory_order_release);
+    persistence.start();
+    const auto first_accepted =
+        packet_flow->producer().accept(
+            lane,
+            {
+                {{0}, 1},
+                {0, 6144},
+                0,
+                std::vector<std::uint8_t>(
+                    4096,
+                    0x71)
+            });
+    const auto first_flushed =
+        packet_flow->producer().flush(lane);
+    const auto first_barrier = wait_for(
+        [&fault_plan]() {
+            return fault_plan.
+                part_flush_completed_generation.load(
+                    std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(2));
+    auto second_accepted =
+        asyncdownload::flow::PacketAdmission{};
+    auto second_flushed =
+        asyncdownload::flow::PacketAdmission{};
+    auto completion =
+        asyncdownload::flow::PacketPublishResult{};
+    if (first_barrier) {
+        second_accepted =
+            packet_flow->producer().accept(
+                lane,
+                {
+                    {{0}, 1},
+                    {0, 6144},
+                    4096,
+                    std::vector<std::uint8_t>(
+                        2048,
+                        0x72)
+                });
+        second_flushed =
+            packet_flow->producer().flush(lane);
+        completion =
+            packet_flow->producer().publish({
+                asyncdownload::flow::
+                    ControlPacketKind::range_complete,
+                {{0}, 1},
+                6144
+            });
+    }
+    const auto range_committed = wait_for(
+        [&facts]() {
+            const auto snapshot =
+                facts.read_since(0);
+            return snapshot.has_value() &&
+                snapshot->committed_generation == 1;
+        },
+        std::chrono::seconds(2));
+    fault_plan.fail_next_checkpoint_submit.store(
+        true,
+        std::memory_order_release);
+    fault_plan.
+        pause_after_part_flush_generation.store(
+            0,
+            std::memory_order_release);
+    const auto submit_failed = wait_for(
+        [&persistence]() {
+            return persistence.error() ==
+                std::make_error_code(
+                    std::errc::not_enough_memory);
+        },
+        std::chrono::seconds(2));
+    const auto close_error =
+        packet_flow->producer().close();
+    static_cast<void>(close_error);
+    persistence.stop();
+    persistence.join();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    const auto [load_error, state] = store.load();
+
+    EXPECT_TRUE(first_accepted.accepted());
+    EXPECT_TRUE(first_flushed.accepted());
+    EXPECT_TRUE(first_barrier);
+    EXPECT_TRUE(second_accepted.accepted());
+    EXPECT_TRUE(second_flushed.accepted());
+    EXPECT_EQ(
+        completion.code,
+        asyncdownload::flow::
+            PacketPublishCode::published);
+    EXPECT_TRUE(range_committed);
+    EXPECT_TRUE(submit_failed);
+    EXPECT_EQ(
+        persistence.error(),
+        std::make_error_code(
+            std::errc::not_enough_memory));
+    EXPECT_EQ(
+        session.vdl_offset.load(
+            std::memory_order_acquire),
+        4096);
+    ASSERT_FALSE(load_error);
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->vdl_offset, 4096);
+    EXPECT_TRUE(std::filesystem::exists(
+        open_request.paths.temporary_path));
 }

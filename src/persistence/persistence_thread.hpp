@@ -157,6 +157,7 @@ private:
     std::size_t bytes_since_flush_ = 0;
     mutable std::mutex error_mutex_;
     std::error_code error_;
+    bool force_checkpoint_pending_ = false;
     bool stopping_ = false;
 };
 
