@@ -21,11 +21,17 @@
 
 namespace {
 
+struct TestPacket {
+    std::size_t range_id = 0;
+    std::int64_t offset = 0;
+    std::vector<std::uint8_t> payload;
+};
+
 void enqueue_data_packet(
     asyncdownload::flow::PacketProducer& producer,
     asyncdownload::flow::ProducerLane& lane,
     asyncdownload::core::SessionState& session,
-    const asyncdownload::core::DataPacket& packet) {
+    const TestPacket& packet) {
     const auto accepted = producer.accept(
         lane,
         {
@@ -164,8 +170,7 @@ void persist_single_range_at_tail_capacity(
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket packet{};
-    packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket packet{};
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(static_cast<std::size_t>(total_size), 0x5A);
@@ -261,8 +266,7 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket packet{};
-    packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket packet{};
     packet.range_id = 0;
     packet.offset = 8 * 1024;
     packet.payload.assign(4096, 0x33);
@@ -321,8 +325,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket packet{};
-    packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket packet{};
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x11);
@@ -384,8 +387,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket packet{};
-    packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket packet{};
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x7A);
@@ -449,8 +451,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket packet{};
-    packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket packet{};
     packet.range_id = 0;
     packet.offset = 0;
     packet.payload.assign(4096, 0x55);
@@ -513,8 +514,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     persistence.register_range(&range);
     persistence.start();
 
-    asyncdownload::core::DataPacket tail_packet{};
-    tail_packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket tail_packet{};
     tail_packet.range_id = 0;
     tail_packet.offset = 8 * 1024;
     tail_packet.payload.assign(4096, 0x44);
@@ -525,8 +525,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
         return range.pause_for_gap.load(std::memory_order_acquire);
     }, std::chrono::milliseconds(1000)));
 
-    asyncdownload::core::DataPacket head_packet{};
-    head_packet.kind = asyncdownload::core::PacketKind::data;
+    TestPacket head_packet{};
     head_packet.range_id = 0;
     head_packet.offset = 0;
     head_packet.payload.assign(8 * 1024, 0x22);

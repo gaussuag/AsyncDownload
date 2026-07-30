@@ -84,8 +84,6 @@ void update_transfer_pause_state(TransferHandle& transfer) noexcept {
     const auto packet_paused =
         transfer.packet_producer != nullptr &&
         transfer.packet_producer->paused(transfer.packet_lane);
-    transfer.range->pause_for_memory.store(
-        packet_paused, std::memory_order_release);
     if (packet_paused ||
         transfer.paused_by_gap ||
         transfer.paused_by_window_boundary) {
@@ -105,6 +103,21 @@ void record_first_network_byte(core::SessionState& session,
     session.telemetry_session_.record_first_byte_received();
 }
 
+[[nodiscard]] std::optional<std::int64_t> merged_downloaded_bytes(
+    const core::SessionState& session,
+    const flow::PacketFlowSnapshot& flow_snapshot) noexcept {
+    if (session.recovery_initial_trusted_bytes < 0 ||
+        flow_snapshot.published_data_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max() -
+                session.recovery_initial_trusted_bytes)) {
+        return std::nullopt;
+    }
+    return session.recovery_initial_trusted_bytes +
+        static_cast<std::int64_t>(
+            flow_snapshot.published_data_bytes);
+}
+
 void invoke_progress(core::SessionState& session,
                      const std::vector<std::unique_ptr<core::RangeContext>>& ranges,
                      const std::vector<TransferHandle>& handles) noexcept {
@@ -113,20 +126,20 @@ void invoke_progress(core::SessionState& session,
     }
 
     auto snapshot = session.telemetry_session_.current_snapshot();
+    const auto flow_snapshot = handles.empty() ||
+            handles.front().packet_producer == nullptr ?
+        flow::PacketFlowSnapshot{} :
+        handles.front().packet_producer->snapshot();
     snapshot.total_bytes = session.total_size;
-    snapshot.downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
+    snapshot.downloaded_bytes =
+        merged_downloaded_bytes(session, flow_snapshot).value_or(
+            std::numeric_limits<std::int64_t>::max());
     snapshot.persisted_bytes = session.persisted_bytes.load(std::memory_order_relaxed);
     snapshot.vdl_offset = session.vdl_offset.load(std::memory_order_relaxed);
     snapshot.inflight_bytes = std::max<std::int64_t>(0,
         snapshot.downloaded_bytes - snapshot.persisted_bytes);
-    snapshot.queued_packets = handles.empty() ||
-            handles.front().packet_producer == nullptr ?
-        0 :
-        handles.front().packet_producer->snapshot().queued_packets;
-    snapshot.memory_bytes = handles.empty() ||
-            handles.front().packet_producer == nullptr ?
-        0 :
-        handles.front().packet_producer->snapshot().accounted_bytes;
+    snapshot.queued_packets = flow_snapshot.queued_packets;
+    snapshot.memory_bytes = flow_snapshot.accounted_bytes;
     snapshot.resumed = session.resumed;
 
     for (const auto& range : ranges) {
@@ -375,22 +388,10 @@ void update_speed(TransferHandle& transfer) noexcept {
     }
 }
 
-void reflect_packet_publication(
-    TransferHandle& transfer,
-    const flow::PacketAdmission& admission) noexcept {
-    if (admission.published_bytes == 0) {
-        return;
-    }
-    transfer.session->downloaded_bytes.fetch_add(
-        static_cast<std::int64_t>(admission.published_bytes),
-        std::memory_order_relaxed);
-}
-
-[[nodiscard]] flow::PacketAdmission flush_transfer_buffer(
+[[nodiscard]] flow::PacketAdmission flush_packet_lane(
     TransferHandle& transfer) noexcept {
     auto result =
         transfer.packet_producer->flush(transfer.packet_lane);
-    reflect_packet_publication(transfer, result);
     if (result.code == flow::PacketAdmissionCode::failed) {
         transfer.packet_error = result.error;
     } else if (result.code == flow::PacketAdmissionCode::closed) {
@@ -400,9 +401,10 @@ void reflect_packet_publication(
     return result;
 }
 
-[[nodiscard]] std::error_code flush_transfer_buffer_blocking(TransferHandle& transfer) noexcept {
+[[nodiscard]] std::error_code drain_packet_lane(
+    TransferHandle& transfer) noexcept {
     while (true) {
-        const auto flushed = flush_transfer_buffer(transfer);
+        const auto flushed = flush_packet_lane(transfer);
         if (flushed.accepted()) {
             return {};
         }
@@ -480,7 +482,7 @@ void reflect_packet_publication(
 
         const auto remaining = current->request_end - current->next_offset + 1;
         if (remaining <= 0) {
-            const auto flushed = flush_transfer_buffer(*current);
+            const auto flushed = flush_packet_lane(*current);
             if (!flushed.accepted()) {
                 if (current->packet_error) {
                     return 0;
@@ -531,7 +533,6 @@ void reflect_packet_publication(
                     reinterpret_cast<const std::uint8_t*>(data),
                     allowed)
             });
-        reflect_packet_publication(*current, admission);
         if (!admission.accepted()) {
             if (admission.code ==
                 flow::PacketAdmissionCode::memory_budget_exhausted) {
@@ -688,7 +689,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
     // 这里处理的是“一个 HTTP window 请求结束了”，不是“整个下载任务结束了”。
     // 所以它既负责校验这次请求，也负责决定后续应该继续调度还是宣告 range 完成。
     update_speed(transfer);
-    if (const auto flush_error = flush_transfer_buffer_blocking(transfer); flush_error) {
+    if (const auto flush_error = drain_packet_lane(transfer); flush_error) {
         rollback_inflight_window(transfer);
         mark_range_status(*transfer.range, core::RangeStatus::failed);
         return flush_error;
@@ -764,7 +765,13 @@ std::error_code stop_network_phase(core::SessionState& session,
     session.stop_requested.store(true, std::memory_order_release);
     std::error_code first_error;
     for (auto& handle : handles) {
-        const auto flush_error = flush_transfer_buffer_blocking(handle);
+        if (handle.packet_producer == nullptr ||
+            handle.packet_lane.id() == 0) {
+            rollback_inflight_window(handle);
+            release_transfer(multi, handle);
+            continue;
+        }
+        const auto flush_error = drain_packet_lane(handle);
         if (flush_error && !first_error) {
             first_error = flush_error;
         }
@@ -991,7 +998,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         const auto safe_vdl = bitmap.contiguous_finished_bytes(
             session.effective_policy.persistence().block_bytes,
             session.total_size);
-        session.downloaded_bytes.store(finished_bytes, std::memory_order_relaxed);
+        session.recovery_initial_trusted_bytes = finished_bytes;
         session.persisted_bytes.store(finished_bytes, std::memory_order_relaxed);
         session.vdl_offset.store(safe_vdl, std::memory_order_relaxed);
 
@@ -1279,9 +1286,16 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         // DownloadResult 主要面向调用方总结最终状态，因此在这里统一从 session 和
         // bitmap 回填一次，避免中途多个分支各自维护结果对象。
+        const auto downloaded = merged_downloaded_bytes(
+            session,
+            packet_flow->producer().snapshot());
+        if (!downloaded && !failure) {
+            failure = make_error_code(DownloadErrc::internal_error);
+        }
         result.error = failure;
         result.total_bytes = session.total_size;
-        result.downloaded_bytes = session.downloaded_bytes.load(std::memory_order_relaxed);
+        result.downloaded_bytes = downloaded.value_or(
+            std::numeric_limits<std::int64_t>::max());
         result.persisted_bytes = sum_finished_bytes(bitmap,
             session.effective_policy.persistence().block_bytes,
             session.total_size);

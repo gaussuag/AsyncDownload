@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
-#include <map>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -18,15 +17,6 @@
 namespace asyncdownload::core {
 
 inline constexpr std::size_t TAIL_BUFFER_CAPACITY_BYTES = 4096;
-
-enum class PacketKind : std::uint8_t {
-    // 真正的下载数据包。
-    data = 0,
-    // Orchestrator 告诉 Persistence：某个 range 的网络阶段已经结束。
-    range_complete = 1,
-    // 结束 Persistence 线程的控制消息。
-    shutdown = 2
-};
 
 enum class RangeStatus : std::uint8_t {
     // 当前没有请求在处理这个 range，等待被调度。
@@ -47,20 +37,6 @@ struct BlockCrcSample {
     std::uint32_t crc32 = 0;
     // 采样长度通常等于 block_size，只有最后一个块可能更短。
     std::size_t length = 0;
-};
-
-struct DataPacket {
-    // 同一个结构同时承载数据包和控制包。
-    PacketKind kind = PacketKind::data;
-    std::size_t range_id = 0;
-    std::int64_t offset = 0;
-    std::vector<std::uint8_t> payload;
-    // 用于全局内存会计，除了 payload 还会加上固定结构和 map 节点开销。
-    std::size_t accounted_bytes = 0;
-
-    [[nodiscard]] std::size_t size() const noexcept {
-        return payload.size();
-    }
 };
 
 struct TailBuffer {
@@ -93,7 +69,6 @@ struct RangeContext {
     // status 是给调度、进度展示和恢复快照看的粗粒度状态。
     std::atomic<std::uint8_t> status{static_cast<std::uint8_t>(RangeStatus::empty)};
     std::atomic<bool> pause_for_gap{false};
-    std::atomic<bool> pause_for_memory{false};
     // completion_notified 防止同一个 range 被重复发送 range_complete 控制消息。
     std::atomic<bool> completion_notified{false};
     // marked_finished 代表 Persistence 已经确认该 range 的最终收尾完成。
@@ -101,9 +76,6 @@ struct RangeContext {
     // persisted_offset 只由 Persistence 线程推进，表示这个 range 已经按顺序
     // 物理写入到磁盘的逻辑前沿。
     std::int64_t persisted_offset;
-    // 网络层可以乱序到达，但真正写盘必须严格按 offset 串行，因此先按 offset
-    // 暂存在 map 里，等缺口补齐后再链式落盘。
-    std::map<std::int64_t, DataPacket> out_of_order_queue;
 };
 
 struct RangeStateSnapshot {
@@ -166,13 +138,10 @@ struct SessionState {
     download::EffectiveDownloadPolicy effective_policy;
     std::int64_t total_size = 0;
     bool resumed = false;
-    // downloaded_bytes 统计已从网络接收的数据，persisted_bytes 统计已物理落盘的数据。
-    std::atomic<std::int64_t> downloaded_bytes{0};
+    std::int64_t recovery_initial_trusted_bytes = 0;
     std::atomic<std::int64_t> persisted_bytes{0};
     // vdl_offset 表示当前已经 flush 并进入恢复元数据的最长连续安全前沿。
     std::atomic<std::int64_t> vdl_offset{0};
-    // queued_packets 用于进度和背压观测，表示还有多少包在持久化链路里等待处理。
-    std::atomic<std::size_t> queued_packets{0};
     std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
     std::chrono::steady_clock::time_point task_started_at{};
