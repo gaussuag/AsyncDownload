@@ -58,7 +58,6 @@ struct TransferHandle {
     flow::ProducerLane packet_lane;
     FlowControlPolicy flow_control{};
     CURL* easy = nullptr;
-    core::RangeContext* range = nullptr;
     std::optional<range::RangeLease> lease;
     std::optional<PendingLease> pending_lease;
     std::string range_header;
@@ -297,80 +296,6 @@ void rebuild_bitmap_from_ranges(
     }
 }
 
-[[nodiscard]] core::RangeContext* find_range_projection(
-    const std::vector<std::unique_ptr<core::RangeContext>>& ranges,
-    const range::RangeId id) noexcept {
-    if (id.value > std::numeric_limits<std::size_t>::max()) {
-        return nullptr;
-    }
-    const auto found = std::find_if(
-        ranges.begin(),
-        ranges.end(),
-        [id](const auto& candidate) {
-            return candidate != nullptr &&
-                candidate->range_id ==
-                    static_cast<std::size_t>(id.value);
-        });
-    return found == ranges.end() ? nullptr : found->get();
-}
-
-[[nodiscard]] std::error_code apply_geometry_effects(
-    const range::EffectBatch<2>& effects,
-    std::vector<std::unique_ptr<core::RangeContext>>& ranges,
-    persistence::PersistenceThread& persistence) noexcept {
-    try {
-        for (std::size_t index = 0;
-             index < effects.size;
-             ++index) {
-            if (const auto* resize =
-                    std::get_if<range::ResizeRangeEffect>(
-                        &effects.values[index])) {
-                auto* projection =
-                    find_range_projection(ranges, resize->range);
-                if (projection == nullptr ||
-                    resize->new_end <= projection->start_offset) {
-                    return make_error_code(
-                        DownloadErrc::internal_error);
-                }
-                continue;
-            }
-
-            const auto* registration =
-                std::get_if<range::RegisterRangeEffect>(
-                    &effects.values[index]);
-            if (registration == nullptr ||
-                registration->range.value >
-                    std::numeric_limits<std::size_t>::max() ||
-                registration->bytes.begin >=
-                    registration->bytes.end ||
-                find_range_projection(
-                    ranges,
-                    registration->range) != nullptr) {
-                return make_error_code(
-                    DownloadErrc::internal_error);
-            }
-            auto projection =
-                std::make_unique<core::RangeContext>(
-                    static_cast<std::size_t>(
-                        registration->range.value),
-                    registration->bytes.begin,
-                    registration->bytes.end - 1);
-            if (const auto registration_error =
-                    persistence.register_range(
-                        projection.get());
-                registration_error) {
-                return registration_error;
-            }
-            ranges.push_back(std::move(projection));
-        }
-        return {};
-    } catch (const std::bad_alloc&) {
-        return std::make_error_code(std::errc::not_enough_memory);
-    } catch (...) {
-        return make_error_code(DownloadErrc::internal_error);
-    }
-}
-
 [[nodiscard]] std::error_code submit_geometry_effect(
     const range::RangeEffect& effect,
     persistence::PersistenceThread& persistence,
@@ -549,21 +474,6 @@ void rebuild_bitmap_from_ranges(
     return {};
 }
 
-void rollback_inflight_window(TransferHandle& transfer) noexcept {
-    if (transfer.range == nullptr ||
-        !transfer.lease.has_value()) {
-        return;
-    }
-
-    // arm_transfer 在派发一个 window 前会先把 current_offset 推进到 window 末尾之后。
-    // 如果这个请求中途失败，就需要把这段“尚未真正完成”的租约回滚回 next_offset，
-    // 否则调度器会误以为这些字节已经被可靠处理过。
-    const auto current = transfer.range->current_offset.load(std::memory_order_acquire);
-    if (transfer.next_offset < current) {
-        transfer.range->current_offset.store(transfer.next_offset, std::memory_order_release);
-    }
-}
-
 [[nodiscard]] std::error_code publish_range_complete(
     flow::PacketProducer& producer,
     const range::PublishRangeCompleteEffect& effect) noexcept {
@@ -660,20 +570,11 @@ void update_speed(TransferHandle& transfer) noexcept {
 [[nodiscard]] std::error_code arm_transfer(TransferHandle& transfer,
                                            CURLM* multi,
                                            const core::SessionState& session,
-                                           core::RangeContext& projection,
                                            range::RangeLease lease) noexcept {
     if (lease.bytes.begin >= lease.bytes.end) {
-        transfer.range = nullptr;
         return {};
     }
 
-    // 派发 window 前先把逻辑租约登记到 range.current_offset。
-    // 即使后面发生失败，也可以借助 rollback_inflight_window 把这段租约收回。
-    projection.current_offset.store(
-        lease.bytes.end,
-        std::memory_order_release);
-
-    transfer.range = &projection;
     transfer.lease = lease;
     transfer.request_start = lease.bytes.begin;
     transfer.request_end = lease.bytes.end - 1;
@@ -701,7 +602,6 @@ void update_speed(TransferHandle& transfer) noexcept {
         const auto bytes = size * nmemb;
         if (bytes == 0 ||
             current == nullptr ||
-            current->range == nullptr ||
             !current->lease.has_value()) {
             return 0;
         }
@@ -792,7 +692,6 @@ void update_speed(TransferHandle& transfer) noexcept {
     }
 
     if (curl_multi_add_handle(multi, transfer.easy) != CURLM_OK) {
-        transfer.range = nullptr;
         transfer.lease.reset();
         return make_error_code(DownloadErrc::http_transfer_failed);
     }
@@ -812,7 +711,6 @@ void update_speed(TransferHandle& transfer) noexcept {
     // 是否已经堆出了过大的洞。
     for (auto& handle : handles) {
         if (!handle.in_multi ||
-            handle.range == nullptr ||
             !handle.lease.has_value()) {
             continue;
         }
@@ -853,7 +751,8 @@ void update_speed(TransferHandle& transfer) noexcept {
     std::vector<flow::PacketPauseAction>& actions) noexcept {
     observations.clear();
     for (auto& handle : handles) {
-        if (!handle.in_multi || handle.range == nullptr) {
+        if (!handle.in_multi ||
+            !handle.lease.has_value()) {
             continue;
         }
         const auto eligible = !handle.paused_by_window_boundary;
@@ -887,7 +786,7 @@ void update_speed(TransferHandle& transfer) noexcept {
             });
         if (found == handles.end() ||
             !found->in_multi ||
-            found->range == nullptr) {
+            !found->lease.has_value()) {
             return make_error_code(DownloadErrc::internal_error);
         }
         if (action.kind ==
@@ -909,15 +808,13 @@ void update_speed(TransferHandle& transfer) noexcept {
     TransferHandle& transfer,
     core::SessionState& session,
     range::RangeLifecycle& lifecycle) noexcept {
-    if (transfer.range == nullptr ||
-        !transfer.lease.has_value()) {
+    if (!transfer.lease.has_value()) {
         return {};
     }
 
     const auto fail_lease =
         [&transfer, &lifecycle](
             const std::error_code error) noexcept {
-            rollback_inflight_window(transfer);
             const auto applied = lifecycle.apply(
                 range::LeaseFailed{
                     transfer.lease->id,
@@ -976,7 +873,6 @@ void update_speed(TransferHandle& transfer) noexcept {
         }
     }
 
-    transfer.range = nullptr;
     transfer.lease.reset();
     transfer.pending_lease.reset();
     transfer.range_header.clear();
@@ -994,7 +890,6 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
     transfer.paused_by_window_boundary = false;
     // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
     // 不销毁底层 easy 对象本身。
-    transfer.range = nullptr;
     transfer.lease.reset();
     transfer.pending_lease.reset();
     transfer.range_header.clear();
@@ -1012,7 +907,6 @@ std::error_code stop_network_phase(core::SessionState& session,
     for (auto& handle : handles) {
         if (handle.packet_producer == nullptr ||
             handle.packet_lane.id() == 0) {
-            rollback_inflight_window(handle);
             release_transfer(multi, handle);
             continue;
         }
@@ -1029,7 +923,6 @@ std::error_code stop_network_phase(core::SessionState& session,
             }
         }
 
-        rollback_inflight_window(handle);
         release_transfer(multi, handle);
     }
 
@@ -1299,19 +1192,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             return result;
         }
         auto lifecycle = std::move(lifecycle_creation.value);
-        std::vector<std::unique_ptr<core::RangeContext>> ranges;
-        ranges.reserve(initial_plan.ranges.size());
-        for (std::size_t index = 0;
-             index < initial_plan.ranges.size();
-             ++index) {
-            const auto span = initial_plan.ranges[index];
-            ranges.push_back(
-                std::make_unique<core::RangeContext>(
-                    index,
-                    span.begin,
-                    span.end - 1));
-        }
-
         std::unique_ptr<flow::PacketFlow> packet_flow;
         const auto packet_flow_error = flow::PacketFlow::create(
             session.effective_policy.flow_control(),
@@ -1333,33 +1213,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             file_writer,
             metadata_store,
             workers,
-            ranges.size());
-        std::error_code projection_error;
-        for (const auto& range : ranges) {
-            projection_error =
-                persistence.register_range(range.get());
-            if (projection_error) {
-                break;
-            }
-        }
-        if (projection_error) {
-            const auto applied = lifecycle->apply(
-                range::EffectApplicationFailed{
-                    projection_error
-                });
-            const auto close_error =
-                packet_flow->producer().close();
-            static_cast<void>(close_error);
-            file_writer.close();
-            result.error = applied.error ?
-                applied.error :
-                projection_error;
-            result.performance =
-                build_performance_summary(
-                    session,
-                    Clock::now());
-            return result;
-        }
+            initial_plan.ranges.size());
         persistence.start();
 
         std::vector<ExpectedGeometryAck> initial_geometry_acks;
@@ -1498,7 +1352,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             }
 
             for (auto& handle : handles) {
-                if (handle.range != nullptr || handle.in_multi || failure) {
+                if (handle.lease.has_value() ||
+                    handle.in_multi ||
+                    failure) {
                     continue;
                 }
 
@@ -1513,30 +1369,10 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     const auto lease =
                         handle.pending_lease->lease;
                     handle.pending_lease.reset();
-                    auto* projection = find_range_projection(
-                        ranges,
-                        lease.id.range);
-                    if (projection == nullptr) {
-                        const auto error =
-                            make_error_code(
-                                DownloadErrc::internal_error);
-                        const auto applied = lifecycle->apply(
-                            range::EffectApplicationFailed{
-                                error
-                            });
-                        failure = applied.error ?
-                            applied.error :
-                            error;
-                        session.stop_requested.store(
-                            true,
-                            std::memory_order_release);
-                        break;
-                    }
                     const auto arm_error = arm_transfer(
                         handle,
                         multi,
                         session,
-                        *projection,
                         lease);
                     if (arm_error) {
                         const auto applied = lifecycle->apply(
@@ -1566,25 +1402,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 if (!acquired.lease.has_value()) {
                     continue;
                 }
-                if (const auto geometry_error =
-                        apply_geometry_effects(
-                            acquired.effects,
-                            ranges,
-                            persistence);
-                    geometry_error) {
-                    const auto applied = lifecycle->apply(
-                        range::EffectApplicationFailed{
-                            geometry_error
-                        });
-                    failure = applied.error ?
-                        applied.error :
-                        geometry_error;
-                    session.stop_requested.store(
-                        true,
-                        std::memory_order_release);
-                    break;
-                }
-
                 const auto lease = *acquired.lease;
                 if (acquired.effects.size > 0) {
                     PendingLease pending;
@@ -1621,29 +1438,10 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     continue;
                 }
 
-                auto* projection = find_range_projection(
-                    ranges,
-                    lease.id.range);
-                if (projection == nullptr) {
-                    const auto error =
-                        make_error_code(
-                            DownloadErrc::internal_error);
-                    const auto applied = lifecycle->apply(
-                        range::EffectApplicationFailed{error});
-                    failure = applied.error ?
-                        applied.error :
-                        error;
-                    session.stop_requested.store(
-                        true,
-                        std::memory_order_release);
-                    break;
-                }
-
                 const auto arm_error = arm_transfer(
                     handle,
                     multi,
                     session,
-                    *projection,
                     lease);
                 if (arm_error) {
                     const auto applied = lifecycle->apply(
@@ -1754,7 +1552,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             const auto has_active = std::any_of(handles.begin(), handles.end(),
                 [](const TransferHandle& handle) {
                     return handle.in_multi ||
-                        handle.range != nullptr ||
+                        handle.lease.has_value() ||
                         handle.pending_lease.has_value();
                 });
             if (!has_active) {

@@ -11,10 +11,6 @@
 #include <map>
 #include <optional>
 
-namespace asyncdownload::core {
-struct RangeContext;
-}
-
 namespace asyncdownload::persistence {
 
 struct RangeTailBuffer {
@@ -44,7 +40,6 @@ struct RangeWriteState {
     std::optional<range::CompletionId>
         pending_completion;
     range::RangeFactPublisher facts;
-    core::RangeContext* legacy_projection = nullptr;
 };
 
 }

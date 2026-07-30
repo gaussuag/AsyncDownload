@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "asyncdownload/error.hpp"
+#include "core/constants.hpp"
 #include "asyncdownload/types.hpp"
 #include "core/models.hpp"
 #include "download/download_policy.hpp"

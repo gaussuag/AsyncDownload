@@ -13,7 +13,6 @@ struct RangeFaultPlan {
     std::atomic<bool> fail_next_geometry_submit_allocation{false};
     std::atomic<bool> fail_next_write_state_allocation{false};
     std::atomic<bool> fail_next_reorder_allocation{false};
-    std::atomic<bool> corrupt_next_reorder_tracking{false};
 
     void reset() noexcept {
         fail_next_create_allocation.store(
@@ -29,9 +28,6 @@ struct RangeFaultPlan {
             false,
             std::memory_order_release);
         fail_next_reorder_allocation.store(
-            false,
-            std::memory_order_release);
-        corrupt_next_reorder_tracking.store(
             false,
             std::memory_order_release);
     }

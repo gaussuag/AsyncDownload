@@ -46,51 +46,6 @@ PersistenceThread::~PersistenceThread() {
     join();
 }
 
-std::error_code PersistenceThread::register_range(
-    core::RangeContext* range) noexcept {
-    // Orchestrator 可能在运行期追加被 steal 出来的新 range，所以这里不能假设
-    // ranges_ 在启动时就固定不变。
-    if (range == nullptr) {
-        return make_error_code(DownloadErrc::internal_error);
-    }
-    try {
-#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
-        range::detail::fail_if_requested(
-            range::detail::range_fault_plan()
-                .fail_next_write_state_allocation);
-#endif
-        std::scoped_lock lock(ranges_mutex_);
-        if (range->range_id >= ranges_.size()) {
-            ranges_.resize(range->range_id + 1);
-        }
-        auto& state = ranges_[range->range_id];
-        if (!state) {
-            auto created =
-                std::make_unique<RangeWriteState>();
-            created->id = {
-                static_cast<std::uint64_t>(range->range_id)
-            };
-            created->bytes = {
-                range->start_offset,
-                range->end_offset.load(
-                    std::memory_order_acquire) + 1
-            };
-            created->observed_dispatch_through =
-                range->start_offset;
-            created->persisted_through =
-                range->persisted_offset;
-            state = std::move(created);
-        }
-        state->legacy_projection = range;
-        return {};
-    } catch (const std::bad_alloc&) {
-        return std::make_error_code(
-            std::errc::not_enough_memory);
-    } catch (...) {
-        return make_error_code(DownloadErrc::internal_error);
-    }
-}
-
 RangeRegistrationSubmitResult
 PersistenceThread::submit_range_geometry(
     RangeGeometryCommand command) noexcept {
@@ -172,17 +127,6 @@ std::error_code PersistenceThread::error() const noexcept {
     return error_;
 }
 
-core::MetadataState PersistenceThread::current_metadata_state() const {
-    return build_metadata_state();
-}
-
-bool PersistenceThread::all_ranges_completed() const noexcept {
-    std::scoped_lock lock(ranges_mutex_);
-    return std::all_of(ranges_.begin(), ranges_.end(), [](const auto& range) {
-        return range == nullptr || range->committed;
-    });
-}
-
 void PersistenceThread::process_loop() {
     // 这个循环的职责不是“看到包就写盘”这么简单，而是把网络层吐出来的离散
     // DataPacket 收敛成一条严格有序、按对齐规则落盘、并能周期性生成恢复元数据
@@ -248,48 +192,58 @@ void PersistenceThread::process_range_geometry() noexcept {
                             DownloadErrc::internal_error);
                         return;
                     }
-                    auto* state = lookup_range(
-                        static_cast<std::size_t>(
-                            effect.range.value));
-                    if (state == nullptr ||
-                        state->legacy_projection == nullptr) {
-                        ack.error = make_error_code(
-                            DownloadErrc::internal_error);
-                        return;
-                    }
                     if constexpr (std::is_same_v<
                                       std::decay_t<
                                           decltype(effect)>,
                                       range::RegisterRangeEffect>) {
-                        const auto* projection =
-                            state->legacy_projection;
-                        const auto end =
-                            projection->end_offset.load(
-                                std::memory_order_acquire);
-                        if (projection->start_offset !=
-                                effect.bytes.begin ||
-                            end ==
-                                std::numeric_limits<
-                                    std::int64_t>::max() ||
-                            end + 1 != effect.bytes.end) {
+                        if (effect.geometry_revision != 0 ||
+                            effect.bytes.begin < 0 ||
+                            effect.bytes.begin >=
+                                effect.bytes.end ||
+                            effect.bytes.end >
+                                session_.total_size) {
                             ack.error = make_error_code(
                                 DownloadErrc::internal_error);
                             return;
                         }
-                        state->id = effect.range;
-                        state->bytes = effect.bytes;
-                        state->geometry_revision =
+                        const auto range_id =
+                            static_cast<std::size_t>(
+                                effect.range.value);
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+                        range::detail::fail_if_requested(
+                            range::detail::range_fault_plan()
+                                .fail_next_write_state_allocation);
+#endif
+                        auto created =
+                            std::make_unique<RangeWriteState>();
+                        created->id = effect.range;
+                        created->bytes = effect.bytes;
+                        created->geometry_revision =
                             effect.geometry_revision;
-                        state->observed_dispatch_through =
-                            std::max(
-                                state->observed_dispatch_through,
-                                effect.bytes.begin);
-                        state->persisted_through =
-                            std::max(
-                                state->persisted_through,
-                                effect.bytes.begin);
-                        state->facts = effect.facts;
+                        created->observed_dispatch_through =
+                            effect.bytes.begin;
+                        created->persisted_through =
+                            effect.bytes.begin;
+                        created->facts = effect.facts;
+                        if (range_id >= ranges_.size()) {
+                            ranges_.resize(range_id + 1);
+                        }
+                        if (ranges_[range_id] != nullptr) {
+                            ack.error = make_error_code(
+                                DownloadErrc::internal_error);
+                            return;
+                        }
+                        ranges_[range_id] =
+                            std::move(created);
                     } else {
+                        auto* state = lookup_range(
+                            static_cast<std::size_t>(
+                                effect.range.value));
+                        if (state == nullptr) {
+                            ack.error = make_error_code(
+                                DownloadErrc::internal_error);
+                            return;
+                        }
                         if (effect.geometry_revision !=
                                 state->geometry_revision + 1 ||
                             effect.new_end <=
@@ -305,10 +259,6 @@ void PersistenceThread::process_range_geometry() noexcept {
                         state->bytes.end = effect.new_end;
                         state->geometry_revision =
                             effect.geometry_revision;
-                        state->legacy_projection
-                            ->end_offset.store(
-                                effect.new_end - 1,
-                                std::memory_order_release);
                     }
                 },
                 pending->second);
@@ -466,16 +416,6 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
     range->observed_dispatch_through = std::max(
         range->observed_dispatch_through,
         data->lease_span.end);
-    if (range->legacy_projection != nullptr) {
-        range->legacy_projection->current_offset.store(
-            range->observed_dispatch_through,
-            std::memory_order_release);
-        range->legacy_projection->status.store(
-            static_cast<std::uint8_t>(
-                core::RangeStatus::downloading),
-            std::memory_order_release);
-    }
-
     if (data->offset == range->persisted_through) {
         // 命中当前 expected offset 时，说明这批数据正好可以接到已经落盘的前沿后面，
         // 于是直接写入，并尝试把 map 里后续连续片段一并 drain 掉。
@@ -491,19 +431,11 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
             static_cast<std::int64_t>(packet_size);
         range->facts.publish_persisted_through(
             range->persisted_through);
-        if (range->legacy_projection != nullptr) {
-            range->legacy_projection->persisted_offset =
-                range->persisted_through;
-        }
         update_finished_blocks(*range);
         drain_ordered_packets(*range, false);
     } else {
         // 回调线程不能阻塞等待缺口补齐，所以乱序包先进入 map。
         // Persistence 线程只要等到 expected offset 到达，就能把后续连续片段一起链式写下去。
-        const auto packet_bytes =
-            data->payload.size() +
-            sizeof(flow::DataPacket) +
-            core::kMapNodeOverheadBytes;
         const auto existing =
             range->out_of_order.find(data->offset);
         if (existing != range->out_of_order.end()) {
@@ -521,7 +453,6 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
                 DownloadErrc::internal_error));
             return;
         }
-        bool reorder_accounted = false;
         try {
             if (const auto account_error =
                     packet.account_reorder_node();
@@ -530,27 +461,6 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
                 set_error(account_error);
                 return;
             }
-            reorder_accounted = true;
-            if (current_out_of_order_packets_ ==
-                    std::numeric_limits<
-                        std::size_t>::max() ||
-                packet_bytes >
-                    static_cast<std::size_t>(
-                        std::numeric_limits<
-                            std::int64_t>::max()) ||
-                current_out_of_order_bytes_ >
-                    std::numeric_limits<
-                        std::int64_t>::max() -
-                        static_cast<std::int64_t>(
-                            packet_bytes)) {
-                packet.complete();
-                set_error(make_error_code(
-                    DownloadErrc::internal_error));
-                return;
-            }
-            ++current_out_of_order_packets_;
-            current_out_of_order_bytes_ +=
-                static_cast<std::int64_t>(packet_bytes);
 #if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
             range::detail::fail_if_requested(
                 range::detail::range_fault_plan()
@@ -563,29 +473,16 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
                     std::move(packet));
             static_cast<void>(position);
             if (!inserted) {
-                static_cast<void>(
-                    release_reorder_tracking(
-                        packet_bytes));
                 set_error(make_error_code(
                     DownloadErrc::internal_error));
                 return;
             }
         } catch (const std::bad_alloc&) {
-            if (reorder_accounted) {
-                static_cast<void>(
-                    release_reorder_tracking(
-                        packet_bytes));
-            }
             packet.complete();
             set_error(std::make_error_code(
                 std::errc::not_enough_memory));
             return;
         } catch (...) {
-            if (reorder_accounted) {
-                static_cast<void>(
-                    release_reorder_tracking(
-                        packet_bytes));
-            }
             packet.complete();
             set_error(make_error_code(
                 DownloadErrc::internal_error));
@@ -639,12 +536,6 @@ void PersistenceThread::handle_range_complete(
     range->observed_dispatch_through = std::max(
         range->observed_dispatch_through,
         control.expected_end);
-    if (range->legacy_projection != nullptr) {
-        range->legacy_projection->current_offset.store(
-            range->observed_dispatch_through,
-            std::memory_order_release);
-    }
-
     // 网络层认定一个 range 的 HTTP 请求已经全部结束后，Persistence 仍然要做
     // 两件事：把最后没凑满对齐块的 tail 刷掉，以及把状态正式推进到 finished。
     const auto flush_error = flush_tail(*range, false);
@@ -668,23 +559,11 @@ void PersistenceThread::handle_range_complete(
         return;
     }
     range->committed = true;
-    if (range->legacy_projection != nullptr) {
-        range->legacy_projection->persisted_offset =
-            range->persisted_through;
-        range->legacy_projection->marked_finished.store(
-            true,
-            std::memory_order_release);
-        range->legacy_projection->status.store(
-            static_cast<std::uint8_t>(
-                core::RangeStatus::finished),
-            std::memory_order_release);
-    }
     maybe_schedule_flush(true);
 }
 
 RangeWriteState* PersistenceThread::lookup_range(
     const std::size_t range_id) const {
-    std::scoped_lock lock(ranges_mutex_);
     if (range_id >= ranges_.size()) {
         return nullptr;
     }
@@ -859,15 +738,6 @@ void PersistenceThread::drain_ordered_packets(
             return;
         }
         const auto packet_size = data->payload.size();
-        const auto packet_bytes =
-            packet_size +
-            sizeof(flow::DataPacket) +
-            core::kMapNodeOverheadBytes;
-        if (!release_reorder_tracking(packet_bytes)) {
-            packet.complete();
-            return;
-        }
-
         const auto append_error = append_bytes(
             range, data->offset, data->payload, sample_timing);
         packet.complete();
@@ -879,10 +749,6 @@ void PersistenceThread::drain_ordered_packets(
             static_cast<std::int64_t>(packet_size);
         range.facts.publish_persisted_through(
             range.persisted_through);
-        if (range.legacy_projection != nullptr) {
-            range.legacy_projection->persisted_offset =
-                range.persisted_through;
-        }
         update_finished_blocks(range);
     }
 
@@ -890,7 +756,6 @@ void PersistenceThread::drain_ordered_packets(
 }
 
 void PersistenceThread::drain_buffered_packets() noexcept {
-    std::scoped_lock lock(ranges_mutex_);
     for (auto& range : ranges_) {
         if (range == nullptr) {
             continue;
@@ -900,48 +765,9 @@ void PersistenceThread::drain_buffered_packets() noexcept {
                 range->out_of_order.begin()->second);
             range->out_of_order.erase(
                 range->out_of_order.begin());
-            const auto* data = packet.data();
-            if (data == nullptr) {
-                packet.complete();
-                set_error(make_error_code(
-                    DownloadErrc::internal_error));
-                continue;
-            }
-            const auto packet_bytes =
-                data->payload.size() +
-                sizeof(flow::DataPacket) +
-                core::kMapNodeOverheadBytes;
-            static_cast<void>(
-                release_reorder_tracking(packet_bytes));
             packet.complete();
         }
     }
-}
-
-bool PersistenceThread::release_reorder_tracking(
-    const std::size_t packet_bytes) noexcept {
-#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
-    if (range::detail::range_fault_plan()
-            .corrupt_next_reorder_tracking.exchange(
-                false,
-                std::memory_order_acq_rel)) {
-        current_out_of_order_packets_ = 0;
-    }
-#endif
-    if (packet_bytes >
-            static_cast<std::size_t>(
-                std::numeric_limits<std::int64_t>::max()) ||
-        current_out_of_order_packets_ == 0 ||
-        current_out_of_order_bytes_ <
-            static_cast<std::int64_t>(packet_bytes)) {
-        set_error(make_error_code(
-            DownloadErrc::internal_error));
-        return false;
-    }
-    --current_out_of_order_packets_;
-    current_out_of_order_bytes_ -=
-        static_cast<std::int64_t>(packet_bytes);
-    return true;
 }
 
 void PersistenceThread::update_gap_flag(
@@ -950,11 +776,6 @@ void PersistenceThread::update_gap_flag(
         if (range.gap_blocked) {
             range.gap_blocked = false;
             range.facts.publish_gap_pause(false);
-        }
-        if (range.legacy_projection != nullptr) {
-            range.legacy_projection->pause_for_gap.store(
-                false,
-                std::memory_order_release);
         }
         return;
     }
@@ -967,11 +788,6 @@ void PersistenceThread::update_gap_flag(
     if (blocked != range.gap_blocked) {
         range.gap_blocked = blocked;
         range.facts.publish_gap_pause(blocked);
-    }
-    if (range.legacy_projection != nullptr) {
-        range.legacy_projection->pause_for_gap.store(
-            blocked,
-            std::memory_order_release);
     }
 }
 
@@ -1074,7 +890,6 @@ core::MetadataState PersistenceThread::build_metadata_state() const {
 
     // metadata 快照不能只信 bitmap 当前值，因为某些 range 的 persisted_offset
     // 可能已经推进了，但本轮 snapshot 还没来得及把这些推进反映到独立副本里。
-    std::scoped_lock lock(ranges_mutex_);
     for (const auto& range : ranges_) {
         if (range == nullptr) {
             continue;

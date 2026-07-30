@@ -51,7 +51,7 @@ struct RangeRegistrationPollResult {
 class PersistenceThread {
 public:
     // PersistenceThread 独占管理以下职责：
-    // 1. RangeContext 的真实落盘前沿
+    // 1. range 的真实落盘前沿
     // 2. 乱序 packet 的重排
     // 3. 4KB 对齐写入与 tail buffer
     // 4. 位图推进
@@ -69,9 +69,6 @@ public:
     PersistenceThread(const PersistenceThread&) = delete;
     PersistenceThread& operator=(const PersistenceThread&) = delete;
 
-    // 注册一个可被该线程管理的 range。运行期 steal 出来的新 range 也会经过这里。
-    [[nodiscard]] std::error_code
-    register_range(core::RangeContext* range) noexcept;
     [[nodiscard]] RangeRegistrationSubmitResult
     submit_range_geometry(RangeGeometryCommand command) noexcept;
     [[nodiscard]] RangeRegistrationPollResult
@@ -85,11 +82,6 @@ public:
 
     // 返回后台线程记录的首个错误。
     [[nodiscard]] std::error_code error() const noexcept;
-    // 生成当前可用于恢复的 metadata 快照。
-    [[nodiscard]] core::MetadataState current_metadata_state() const;
-    // 判断所有已注册 range 是否都已进入 marked_finished。
-    [[nodiscard]] bool all_ranges_completed() const noexcept;
-
 private:
     // 主循环：消费 packet、轮询 flush 结果、按阈值发起新的 flush。
     void process_loop();
@@ -121,9 +113,7 @@ private:
         RangeWriteState& range,
         bool sample_timing);
     void drain_buffered_packets() noexcept;
-    [[nodiscard]] bool release_reorder_tracking(
-        std::size_t packet_bytes) noexcept;
-    // 根据当前缺口大小更新 pause_for_gap。
+    // 根据当前缺口大小更新 gap pause。
     void update_gap_flag(RangeWriteState& range);
     // 达到字节阈值或时间阈值后，异步提交 flush + metadata 保存任务。
     void maybe_schedule_flush(bool force);
@@ -146,7 +136,6 @@ private:
     storage::FileWriter& file_writer_;
     metadata::MetadataStore& metadata_store_;
     BS::thread_pool<>& workers_;
-    mutable std::mutex ranges_mutex_;
     std::vector<std::unique_ptr<RangeWriteState>>
         ranges_;
     const std::size_t geometry_capacity_;
@@ -160,12 +149,9 @@ private:
     std::future<std::error_code> pending_flush_;
     std::chrono::steady_clock::time_point last_flush_time_{std::chrono::steady_clock::now()};
     std::size_t bytes_since_flush_ = 0;
-    std::size_t current_out_of_order_packets_ = 0;
-    std::int64_t current_out_of_order_bytes_ = 0;
     mutable std::mutex error_mutex_;
     std::error_code error_;
     bool stopping_ = false;
-    std::uint64_t sampled_data_packet_counter_ = 0;
 };
 
 } // namespace asyncdownload::persistence

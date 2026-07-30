@@ -2,10 +2,8 @@
 
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "asyncdownload/types.hpp"
-#include "core/constants.hpp"
 #include "download/download_policy.hpp"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -36,43 +34,6 @@ struct BlockCrcSample {
     std::uint32_t crc32 = 0;
     // 采样长度通常等于 block_size，只有最后一个块可能更短。
     std::size_t length = 0;
-};
-
-struct TailBuffer {
-    // Persistence 线程只会把完整对齐块直接写盘，不满 4KB 的尾巴先暂存在这里，
-    // 等后续数据补齐或 range 结束时再一起刷到磁盘。
-    std::array<std::uint8_t, TAIL_BUFFER_CAPACITY_BYTES> data{};
-    std::size_t length = 0;
-    std::int64_t offset = 0;
-};
-
-struct RangeContext {
-    RangeContext(const std::size_t id,
-                 const std::int64_t start,
-                 const std::int64_t end) noexcept
-        : range_id(id),
-          start_offset(start),
-          end_offset(end),
-          current_offset(start),
-          persisted_offset(start) {}
-
-    // range_id 在整个任务内唯一，用来把网络包、控制包、metadata 快照关联到同一 range。
-    const std::size_t range_id;
-    // 逻辑起点保持不变，主要用于恢复、位图推进和调试。
-    const std::int64_t start_offset;
-    // end_offset 在安全 steal 时可以被缩短，因此用原子维护。
-    std::atomic<std::int64_t> end_offset;
-    // current_offset 表示调度器已经租出去的前沿，而不是已经写盘的前沿。
-    std::atomic<std::int64_t> current_offset;
-    TailBuffer tail_buffer;
-    // status 是给调度、进度展示和恢复快照看的粗粒度状态。
-    std::atomic<std::uint8_t> status{static_cast<std::uint8_t>(RangeStatus::empty)};
-    std::atomic<bool> pause_for_gap{false};
-    // marked_finished 代表 Persistence 已经确认该 range 的最终收尾完成。
-    std::atomic<bool> marked_finished{false};
-    // persisted_offset 只由 Persistence 线程推进，表示这个 range 已经按顺序
-    // 物理写入到磁盘的逻辑前沿。
-    std::int64_t persisted_offset;
 };
 
 struct RangeStateSnapshot {
@@ -139,7 +100,6 @@ struct SessionState {
     std::atomic<std::int64_t> persisted_bytes{0};
     // vdl_offset 表示当前已经 flush 并进入恢复元数据的最长连续安全前沿。
     std::atomic<std::int64_t> vdl_offset{0};
-    std::atomic<bool> cancel_requested{false};
     std::atomic<bool> stop_requested{false};
     std::chrono::steady_clock::time_point task_started_at{};
     ProgressCallback progress_callback{};

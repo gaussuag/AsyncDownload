@@ -172,7 +172,7 @@ TEST_F(
 
 TEST_F(
     RangeLifecycleFaultTest,
-    WriteStateAllocationFailureLeavesRegistrationRetryable) {
+    WriteStateAllocationFailureStopsPersistenceWithoutAck) {
     asyncdownload::core::SessionState session(
         effective_fault_policy());
     std::unique_ptr<asyncdownload::flow::PacketFlow>
@@ -195,22 +195,43 @@ TEST_F(
         store,
         workers,
         1);
-    asyncdownload::core::RangeContext range(0, 0, 4095);
     auto& plan =
         asyncdownload::range::detail::range_fault_plan();
     plan.fail_next_write_state_allocation.store(
         true,
         std::memory_order_release);
-
-    const auto failed =
-        persistence.register_range(&range);
-    const auto succeeded =
-        persistence.register_range(&range);
+    const auto submitted =
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 4096},
+                0,
+                {}
+            });
+    ASSERT_FALSE(submitted.error);
+    persistence.start();
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(1);
+    while (!persistence.error() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1));
+    }
+    const auto close_error =
+        packet_flow->producer().close();
+    persistence.stop();
+    persistence.join();
 
     EXPECT_EQ(
-        failed,
+        persistence.error(),
         std::make_error_code(std::errc::not_enough_memory));
-    EXPECT_FALSE(succeeded);
+    EXPECT_EQ(close_error, persistence.error());
+    EXPECT_FALSE(
+        persistence.poll_range_geometry_ack().ack.has_value());
+    EXPECT_EQ(
+        packet_flow->producer().snapshot().accounted_bytes,
+        0U);
 }
 
 TEST_F(
@@ -261,8 +282,15 @@ TEST_F(
         store,
         workers,
         1);
-    asyncdownload::core::RangeContext range(0, 0, 4095);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    ASSERT_FALSE(
+        persistence.submit_range_geometry(
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 4096},
+                0,
+                facts.publisher()
+            }).error);
     persistence.start();
     auto& plan =
         asyncdownload::range::detail::range_fault_plan();
@@ -307,95 +335,6 @@ TEST_F(
         observed_error,
         std::make_error_code(std::errc::not_enough_memory));
     EXPECT_EQ(close_error, observed_error);
-    EXPECT_EQ(flow_snapshot.queued_packets, 0U);
-    EXPECT_EQ(flow_snapshot.accounted_bytes, 0U);
-}
-
-TEST_F(
-    RangeLifecycleFaultTest,
-    ReorderTrackingUnderflowBecomesPersistenceError) {
-    asyncdownload::core::SessionState session(
-        effective_fault_policy());
-    const auto temp_root =
-        std::filesystem::temp_directory_path() /
-        "asyncdownload_range_underflow_test";
-    std::error_code filesystem_error;
-    std::filesystem::create_directories(
-        temp_root,
-        filesystem_error);
-    ASSERT_FALSE(filesystem_error);
-    session.paths.temporary_path =
-        temp_root / "output.bin.part";
-    session.paths.metadata_path =
-        temp_root / "output.bin.config.json";
-    session.paths.output_path =
-        temp_root / "output.bin";
-    session.url = "http://127.0.0.1/fault.bin";
-    std::unique_ptr<asyncdownload::flow::PacketFlow>
-        packet_flow;
-    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
-        session.effective_policy.flow_control(),
-        session.telemetry_session_,
-        packet_flow));
-    asyncdownload::flow::ProducerLane lane;
-    ASSERT_FALSE(
-        packet_flow->producer().open_lane(lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(1);
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(
-        session.paths.temporary_path,
-        session.total_size,
-        false,
-        true));
-    asyncdownload::metadata::MetadataStore store(
-        session.paths.metadata_path);
-    BS::thread_pool<> workers(1);
-    asyncdownload::persistence::PersistenceThread persistence(
-        session,
-        session.effective_policy.persistence(),
-        packet_flow->consumer(),
-        bitmap,
-        writer,
-        store,
-        workers,
-        1);
-    asyncdownload::core::RangeContext range(0, 0, 4095);
-    ASSERT_FALSE(persistence.register_range(&range));
-    auto& plan =
-        asyncdownload::range::detail::range_fault_plan();
-    plan.corrupt_next_reorder_tracking.store(
-        true,
-        std::memory_order_release);
-    const std::array<std::uint8_t, 512> payload{};
-    ASSERT_TRUE(packet_flow->producer().accept(
-        lane,
-        {{{0}, 1}, {0, 4096}, 2048, payload})
-        .accepted());
-    ASSERT_TRUE(
-        packet_flow->producer().flush(lane).accepted());
-    const std::array<std::uint8_t, 2048> head{};
-    ASSERT_TRUE(packet_flow->producer().accept(
-        lane,
-        {{{0}, 1}, {0, 4096}, 0, head})
-        .accepted());
-    ASSERT_TRUE(
-        packet_flow->producer().flush(lane).accepted());
-    ASSERT_FALSE(packet_flow->producer().close());
-    persistence.start();
-    persistence.stop();
-    persistence.join();
-    const auto flow_snapshot =
-        packet_flow->producer().snapshot();
-    writer.close();
-    const auto removed = std::filesystem::remove_all(
-        temp_root,
-        filesystem_error);
-    static_cast<void>(removed);
-
-    EXPECT_EQ(
-        persistence.error(),
-        asyncdownload::make_error_code(
-            asyncdownload::DownloadErrc::internal_error));
     EXPECT_EQ(flow_snapshot.queued_packets, 0U);
     EXPECT_EQ(flow_snapshot.accounted_bytes, 0U);
 }

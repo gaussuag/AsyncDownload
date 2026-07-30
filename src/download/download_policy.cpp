@@ -6,7 +6,7 @@
 #include <utility>
 
 #include "asyncdownload/error.hpp"
-#include "core/models.hpp"
+#include "core/constants.hpp"
 
 namespace asyncdownload::download {
 namespace {

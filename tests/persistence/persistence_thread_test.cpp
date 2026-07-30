@@ -101,6 +101,22 @@ bool wait_for_condition(const std::function<bool()>& predicate,
     return predicate();
 }
 
+void submit_range_registration(
+    asyncdownload::persistence::PersistenceThread& persistence,
+    asyncdownload::range::RangeFactSlot& facts,
+    const std::int64_t total_size,
+    const std::uint64_t range_id = 0) {
+    const auto submitted = persistence.submit_range_geometry(
+        asyncdownload::range::RegisterRangeEffect{
+            {range_id},
+            {0, total_size},
+            0,
+            facts.publisher()
+        });
+    ASSERT_FALSE(submitted.error);
+    ASSERT_NE(submitted.ticket, 0U);
+}
+
 asyncdownload::download::EffectiveDownloadPolicy make_effective_policy(
     const asyncdownload::download::PersistencePolicy& policy,
     const std::int64_t total_size) {
@@ -176,8 +192,8 @@ void persist_single_range_at_tail_capacity(
         store,
         workers);
 
-    asyncdownload::core::RangeContext range(0, 0, total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(persistence, facts, total_size);
     persistence.start();
 
     TestPacket packet{};
@@ -186,12 +202,13 @@ void persist_single_range_at_tail_capacity(
     packet.payload.assign(static_cast<std::size_t>(total_size), 0x5A);
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, packet);
-    EXPECT_FALSE(range.marked_finished.load(
-        std::memory_order_acquire));
+    EXPECT_FALSE(facts.read_since(0).has_value());
     enqueue_range_complete(packet_flow->producer(), session, 0);
 
-    ASSERT_TRUE(wait_for_condition([&range]() {
-        return range.marked_finished.load(std::memory_order_acquire);
+    ASSERT_TRUE(wait_for_condition([&facts]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            snapshot->committed_generation == 1;
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
@@ -226,7 +243,7 @@ struct PersistenceScenarioResult {
     std::error_code error;
     asyncdownload::flow::PacketFlowSnapshot flow;
     std::int64_t persisted_through = 0;
-    bool marked_finished = false;
+    bool committed = false;
 };
 
 PersistenceScenarioResult run_persistence_scenario(
@@ -288,11 +305,11 @@ PersistenceScenarioResult run_persistence_scenario(
         store,
         workers,
         1);
-    asyncdownload::core::RangeContext range(
-        0,
-        0,
-        total_size - 1);
-    EXPECT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        total_size);
     if (!close_writer_before_start) {
         persistence.start();
     }
@@ -329,12 +346,15 @@ PersistenceScenarioResult run_persistence_scenario(
     }
     persistence.stop();
     persistence.join();
+    const auto fact_snapshot = facts.read_since(0);
     PersistenceScenarioResult result{
         persistence.error(),
         packet_flow->producer().snapshot(),
-        range.persisted_offset,
-        range.marked_finished.load(
-            std::memory_order_acquire)
+        fact_snapshot.has_value() ?
+            fact_snapshot->persisted_through :
+            0,
+        fact_snapshot.has_value() &&
+            fact_snapshot->committed_generation != 0
     };
     writer.close();
     const auto removed = std::filesystem::remove_all(
@@ -545,7 +565,7 @@ TEST(
         run_persistence_scenario({packet}, {completion});
 
     EXPECT_TRUE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
 }
 
 TEST(
@@ -607,7 +627,7 @@ TEST(
         run_persistence_scenario({buffered}, {completion});
 
     EXPECT_TRUE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
     EXPECT_EQ(result.flow.accounted_bytes, 0U);
 }
 
@@ -629,7 +649,7 @@ TEST(
         run_persistence_scenario({packet}, {completion});
 
     EXPECT_TRUE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
     EXPECT_EQ(result.persisted_through, 512);
 }
 
@@ -651,7 +671,7 @@ TEST(
         run_persistence_scenario({packet}, {completion});
 
     EXPECT_TRUE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
 }
 
 TEST(
@@ -675,7 +695,7 @@ TEST(
         4095);
 
     EXPECT_TRUE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
 }
 
 TEST(
@@ -697,7 +717,7 @@ TEST(
         {completion, completion});
 
     EXPECT_FALSE(result.error);
-    EXPECT_TRUE(result.marked_finished);
+    EXPECT_TRUE(result.committed);
     EXPECT_EQ(result.persisted_through, 4096);
 }
 
@@ -724,7 +744,7 @@ TEST(
         run_persistence_scenario({first, second}, {stale});
 
     EXPECT_FALSE(result.error);
-    EXPECT_FALSE(result.marked_finished);
+    EXPECT_FALSE(result.committed);
     EXPECT_EQ(result.persisted_through, 1024);
 }
 
@@ -752,7 +772,7 @@ TEST(
         {completion, conflicting});
 
     EXPECT_TRUE(result.error);
-    EXPECT_TRUE(result.marked_finished);
+    EXPECT_TRUE(result.committed);
 }
 
 TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {
@@ -798,8 +818,11 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     asyncdownload::persistence::PersistenceThread persistence(
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
-    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        session.total_size);
     persistence.start();
 
     TestPacket packet{};
@@ -809,8 +832,10 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, packet);
 
-    EXPECT_TRUE(wait_for_condition([&range]() {
-        return range.pause_for_gap.load(std::memory_order_acquire);
+    EXPECT_TRUE(wait_for_condition([&facts]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            snapshot->gap_paused;
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
@@ -857,8 +882,11 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     asyncdownload::persistence::PersistenceThread persistence(
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
-    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        session.total_size);
     persistence.start();
 
     TestPacket packet{};
@@ -919,8 +947,11 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     asyncdownload::persistence::PersistenceThread persistence(
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
-    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        session.total_size);
     persistence.start();
 
     TestPacket packet{};
@@ -983,8 +1014,11 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     asyncdownload::persistence::PersistenceThread persistence(
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
-    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        session.total_size);
     persistence.start();
 
     TestPacket packet{};
@@ -1046,8 +1080,11 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     asyncdownload::persistence::PersistenceThread persistence(
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
-    asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    ASSERT_FALSE(persistence.register_range(&range));
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
+    submit_range_registration(
+        persistence,
+        facts,
+        session.total_size);
     persistence.start();
 
     TestPacket tail_packet{};
@@ -1057,8 +1094,10 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, tail_packet);
 
-    ASSERT_TRUE(wait_for_condition([&range]() {
-        return range.pause_for_gap.load(std::memory_order_acquire);
+    ASSERT_TRUE(wait_for_condition([&facts]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            snapshot->gap_paused;
     }, std::chrono::milliseconds(1000)));
 
     TestPacket head_packet{};
@@ -1068,15 +1107,19 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, head_packet);
 
-    EXPECT_TRUE(wait_for_condition([&range, &session]() {
-        return !range.pause_for_gap.load(std::memory_order_acquire) &&
+    EXPECT_TRUE(wait_for_condition([&facts, &session]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            !snapshot->gap_paused &&
             session.persisted_bytes.load(std::memory_order_acquire) == 12 * 1024;
     }, std::chrono::milliseconds(1000)));
 
     enqueue_range_complete(packet_flow->producer(), session, 0);
 
-    EXPECT_TRUE(wait_for_condition([&range]() {
-        return range.marked_finished.load(std::memory_order_acquire);
+    EXPECT_TRUE(wait_for_condition([&facts]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            snapshot->committed_generation == 1;
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
@@ -1142,8 +1185,6 @@ TEST(
         store,
         workers,
         1);
-    asyncdownload::core::RangeContext range(0, 0, 4095);
-    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     const auto registered = persistence.submit_range_geometry(
@@ -1169,7 +1210,6 @@ TEST(
         },
         std::chrono::milliseconds(1000));
 
-    range.end_offset.store(2047, std::memory_order_release);
     const auto resized = persistence.submit_range_geometry(
         asyncdownload::persistence::RangeGeometryCommand{
             asyncdownload::range::ResizeRangeEffect{

@@ -139,99 +139,6 @@ std::optional<StealPlan> RangeScheduler::choose_steal(
     return StealPlan{donor->id, split};
 }
 
-std::vector<std::unique_ptr<core::RangeContext>>
-RangeScheduler::build_initial_ranges(const core::AtomicBlockBitmap& bitmap) noexcept {
-    std::vector<std::unique_ptr<core::RangeContext>> ranges;
-    // 调度器看到的输入不是“整个文件”，而是“当前 bitmap 上还没 finished 的洞”。
-    // 对新任务来说这些洞覆盖整文件；对恢复任务来说只覆盖未完成区域。
-    const auto spans = split_spans(build_unfinished_spans(bitmap));
-
-    for (const auto& [start, end] : spans) {
-        if (start > end) {
-            continue;
-        }
-
-        ranges.push_back(std::make_unique<core::RangeContext>(next_range_id_++, start, end));
-    }
-
-    return ranges;
-}
-
-std::unique_ptr<core::RangeContext>
-RangeScheduler::steal_largest_range(
-    const std::vector<std::unique_ptr<core::RangeContext>>& ranges) noexcept {
-    if (!policy_.allow_work_stealing) {
-        // 非 Range 服务端无法安全把一段下载任务拆给第二个请求，所以直接禁用 steal。
-        return nullptr;
-    }
-
-    core::RangeContext* donor = nullptr;
-    std::int64_t donor_remaining = 0;
-
-    // 这里偷的不是“当前正在飞行的 HTTP 响应体”，而是 donor 还没派发出去的尾部区间。
-    // 这样可以避免在一个正在进行中的请求中途硬缩短 range 带来的复杂竞态。
-    for (const auto& range_ptr : ranges) {
-        auto* candidate = range_ptr.get();
-        if (candidate->marked_finished.load(std::memory_order_acquire)) {
-            continue;
-        }
-
-        const auto current = candidate->current_offset.load(std::memory_order_acquire);
-        const auto end = candidate->end_offset.load(std::memory_order_acquire);
-        if (current >= end) {
-            continue;
-        }
-
-        const auto remaining = end - current + 1;
-        if (remaining > donor_remaining) {
-            donor = candidate;
-            donor_remaining = remaining;
-        }
-    }
-
-    if (donor == nullptr ||
-        !has_two_units(donor_remaining, policy_.block_bytes) ||
-        (policy_.connection_limit >= 16 &&
-         !has_two_units(donor_remaining, policy_.transfer_window_bytes))) {
-        return nullptr;
-    }
-
-    const auto current = donor->current_offset.load(std::memory_order_acquire);
-    const auto old_end = donor->end_offset.load(std::memory_order_acquire);
-    // midpoint 必须按 block_size 对齐，这样新旧 range 的分界线就和位图颗粒度一致，
-    // 后续 finished 判定和恢复逻辑都会更稳定。
-    const auto midpoint = align_down(
-        current + (donor_remaining / 2),
-        policy_.block_bytes);
-    if (midpoint <= current || midpoint > old_end) {
-        return nullptr;
-    }
-
-    donor->end_offset.store(midpoint - 1, std::memory_order_release);
-    return std::make_unique<core::RangeContext>(next_range_id_++, midpoint, old_end);
-}
-
-std::pair<std::int64_t, std::int64_t>
-RangeScheduler::next_window(const core::RangeContext& range) const noexcept {
-    const auto start = range.current_offset.load(std::memory_order_acquire);
-    const auto end = range.end_offset.load(std::memory_order_acquire);
-    if (start > end) {
-        return {0, -1};
-    }
-
-    if (!policy_.issue_range_requests) {
-        // 不能做 Range 时，一个请求必须覆盖整文件；这里返回完整区间，
-        // 让上层走最保守的单请求路径。
-        return {0, total_size_ - 1};
-    }
-
-    // window 是“单次 HTTP 请求的租约大小”，不是整个逻辑 range 的大小。
-    // 这样同一个 range 可以被拆成多个顺序请求，中间还能给 work stealing 留空间。
-    const auto remaining = end - start + 1;
-    const auto extent = std::min(remaining, policy_.transfer_window_bytes);
-    return {start, start + extent - 1};
-}
-
 std::vector<std::pair<std::int64_t, std::int64_t>>
 RangeScheduler::build_unfinished_spans(const core::AtomicBlockBitmap& bitmap) const noexcept {
     std::vector<std::pair<std::int64_t, std::int64_t>> spans;
@@ -284,7 +191,7 @@ RangeScheduler::split_spans(
     std::vector<std::pair<std::int64_t, std::int64_t>> result = spans;
 
     // 初始切分尽量把最大洞不断对半拆开，直到足够喂满可用连接数。
-    // 后续运行期如果仍有负载不均，再交给 steal_largest_range 做动态修正。
+    // 后续运行期如果仍有负载不均，再通过纯提案做动态修正。
     while (result.size() < policy_.connection_limit) {
         auto largest_it = std::max_element(result.begin(), result.end(),
             [](const auto& lhs, const auto& rhs) {
@@ -302,7 +209,7 @@ RangeScheduler::split_spans(
         }
 
         // 初始切分使用 align_up，让右半段总是从块边界开始，便于后续把它直接作为
-        // 一个独立 RangeContext 派发出去。
+        // 一个独立 range 派发出去。
         std::int64_t midpoint = 0;
         if (!align_up_within(
                 start + (remaining / 2),
