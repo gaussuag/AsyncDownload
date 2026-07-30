@@ -811,4 +811,99 @@ TEST_F(
 #endif
 }
 
+TEST_F(
+    CurlHttpTransferTest,
+    PreservesCallbackCauseOverWriteError) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This test currently uses Windows process control.";
+#else
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("asyncdownload_curl_callback_cause_" +
+         std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    ASSERT_FALSE(ec);
+    const auto source = root / "source.bin";
+    const auto request_log = root / "requests.log";
+    {
+        std::ofstream stream(
+            source,
+            std::ios::binary |
+                std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        const std::array<char, 5> bytes{
+            1,
+            2,
+            3,
+            4,
+            5
+        };
+        stream.write(
+            bytes.data(),
+            static_cast<std::streamsize>(
+                bytes.size()));
+    }
+
+    PythonServer server;
+    ASSERT_TRUE(start_python_server(
+        server,
+        source,
+        request_log,
+        L" --force-get-content-encoding gzip"));
+    const auto server_port =
+        read_server_port(server);
+    ASSERT_FALSE(server_port.empty());
+    auto session = open_session(
+        "http://127.0.0.1:" + server_port +
+            "/source.bin",
+        5,
+        1);
+    const asyncdownload::range::RangeLease
+        requested{
+            {{1}, 1},
+            {0, 4},
+            true
+        };
+    ASSERT_EQ(
+        session->start(requested).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+
+    const auto result =
+        poll_until_event(
+            *session,
+            std::chrono::seconds(2));
+    ASSERT_EQ(
+        result.code,
+        asyncdownload::http::
+            HttpPollCode::event);
+    ASSERT_TRUE(result.event.has_value());
+    const auto* failure =
+        std::get_if<
+            asyncdownload::http::
+                HttpLeaseFailed>(
+            &*result.event);
+    ASSERT_NE(failure, nullptr);
+    EXPECT_EQ(
+        failure->failure.reason,
+        asyncdownload::http::
+            HttpFailureReason::
+                content_encoding_invalid);
+    EXPECT_EQ(
+        failure->failure.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                http_invalid_response));
+    EXPECT_EQ(failure->accepted_through, 0);
+    EXPECT_TRUE(session->close());
+    server.stop();
+
+    const auto removed =
+        std::filesystem::remove_all(root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
 }

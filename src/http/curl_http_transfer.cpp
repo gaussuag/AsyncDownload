@@ -4,9 +4,8 @@
 #include "asyncdownload/telemetry/telemetry_event.hpp"
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "flow/packet_flow.hpp"
+#include "curl_runtime_adapter.hpp"
 #include "http_response_accumulator.hpp"
-
-#include <curl/curl.h>
 
 #include <algorithm>
 #include <chrono>
@@ -73,66 +72,56 @@ std::size_t capture_probe_header(
         : CURL_WRITEFUNC_ERROR;
 }
 
-void configure_probe_common(
+bool configure_probe_common(
     CURL* easy,
     const std::string& url,
     HttpResponseAccumulator& response,
     curl_slist* identity_headers) noexcept {
-    static_cast<void>(
-        curl_easy_setopt(
-            easy,
-            CURLOPT_URL,
-            url.c_str()));
-    static_cast<void>(
-        curl_easy_setopt(
+    return detail::easy_setopt(
+               easy,
+               CURLOPT_URL,
+               url.c_str()) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_FOLLOWLOCATION,
-            1L));
-    static_cast<void>(
-        curl_easy_setopt(
+            1L) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_NOSIGNAL,
-            1L));
-    static_cast<void>(
-        curl_easy_setopt(
+            1L) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_HTTP_VERSION,
-            CURL_HTTP_VERSION_1_1));
-    static_cast<void>(
-        curl_easy_setopt(
+            CURL_HTTP_VERSION_1_1) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_WRITEFUNCTION,
-            discard_probe_body));
-    static_cast<void>(
-        curl_easy_setopt(
+            discard_probe_body) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_WRITEDATA,
-            &response));
-    static_cast<void>(
-        curl_easy_setopt(
+            &response) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_HEADERFUNCTION,
-            capture_probe_header));
-    static_cast<void>(
-        curl_easy_setopt(
+            capture_probe_header) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_HEADERDATA,
-            &response));
-    static_cast<void>(
-        curl_easy_setopt(
+            &response) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_ACCEPT_ENCODING,
-            static_cast<const char*>(nullptr)));
-    static_cast<void>(
-        curl_easy_setopt(
+            static_cast<const char*>(
+                nullptr)) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_HTTP_CONTENT_DECODING,
-            0L));
-    static_cast<void>(
-        curl_easy_setopt(
+            0L) == CURLE_OK &&
+        detail::easy_setopt(
             easy,
             CURLOPT_HTTPHEADER,
-            identity_headers));
+            identity_headers) == CURLE_OK;
 }
 
 HttpProbeResult failed_probe(
@@ -148,7 +137,7 @@ HttpProbeResult failed_probe(
 HttpProbeResult fallback_probe(
     const HttpProbeRequest& request,
     curl_slist* identity_headers) noexcept {
-    CURL* easy = curl_easy_init();
+    CURL* easy = detail::easy_init();
     if (easy == nullptr) {
         return failed_probe(
             make_failure(
@@ -157,37 +146,42 @@ HttpProbeResult fallback_probe(
     }
 
     HttpResponseAccumulator response;
-    configure_probe_common(
-        easy,
-        request.url,
-        response,
-        identity_headers);
-    static_cast<void>(
-        curl_easy_setopt(
+    if (!configure_probe_common(
+            easy,
+            request.url,
+            response,
+            identity_headers) ||
+        detail::easy_setopt(
             easy,
             CURLOPT_HTTPGET,
-            1L));
-    static_cast<void>(
-        curl_easy_setopt(
+            1L) != CURLE_OK ||
+        detail::easy_setopt(
             easy,
             CURLOPT_RANGE,
-            "0-0"));
+            "0-0") != CURLE_OK) {
+        detail::easy_cleanup(easy);
+        return failed_probe(
+            make_failure(
+                HttpFailureReason::
+                    easy_option_failed,
+                DownloadErrc::http_probe_failed));
+    }
 
     const auto curl_result =
-        curl_easy_perform(easy);
+        detail::easy_perform(easy);
     long response_code = 0;
-    static_cast<void>(
-        curl_easy_getinfo(
+    const auto response_info =
+        detail::easy_getinfo(
             easy,
             CURLINFO_RESPONSE_CODE,
-            &response_code));
+            &response_code);
     curl_off_t response_length = -1;
-    static_cast<void>(
-        curl_easy_getinfo(
+    const auto length_info =
+        detail::easy_getinfo(
             easy,
             CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
-            &response_length));
-    curl_easy_cleanup(easy);
+            &response_length);
+    detail::easy_cleanup(easy);
 
     if (curl_result != CURLE_OK ||
         response.parser_failed()) {
@@ -198,6 +192,15 @@ HttpProbeResult fallback_probe(
                         header_callback_failed
                     : HttpFailureReason::
                         transport_failed,
+                DownloadErrc::http_probe_failed),
+            response_code);
+    }
+    if (response_info != CURLE_OK ||
+        length_info != CURLE_OK) {
+        return failed_probe(
+            make_failure(
+                HttpFailureReason::
+                    easy_info_failed,
                 DownloadErrc::http_probe_failed),
             response_code);
     }
@@ -325,7 +328,8 @@ public:
                         config,
                         packet_producer,
                         telemetry));
-            session->multi_ = curl_multi_init();
+            session->multi_ =
+                detail::multi_init();
             if (session->multi_ == nullptr) {
                 return {
                     nullptr,
@@ -336,7 +340,7 @@ public:
                 };
             }
             session->identity_headers_ =
-                curl_slist_append(
+                detail::slist_append(
                     nullptr,
                     "Accept-Encoding: identity");
             if (session->identity_headers_ == nullptr) {
@@ -349,13 +353,13 @@ public:
                             http_init_failed)
                 };
             }
-            if (curl_multi_setopt(
+            if (detail::multi_setopt(
                     session->multi_,
                     CURLMOPT_MAX_TOTAL_CONNECTIONS,
                     static_cast<long>(
                         config.max_active_transfers)) !=
                     CURLM_OK ||
-                curl_multi_setopt(
+                detail::multi_setopt(
                     session->multi_,
                     CURLMOPT_MAX_HOST_CONNECTIONS,
                     static_cast<long>(
@@ -379,7 +383,8 @@ public:
                 slot->owner = session.get();
                 slot->id =
                     static_cast<TransferSlotId>(index);
-                slot->easy = curl_easy_init();
+                slot->easy =
+                    detail::easy_init();
                 if (slot->easy == nullptr) {
                     return {
                         nullptr,
@@ -427,7 +432,7 @@ public:
     }
 
     ~CurlHttpTransferSession() override {
-        cleanup_unchecked();
+        static_cast<void>(cleanup());
     }
 
     HttpStartResult start(
@@ -516,7 +521,7 @@ public:
             slot.response.reset();
             slot.range_header.clear();
 
-            curl_easy_reset(slot.easy);
+            detail::easy_reset(slot.easy);
             if (!configure_slot(slot)) {
                 slot.lease.reset();
                 return failed_start(
@@ -526,7 +531,7 @@ public:
                         DownloadErrc::
                             http_transfer_failed));
             }
-            if (curl_multi_add_handle(
+            if (detail::multi_add_handle(
                     multi_,
                     slot.easy) != CURLM_OK) {
                 slot.lease.reset();
@@ -616,6 +621,13 @@ public:
                 {}
             };
         }
+        if (state_ == HttpSessionState::failed) {
+            return {
+                HttpPollCode::failed,
+                std::nullopt,
+                error_
+            };
+        }
 
         const auto reconcile_error =
             reconcile_pauses();
@@ -659,7 +671,7 @@ public:
 
         int descriptor_count = 0;
         const auto wait_result =
-            curl_multi_wait(
+            detail::multi_wait(
                 multi_,
                 nullptr,
                 0,
@@ -727,7 +739,7 @@ public:
             }
             slot.cancelling = true;
             if (slot.in_multi) {
-                if (curl_multi_remove_handle(
+                if (detail::multi_remove_handle(
                         multi_,
                         slot.easy) != CURLM_OK &&
                     !error_) {
@@ -815,9 +827,11 @@ public:
             return make_error_code(
                 DownloadErrc::internal_error);
         }
-        cleanup_unchecked();
+        const auto cleanup_error = cleanup();
         state_ = HttpSessionState::closed;
-        return error_;
+        return error_
+            ? error_
+            : cleanup_error;
     }
 
 private:
@@ -1003,7 +1017,7 @@ private:
         const auto set = [&slot](
             const CURLoption option,
             const auto value) noexcept {
-            return curl_easy_setopt(
+            return detail::easy_setopt(
                 slot.easy,
                 option,
                 value) == CURLE_OK;
@@ -1115,18 +1129,24 @@ private:
                 slot->gap_paused;
             if (should_pause &&
                 !slot->curl_receive_paused) {
-                static_cast<void>(
-                    curl_easy_pause(
+                if (detail::easy_pause(
                         slot->easy,
-                        CURLPAUSE_RECV));
+                        CURLPAUSE_RECV) != CURLE_OK) {
+                    return make_error_code(
+                        DownloadErrc::
+                            http_transfer_failed);
+                }
                 slot->curl_receive_paused = true;
             } else if (!should_pause &&
                        slot->curl_receive_paused) {
                 slot->curl_receive_paused = false;
-                static_cast<void>(
-                    curl_easy_pause(
+                if (detail::easy_pause(
                         slot->easy,
-                        CURLPAUSE_CONT));
+                        CURLPAUSE_CONT) != CURLE_OK) {
+                    return make_error_code(
+                        DownloadErrc::
+                            http_transfer_failed);
+                }
             }
         }
         return {};
@@ -1135,7 +1155,7 @@ private:
     DriveResult perform_and_drain() noexcept {
         int running_handles = 0;
         const auto perform_result =
-            curl_multi_perform(
+            detail::multi_perform(
                 multi_,
                 &running_handles);
         static_cast<void>(running_handles);
@@ -1152,7 +1172,7 @@ private:
         }
         int pending_messages = 0;
         while (auto* message =
-                   curl_multi_info_read(
+                   detail::multi_info_read(
                        multi_,
                        &pending_messages)) {
             if (message->msg != CURLMSG_DONE) {
@@ -1188,35 +1208,49 @@ private:
         Slot& slot,
         const CURLcode curl_result) noexcept {
         long response_code = 0;
-        static_cast<void>(
-            curl_easy_getinfo(
+        const auto response_info =
+            detail::easy_getinfo(
                 slot.easy,
                 CURLINFO_RESPONSE_CODE,
-                &response_code));
+                &response_code);
         curl_off_t speed = 0;
-        static_cast<void>(
-            curl_easy_getinfo(
+        const auto speed_info =
+            detail::easy_getinfo(
                 slot.easy,
                 CURLINFO_SPEED_DOWNLOAD_T,
-                &speed));
-        if (speed > 0) {
+                &speed);
+        if (speed_info == CURLE_OK &&
+            speed > 0) {
             slot.bytes_per_second =
                 static_cast<double>(speed);
         }
+        auto remove_result = CURLM_OK;
         if (slot.in_multi) {
-            static_cast<void>(
-                curl_multi_remove_handle(
+            remove_result =
+                detail::multi_remove_handle(
                     multi_,
-                    slot.easy));
-            slot.in_multi = false;
+                    slot.easy);
+            if (remove_result == CURLM_OK) {
+                slot.in_multi = false;
+            }
         }
         HttpFailure failure =
             slot.callback_failure;
         if (!failure.error) {
-            failure =
-                validate_response(
-                    slot,
-                    response_code);
+            if (response_info != CURLE_OK ||
+                speed_info != CURLE_OK) {
+                failure = make_failure(
+                    HttpFailureReason::
+                        easy_info_failed,
+                    DownloadErrc::
+                        http_transfer_failed);
+            } else if (remove_result != CURLM_OK) {
+                failure = make_failure(
+                    HttpFailureReason::
+                        remove_handle_failed,
+                    DownloadErrc::
+                        http_transfer_failed);
+            }
         }
         const auto flush_error =
             flush_lane(slot);
@@ -1234,6 +1268,12 @@ private:
                     transport_failed,
                 DownloadErrc::
                     http_transfer_failed);
+        }
+        if (!failure.error) {
+            failure =
+                validate_response(
+                    slot,
+                    response_code);
         }
         if (!failure.error &&
             slot.lease.has_value() &&
@@ -1495,31 +1535,48 @@ private:
         }
     }
 
-    void cleanup_unchecked() noexcept {
+    std::error_code cleanup() noexcept {
+        std::error_code cleanup_error;
         for (auto& slot : slots_) {
             if (slot->in_multi &&
                 multi_ != nullptr) {
-                static_cast<void>(
-                    curl_multi_remove_handle(
+                if (detail::multi_remove_handle(
                         multi_,
-                        slot->easy));
+                        slot->easy) != CURLM_OK &&
+                    !cleanup_error) {
+                    cleanup_error =
+                        make_error_code(
+                            DownloadErrc::
+                                http_transfer_failed);
+                }
                 slot->in_multi = false;
             }
             if (slot->easy != nullptr) {
-                curl_easy_cleanup(slot->easy);
+                detail::easy_cleanup(
+                    slot->easy);
                 slot->easy = nullptr;
             }
         }
         if (multi_ != nullptr) {
-            static_cast<void>(
-                curl_multi_cleanup(multi_));
+            if (detail::multi_cleanup(
+                    multi_) != CURLM_OK &&
+                !cleanup_error) {
+                cleanup_error =
+                    make_error_code(
+                        DownloadErrc::
+                            http_transfer_failed);
+            }
             multi_ = nullptr;
         }
         if (identity_headers_ != nullptr) {
-            curl_slist_free_all(
+            detail::slist_free_all(
                 identity_headers_);
             identity_headers_ = nullptr;
         }
+        if (!error_ && cleanup_error) {
+            error_ = cleanup_error;
+        }
+        return cleanup_error;
     }
 
     HttpSessionConfig config_;
@@ -1550,7 +1607,7 @@ public:
         }
 
         curl_slist* identity_headers =
-            curl_slist_append(
+            detail::slist_append(
                 nullptr,
                 "Accept-Encoding: identity");
         if (identity_headers == nullptr) {
@@ -1562,10 +1619,10 @@ public:
         }
         const auto free_identity_headers =
             [&identity_headers]() noexcept {
-                curl_slist_free_all(
+                detail::slist_free_all(
                     identity_headers);
             };
-        CURL* easy = curl_easy_init();
+        CURL* easy = detail::easy_init();
         if (easy == nullptr) {
             free_identity_headers();
             return failed_probe(
@@ -1575,37 +1632,45 @@ public:
         }
 
         HttpResponseAccumulator response;
-        configure_probe_common(
-            easy,
-            request.url,
-            response,
-            identity_headers);
-        static_cast<void>(
-            curl_easy_setopt(
+        if (!configure_probe_common(
+                easy,
+                request.url,
+                response,
+                identity_headers) ||
+            detail::easy_setopt(
                 easy,
                 CURLOPT_NOBODY,
-                1L));
-        static_cast<void>(
-            curl_easy_setopt(
+                1L) != CURLE_OK ||
+            detail::easy_setopt(
                 easy,
                 CURLOPT_RANGE,
-                nullptr));
+                static_cast<const char*>(
+                    nullptr)) != CURLE_OK) {
+            detail::easy_cleanup(easy);
+            free_identity_headers();
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        easy_option_failed,
+                    DownloadErrc::
+                        http_probe_failed));
+        }
 
         const auto curl_result =
-            curl_easy_perform(easy);
+            detail::easy_perform(easy);
         long response_code = 0;
-        static_cast<void>(
-            curl_easy_getinfo(
+        const auto response_info =
+            detail::easy_getinfo(
                 easy,
                 CURLINFO_RESPONSE_CODE,
-                &response_code));
+                &response_code);
         curl_off_t response_length = -1;
-        static_cast<void>(
-            curl_easy_getinfo(
+        const auto length_info =
+            detail::easy_getinfo(
                 easy,
                 CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
-                &response_length));
-        curl_easy_cleanup(easy);
+                &response_length);
+        detail::easy_cleanup(easy);
 
         if (curl_result != CURLE_OK) {
             const auto result =
@@ -1622,6 +1687,17 @@ public:
                     HttpFailureReason::
                         header_callback_failed,
                     DownloadErrc::http_probe_failed),
+                response_code);
+        }
+        if (response_info != CURLE_OK ||
+            length_info != CURLE_OK) {
+            free_identity_headers();
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        easy_info_failed,
+                    DownloadErrc::
+                        http_probe_failed),
                 response_code);
         }
         if (!response.content_encoding_is_identity()) {
@@ -1674,7 +1750,8 @@ public:
 
 CURLcode curl_runtime_result() noexcept {
     static const auto result =
-        curl_global_init(CURL_GLOBAL_DEFAULT);
+        detail::global_init(
+            CURL_GLOBAL_DEFAULT);
     return result;
 }
 

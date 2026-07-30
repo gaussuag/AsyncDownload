@@ -3,6 +3,7 @@
 )
 list(REMOVE_ITEM ASYNCDOWNLOAD_TEST_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/flow/packet_flow_fault_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/http/curl_http_transfer_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/range/range_lifecycle_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/recovery/recovery_failure_test.cpp"
 )
@@ -60,6 +61,51 @@ target_compile_features(
         cxx_std_20
 )
 gtest_discover_tests(asyncdownload_packet_flow_fault_tests)
+
+add_executable(asyncdownload_http_transfer_fault_tests
+    http/curl_http_transfer_fault_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/flow/packet_flow.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/curl_http_transfer.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/http_response_accumulator.cpp
+    ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_collector.cpp
+    ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_session.cpp
+)
+target_compile_definitions(
+    asyncdownload_http_transfer_fault_tests
+    PRIVATE
+        ASYNCDOWNLOAD_HTTP_TRANSFER_FAULT_TEST
+)
+target_include_directories(
+    asyncdownload_http_transfer_fault_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+)
+file(GLOB HTTP_FAULT_LIB_INCLUDE_DIRS
+    LIST_DIRECTORIES true
+    "${CMAKE_SOURCE_DIR}/libs/*/include")
+foreach(inc_dir ${HTTP_FAULT_LIB_INCLUDE_DIRS})
+    if(IS_DIRECTORY ${inc_dir})
+        target_include_directories(
+            asyncdownload_http_transfer_fault_tests
+            PRIVATE
+                ${inc_dir})
+    endif()
+endforeach()
+target_link_libraries(
+    asyncdownload_http_transfer_fault_tests
+    PRIVATE
+        gtest_main
+        CURL::libcurl
+)
+target_compile_features(
+    asyncdownload_http_transfer_fault_tests
+    PRIVATE
+        cxx_std_20
+)
+gtest_discover_tests(
+    asyncdownload_http_transfer_fault_tests)
 
 add_executable(asyncdownload_range_lifecycle_fault_tests
     range/range_lifecycle_fault_test.cpp
