@@ -1,14 +1,23 @@
 #include "http_transfer.hpp"
 
 #include "asyncdownload/error.hpp"
+#include "asyncdownload/telemetry/telemetry_event.hpp"
+#include "asyncdownload/telemetry/telemetry_session.hpp"
+#include "flow/packet_flow.hpp"
 #include "http_response_accumulator.hpp"
 
 #include <curl/curl.h>
 
+#include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
+#include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace asyncdownload::http {
 namespace {
@@ -241,6 +250,1128 @@ HttpProbeResult fallback_probe(
     };
 }
 
+class CurlHttpTransferSession final :
+    public HttpTransferSession {
+public:
+    struct Slot {
+        CurlHttpTransferSession* owner = nullptr;
+        CURL* easy = nullptr;
+        flow::ProducerLane lane;
+        TransferSlotId id = 0;
+        std::uint64_t generation = 0;
+        std::optional<range::RangeLease> lease;
+        std::optional<HttpTransferEvent> pending_event;
+        HttpResponseAccumulator response;
+        range::ByteOffset accepted_through = 0;
+        std::uint64_t body_bytes = 0;
+        double bytes_per_second = 0.0;
+        std::uint8_t packet_pause_mask = 0;
+        bool gap_paused = false;
+        bool curl_receive_paused = false;
+        bool in_multi = false;
+        bool callback_active = false;
+        bool cancelling = false;
+        bool first_byte_recorded = false;
+        HttpFailure callback_failure{};
+        std::string range_header;
+    };
+
+    static HttpSessionOpenResult create(
+        const HttpSessionConfig& config,
+        flow::PacketProducer& packet_producer,
+        telemetry::TelemetrySession& telemetry) noexcept {
+        if (config.url.empty() ||
+            config.total_size <= 0 ||
+            config.max_active_transfers == 0) {
+            return {
+                nullptr,
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error)
+            };
+        }
+
+        try {
+            auto session =
+                std::unique_ptr<CurlHttpTransferSession>(
+                    new CurlHttpTransferSession(
+                        config,
+                        packet_producer,
+                        telemetry));
+            session->multi_ = curl_multi_init();
+            if (session->multi_ == nullptr) {
+                return {
+                    nullptr,
+                    make_failure(
+                        HttpFailureReason::
+                            multi_init_failed,
+                        DownloadErrc::http_init_failed)
+                };
+            }
+            if (curl_multi_setopt(
+                    session->multi_,
+                    CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                    static_cast<long>(
+                        config.max_active_transfers)) !=
+                    CURLM_OK ||
+                curl_multi_setopt(
+                    session->multi_,
+                    CURLMOPT_MAX_HOST_CONNECTIONS,
+                    static_cast<long>(
+                        config.max_active_transfers)) !=
+                    CURLM_OK) {
+                return {
+                    nullptr,
+                    make_failure(
+                        HttpFailureReason::
+                            multi_option_failed,
+                        DownloadErrc::http_init_failed)
+                };
+            }
+
+            session->slots_.reserve(
+                config.max_active_transfers);
+            for (std::size_t index = 0;
+                 index < config.max_active_transfers;
+                 ++index) {
+                auto slot = std::make_unique<Slot>();
+                slot->owner = session.get();
+                slot->id =
+                    static_cast<TransferSlotId>(index);
+                slot->easy = curl_easy_init();
+                if (slot->easy == nullptr) {
+                    return {
+                        nullptr,
+                        make_failure(
+                            HttpFailureReason::
+                                easy_init_failed,
+                            DownloadErrc::
+                                http_init_failed)
+                    };
+                }
+                const auto lane_error =
+                    packet_producer.open_lane(
+                        slot->lane);
+                if (lane_error) {
+                    return {
+                        nullptr,
+                        {
+                            HttpFailureReason::
+                                callback_sink_failed,
+                            lane_error
+                        }
+                    };
+                }
+                session->slots_.push_back(
+                    std::move(slot));
+            }
+            return {std::move(session), {}};
+        } catch (const std::bad_alloc&) {
+            return {
+                nullptr,
+                make_failure(
+                    HttpFailureReason::
+                        allocation_failed,
+                    DownloadErrc::internal_error)
+            };
+        } catch (...) {
+            return {
+                nullptr,
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error)
+            };
+        }
+    }
+
+    ~CurlHttpTransferSession() override {
+        cleanup_unchecked();
+    }
+
+    HttpStartResult start(
+        const range::RangeLease& lease) noexcept override {
+        if (!owner_thread_matches()) {
+            return failed_start(
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error));
+        }
+        if (state_ == HttpSessionState::closed) {
+            return {
+                HttpStartCode::closed,
+                std::nullopt,
+                {}
+            };
+        }
+        if (pending_count() != 0) {
+            return {
+                HttpStartCode::no_capacity,
+                std::nullopt,
+                {}
+            };
+        }
+        if (state_ != HttpSessionState::open) {
+            return failed_start(
+                {
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    error_
+                        ? error_
+                        : make_error_code(
+                            DownloadErrc::
+                                http_transfer_failed)
+                });
+        }
+        if (lease.bytes.begin < 0 ||
+            lease.bytes.end <= lease.bytes.begin ||
+            lease.bytes.end > config_.total_size) {
+            return failed_start(
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error));
+        }
+
+        const auto found = std::find_if(
+            slots_.begin(),
+            slots_.end(),
+            [](const std::unique_ptr<Slot>& slot) {
+                return !slot->lease.has_value() &&
+                    !slot->pending_event.has_value() &&
+                    !slot->in_multi;
+            });
+        if (found == slots_.end()) {
+            return {
+                HttpStartCode::no_capacity,
+                std::nullopt,
+                {}
+            };
+        }
+
+        auto& slot = **found;
+        try {
+            ++slot.generation;
+            if (slot.generation == 0) {
+                return failed_start(
+                    make_failure(
+                        HttpFailureReason::
+                            protocol_order_invalid,
+                        DownloadErrc::internal_error));
+            }
+            slot.lease = lease;
+            slot.accepted_through =
+                lease.bytes.begin;
+            slot.body_bytes = 0;
+            slot.bytes_per_second = 0.0;
+            slot.packet_pause_mask = 0;
+            slot.gap_paused = false;
+            slot.curl_receive_paused = false;
+            slot.callback_active = false;
+            slot.cancelling = false;
+            slot.first_byte_recorded = false;
+            slot.callback_failure = {};
+            slot.response.reset();
+            slot.range_header.clear();
+
+            curl_easy_reset(slot.easy);
+            if (!configure_slot(slot)) {
+                slot.lease.reset();
+                return failed_start(
+                    make_failure(
+                        HttpFailureReason::
+                            easy_option_failed,
+                        DownloadErrc::
+                            http_transfer_failed));
+            }
+            if (curl_multi_add_handle(
+                    multi_,
+                    slot.easy) != CURLM_OK) {
+                slot.lease.reset();
+                return failed_start(
+                    make_failure(
+                        HttpFailureReason::
+                            add_handle_failed,
+                        DownloadErrc::
+                            http_transfer_failed));
+            }
+            slot.in_multi = true;
+            const TransferToken token{
+                slot.id,
+                slot.generation,
+                lease.id
+            };
+            return {
+                HttpStartCode::started,
+                token,
+                {}
+            };
+        } catch (const std::bad_alloc&) {
+            slot.lease.reset();
+            return failed_start(
+                make_failure(
+                    HttpFailureReason::
+                        allocation_failed,
+                    DownloadErrc::internal_error));
+        } catch (...) {
+            slot.lease.reset();
+            return failed_start(
+                make_failure(
+                    HttpFailureReason::
+                        protocol_order_invalid,
+                    DownloadErrc::internal_error));
+        }
+    }
+
+    std::error_code set_gap_paused(
+        const TransferToken& token,
+        const bool active) noexcept override {
+        if (!owner_thread_matches()) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        auto* slot = find_active(token);
+        if (slot == nullptr) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        if (active && !slot->gap_paused) {
+            telemetry_.record_pause(
+                telemetry::TelemetryPauseReason::gap,
+                false);
+        }
+        slot->gap_paused = active;
+        return {};
+    }
+
+    HttpPollResult poll(
+        const std::chrono::milliseconds timeout)
+            noexcept override {
+        if (!owner_thread_matches() ||
+            timeout.count() < 0) {
+            const auto error =
+                make_error_code(
+                    DownloadErrc::internal_error);
+            fail_session(error);
+            return {
+                HttpPollCode::failed,
+                std::nullopt,
+                error
+            };
+        }
+        if (state_ == HttpSessionState::closed) {
+            return {
+                HttpPollCode::closed,
+                std::nullopt,
+                {}
+            };
+        }
+        if (const auto event = take_event();
+            event.has_value()) {
+            return {
+                HttpPollCode::event,
+                std::move(*event),
+                {}
+            };
+        }
+
+        const auto reconcile_error =
+            reconcile_pauses();
+        if (reconcile_error) {
+            fail_session(reconcile_error);
+            return {
+                HttpPollCode::failed,
+                std::nullopt,
+                reconcile_error
+            };
+        }
+
+        const auto first_drive =
+            perform_and_drain();
+        if (first_drive.error) {
+            fail_session(first_drive.error);
+            return first_drive;
+        }
+        if (const auto event = take_event();
+            event.has_value()) {
+            return {
+                HttpPollCode::event,
+                std::move(*event),
+                {}
+            };
+        }
+        if (active_count() == 0) {
+            if (state_ == HttpSessionState::failed) {
+                return {
+                    HttpPollCode::failed,
+                    std::nullopt,
+                    error_
+                };
+            }
+            return {
+                HttpPollCode::idle,
+                std::nullopt,
+                {}
+            };
+        }
+
+        int descriptor_count = 0;
+        const auto wait_result =
+            curl_multi_wait(
+                multi_,
+                nullptr,
+                0,
+                static_cast<int>(timeout.count()),
+                &descriptor_count);
+        static_cast<void>(descriptor_count);
+        if (wait_result != CURLM_OK) {
+            const auto error = make_error_code(
+                DownloadErrc::http_transfer_failed);
+            fail_session(error);
+            return {
+                HttpPollCode::failed,
+                std::nullopt,
+                error
+            };
+        }
+
+        const auto second_drive =
+            perform_and_drain();
+        if (second_drive.error) {
+            fail_session(second_drive.error);
+            return second_drive;
+        }
+        if (const auto event = take_event();
+            event.has_value()) {
+            return {
+                HttpPollCode::event,
+                std::move(*event),
+                {}
+            };
+        }
+        return {
+            HttpPollCode::timed_out,
+            std::nullopt,
+            {}
+        };
+    }
+
+    std::error_code cancel(
+        const HttpCancelRequest& request)
+            noexcept override {
+        if (!owner_thread_matches()) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        if ((request.kind ==
+                HttpCancelKind::task_cancelled &&
+             request.cause) ||
+            (request.kind ==
+                HttpCancelKind::upstream_failed &&
+             !request.cause)) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        if (state_ == HttpSessionState::closed) {
+            return {};
+        }
+        state_ = HttpSessionState::cancelling;
+
+        for (auto& slot_pointer : slots_) {
+            auto& slot = *slot_pointer;
+            if (!slot.lease.has_value() ||
+                slot.pending_event.has_value()) {
+                continue;
+            }
+            slot.cancelling = true;
+            if (slot.in_multi) {
+                if (curl_multi_remove_handle(
+                        multi_,
+                        slot.easy) != CURLM_OK &&
+                    !error_) {
+                    error_ = make_error_code(
+                        DownloadErrc::
+                            http_transfer_failed);
+                }
+                slot.in_multi = false;
+            }
+            if (request.kind ==
+                HttpCancelKind::upstream_failed) {
+                const auto discard_error =
+                    packet_producer_.discard(
+                        slot.lane);
+                if (discard_error && !error_) {
+                    error_ = discard_error;
+                }
+            } else {
+                const auto flush_error =
+                    flush_lane(slot);
+                if (flush_error && !error_) {
+                    error_ = flush_error;
+                }
+            }
+            const auto cause = request.kind ==
+                    HttpCancelKind::upstream_failed
+                ? request.cause
+                : make_error_code(
+                    DownloadErrc::cancelled);
+            slot.pending_event = HttpLeaseFailed{
+                token_for(slot),
+                slot.lease->id,
+                slot.accepted_through,
+                {
+                    request.kind ==
+                            HttpCancelKind::
+                                upstream_failed
+                        ? HttpFailureReason::
+                            upstream_failed
+                        : HttpFailureReason::
+                            cancelled,
+                    cause
+                }
+            };
+        }
+        return error_;
+    }
+
+    HttpSessionSnapshot snapshot()
+        const noexcept override {
+        const auto active = active_count();
+        const auto pending = pending_count();
+        std::size_t paused = 0;
+        for (const auto& slot : slots_) {
+            if (slot->lease.has_value() &&
+                !slot->pending_event.has_value() &&
+                (slot->gap_paused ||
+                 slot->curl_receive_paused)) {
+                ++paused;
+            }
+        }
+        return {
+            state_,
+            active,
+            pending == 0 &&
+                    state_ == HttpSessionState::open
+                ? slots_.size() - active
+                : 0,
+            pending,
+            paused,
+            error_
+        };
+    }
+
+    std::error_code close() noexcept override {
+        if (!owner_thread_matches()) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        if (state_ == HttpSessionState::closed) {
+            return {};
+        }
+        if (active_count() != 0 ||
+            pending_count() != 0) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        cleanup_unchecked();
+        state_ = HttpSessionState::closed;
+        return error_;
+    }
+
+private:
+    struct DriveResult : HttpPollResult {};
+
+    CurlHttpTransferSession(
+        HttpSessionConfig config,
+        flow::PacketProducer& packet_producer,
+        telemetry::TelemetrySession& telemetry) noexcept
+        : config_(std::move(config)),
+          packet_producer_(packet_producer),
+          telemetry_(telemetry),
+          owner_thread_(std::this_thread::get_id()) {}
+
+    static std::size_t write_callback(
+        char* data,
+        const std::size_t size,
+        const std::size_t count,
+        void* user_data) noexcept {
+        auto* slot = static_cast<Slot*>(user_data);
+        const auto bytes = callback_bytes(
+            size,
+            count);
+        if (slot == nullptr ||
+            !bytes.has_value()) {
+            return CURL_WRITEFUNC_ERROR;
+        }
+        return slot->owner->accept_body(
+            *slot,
+            data,
+            *bytes);
+    }
+
+    static std::size_t header_callback(
+        char* data,
+        const std::size_t size,
+        const std::size_t count,
+        void* user_data) noexcept {
+        auto* slot = static_cast<Slot*>(user_data);
+        const auto bytes = callback_bytes(
+            size,
+            count);
+        if (slot == nullptr ||
+            !bytes.has_value()) {
+            return CURL_WRITEFUNC_ERROR;
+        }
+        if (!slot->response.append(
+                std::string_view(data, *bytes))) {
+            slot->callback_failure =
+                make_failure(
+                    HttpFailureReason::
+                        header_callback_failed,
+                    DownloadErrc::
+                        http_invalid_response);
+            return CURL_WRITEFUNC_ERROR;
+        }
+        return *bytes;
+    }
+
+    std::size_t accept_body(
+        Slot& slot,
+        char* data,
+        const std::size_t bytes) noexcept {
+        slot.callback_active = true;
+        const auto finish_callback =
+            [&slot]() noexcept {
+                slot.callback_active = false;
+            };
+        if (bytes == 0) {
+            finish_callback();
+            return 0;
+        }
+        if (!slot.lease.has_value() ||
+            slot.cancelling) {
+            slot.callback_failure =
+                make_failure(
+                    slot.cancelling
+                        ? HttpFailureReason::cancelled
+                        : HttpFailureReason::
+                            protocol_order_invalid,
+                    slot.cancelling
+                        ? DownloadErrc::cancelled
+                        : DownloadErrc::internal_error);
+            finish_callback();
+            return CURL_WRITEFUNC_ERROR;
+        }
+        slot.response.begin_body();
+        const auto remaining =
+            slot.lease->bytes.end -
+            slot.accepted_through;
+        if (remaining < 0 ||
+            bytes > static_cast<std::uint64_t>(
+                        remaining)) {
+            slot.curl_receive_paused = true;
+            finish_callback();
+            return CURL_WRITEFUNC_PAUSE;
+        }
+        const flow::DataChunk chunk{
+            slot.lease->id,
+            slot.lease->bytes,
+            slot.accepted_through,
+            {
+                reinterpret_cast<
+                    const std::uint8_t*>(data),
+                bytes
+            }
+        };
+        const auto admission =
+            packet_producer_.accept(
+                slot.lane,
+                chunk);
+        slot.packet_pause_mask =
+            admission.active_pause_mask;
+        if (admission.code ==
+            flow::PacketAdmissionCode::accepted) {
+            if (admission.consumed_bytes != bytes) {
+                slot.callback_failure =
+                    make_failure(
+                        HttpFailureReason::
+                            protocol_order_invalid,
+                        DownloadErrc::internal_error);
+                finish_callback();
+                return CURL_WRITEFUNC_ERROR;
+            }
+            if (!slot.first_byte_recorded) {
+                telemetry_.
+                    record_first_byte_received();
+                slot.first_byte_recorded = true;
+            }
+            slot.accepted_through +=
+                static_cast<range::ByteOffset>(
+                    bytes);
+            slot.body_bytes += bytes;
+            finish_callback();
+            return bytes;
+        }
+        if (admission.must_pause() &&
+            admission.consumed_bytes == 0) {
+            slot.curl_receive_paused = true;
+            finish_callback();
+            return CURL_WRITEFUNC_PAUSE;
+        }
+        slot.callback_failure = {
+            HttpFailureReason::
+                callback_sink_failed,
+            admission.error
+                ? admission.error
+                : make_error_code(
+                    DownloadErrc::
+                        http_transfer_failed)
+        };
+        finish_callback();
+        return CURL_WRITEFUNC_ERROR;
+    }
+
+    bool configure_slot(Slot& slot) noexcept {
+        if (!slot.lease.has_value()) {
+            return false;
+        }
+        const auto set = [&slot](
+            const CURLoption option,
+            const auto value) noexcept {
+            return curl_easy_setopt(
+                slot.easy,
+                option,
+                value) == CURLE_OK;
+        };
+        if (!set(CURLOPT_URL, config_.url.c_str()) ||
+            !set(CURLOPT_FOLLOWLOCATION, 1L) ||
+            !set(CURLOPT_NOSIGNAL, 1L) ||
+            !set(
+                CURLOPT_HTTP_VERSION,
+                CURL_HTTP_VERSION_1_1) ||
+            !set(
+                CURLOPT_WRITEFUNCTION,
+                write_callback) ||
+            !set(CURLOPT_WRITEDATA, &slot) ||
+            !set(
+                CURLOPT_HEADERFUNCTION,
+                header_callback) ||
+            !set(CURLOPT_HEADERDATA, &slot) ||
+            !set(CURLOPT_PRIVATE, &slot) ||
+            !set(CURLOPT_TCP_KEEPALIVE, 1L) ||
+            !set(CURLOPT_ACCEPT_ENCODING, "") ||
+            !set(CURLOPT_FRESH_CONNECT, 1L) ||
+            !set(CURLOPT_FORBID_REUSE, 1L) ||
+            !set(CURLOPT_PIPEWAIT, 0L)) {
+            return false;
+        }
+        if (slot.lease->use_http_range) {
+            const auto inclusive_end =
+                slot.lease->bytes.end - 1;
+            slot.range_header =
+                std::to_string(
+                    slot.lease->bytes.begin) +
+                "-" +
+                std::to_string(inclusive_end);
+            return set(
+                CURLOPT_RANGE,
+                slot.range_header.c_str());
+        }
+        return set(CURLOPT_RANGE, nullptr);
+    }
+
+    std::error_code reconcile_pauses() noexcept {
+        observations_.clear();
+        actions_.clear();
+        try {
+            for (const auto& slot : slots_) {
+                if (!slot->lease.has_value() ||
+                    slot->pending_event.has_value()) {
+                    continue;
+                }
+                observations_.push_back({
+                    slot->lane.id(),
+                    slot->bytes_per_second,
+                    true
+                });
+            }
+            actions_.resize(
+                observations_.size());
+        } catch (...) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        const auto reconciled =
+            packet_producer_.reconcile(
+                observations_,
+                actions_);
+        if (reconciled.error ||
+            reconciled.action_count >
+                actions_.size()) {
+            return reconciled.error
+                ? reconciled.error
+                : make_error_code(
+                    DownloadErrc::internal_error);
+        }
+        for (std::size_t index = 0;
+             index < reconciled.action_count;
+             ++index) {
+            const auto& action = actions_[index];
+            const auto found = std::find_if(
+                slots_.begin(),
+                slots_.end(),
+                [&action](
+                    const std::unique_ptr<Slot>& slot) {
+                    return slot->lease.has_value() &&
+                        slot->lane.id() ==
+                            action.lane_id;
+                });
+            if (found != slots_.end()) {
+                (*found)->packet_pause_mask =
+                    action.active_pause_mask;
+            }
+        }
+        for (auto& slot : slots_) {
+            if (!slot->lease.has_value() ||
+                slot->pending_event.has_value() ||
+                !slot->in_multi) {
+                continue;
+            }
+            const auto should_pause =
+                slot->packet_pause_mask != 0 ||
+                slot->gap_paused;
+            if (should_pause &&
+                !slot->curl_receive_paused) {
+                static_cast<void>(
+                    curl_easy_pause(
+                        slot->easy,
+                        CURLPAUSE_RECV));
+                slot->curl_receive_paused = true;
+            } else if (!should_pause &&
+                       slot->curl_receive_paused) {
+                slot->curl_receive_paused = false;
+                static_cast<void>(
+                    curl_easy_pause(
+                        slot->easy,
+                        CURLPAUSE_CONT));
+            }
+        }
+        return {};
+    }
+
+    DriveResult perform_and_drain() noexcept {
+        int running_handles = 0;
+        const auto perform_result =
+            curl_multi_perform(
+                multi_,
+                &running_handles);
+        static_cast<void>(running_handles);
+        if (perform_result != CURLM_OK) {
+            return {
+                {
+                    HttpPollCode::failed,
+                    std::nullopt,
+                    make_error_code(
+                        DownloadErrc::
+                            http_transfer_failed)
+                }
+            };
+        }
+        int pending_messages = 0;
+        while (auto* message =
+                   curl_multi_info_read(
+                       multi_,
+                       &pending_messages)) {
+            if (message->msg != CURLMSG_DONE) {
+                continue;
+            }
+            auto* slot = find_slot(
+                message->easy_handle);
+            if (slot == nullptr) {
+                return {
+                    {
+                        HttpPollCode::failed,
+                        std::nullopt,
+                        make_error_code(
+                            DownloadErrc::
+                                internal_error)
+                    }
+                };
+            }
+            finalize_done(
+                *slot,
+                message->data.result);
+        }
+        return {
+            {
+                HttpPollCode::idle,
+                std::nullopt,
+                {}
+            }
+        };
+    }
+
+    void finalize_done(
+        Slot& slot,
+        const CURLcode curl_result) noexcept {
+        long response_code = 0;
+        static_cast<void>(
+            curl_easy_getinfo(
+                slot.easy,
+                CURLINFO_RESPONSE_CODE,
+                &response_code));
+        curl_off_t speed = 0;
+        static_cast<void>(
+            curl_easy_getinfo(
+                slot.easy,
+                CURLINFO_SPEED_DOWNLOAD_T,
+                &speed));
+        if (speed > 0) {
+            slot.bytes_per_second =
+                static_cast<double>(speed);
+        }
+        if (slot.in_multi) {
+            static_cast<void>(
+                curl_multi_remove_handle(
+                    multi_,
+                    slot.easy));
+            slot.in_multi = false;
+        }
+        const auto flush_error =
+            flush_lane(slot);
+        HttpFailure failure =
+            slot.callback_failure;
+        if (!failure.error && flush_error) {
+            failure = {
+                HttpFailureReason::
+                    callback_sink_failed,
+                flush_error
+            };
+        }
+        if (!failure.error &&
+            curl_result != CURLE_OK) {
+            failure = make_failure(
+                HttpFailureReason::
+                    transport_failed,
+                DownloadErrc::
+                    http_transfer_failed);
+        }
+        if (!failure.error &&
+            !legacy_response_valid(
+                slot,
+                response_code)) {
+            failure = make_failure(
+                HttpFailureReason::
+                    response_status_invalid,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        if (!failure.error &&
+            slot.lease.has_value() &&
+            slot.accepted_through !=
+                slot.lease->bytes.end) {
+            failure = make_failure(
+                HttpFailureReason::body_too_short,
+                DownloadErrc::
+                    http_transfer_failed);
+        }
+
+        if (failure.error) {
+            slot.pending_event = HttpLeaseFailed{
+                token_for(slot),
+                slot.lease->id,
+                slot.accepted_through,
+                failure
+            };
+            fail_session(failure.error);
+        } else {
+            slot.pending_event =
+                HttpLeaseSucceeded{
+                    token_for(slot),
+                    slot.lease->id,
+                    slot.accepted_through,
+                    response_code
+                };
+        }
+    }
+
+    bool legacy_response_valid(
+        const Slot& slot,
+        const long response_code) const noexcept {
+        if (!slot.lease.has_value()) {
+            return false;
+        }
+        if (slot.lease->use_http_range) {
+            const auto whole_object =
+                slot.lease->bytes.begin == 0 &&
+                slot.lease->bytes.end ==
+                    config_.total_size;
+            return whole_object
+                ? response_code == 200 ||
+                    response_code == 206
+                : response_code == 206;
+        }
+        return response_code == 200 ||
+            response_code == 206;
+    }
+
+    std::error_code flush_lane(
+        Slot& slot) noexcept {
+        while (true) {
+            const auto admission =
+                packet_producer_.flush(slot.lane);
+            if (admission.code ==
+                flow::PacketAdmissionCode::accepted) {
+                return {};
+            }
+            if (admission.must_pause()) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(1));
+                continue;
+            }
+            return admission.error
+                ? admission.error
+                : make_error_code(
+                    DownloadErrc::
+                        http_transfer_failed);
+        }
+    }
+
+    Slot* find_slot(CURL* easy) noexcept {
+        const auto found = std::find_if(
+            slots_.begin(),
+            slots_.end(),
+            [easy](
+                const std::unique_ptr<Slot>& slot) {
+                return slot->easy == easy;
+            });
+        return found == slots_.end()
+            ? nullptr
+            : found->get();
+    }
+
+    Slot* find_active(
+        const TransferToken& token) noexcept {
+        if (token.slot >= slots_.size()) {
+            return nullptr;
+        }
+        auto& slot = *slots_[token.slot];
+        return slot.lease.has_value() &&
+               !slot.pending_event.has_value() &&
+               token == token_for(slot)
+            ? &slot
+            : nullptr;
+    }
+
+    TransferToken token_for(
+        const Slot& slot) const noexcept {
+        return {
+            slot.id,
+            slot.generation,
+            slot.lease.has_value()
+                ? slot.lease->id
+                : range::LeaseId{}
+        };
+    }
+
+    std::optional<HttpTransferEvent>
+    take_event() noexcept {
+        for (auto& slot : slots_) {
+            if (!slot->pending_event.has_value()) {
+                continue;
+            }
+            auto event =
+                std::move(slot->pending_event);
+            slot->pending_event.reset();
+            slot->lease.reset();
+            slot->range_header.clear();
+            slot->callback_failure = {};
+            return event;
+        }
+        return std::nullopt;
+    }
+
+    std::size_t active_count() const noexcept {
+        return static_cast<std::size_t>(
+            std::count_if(
+                slots_.begin(),
+                slots_.end(),
+                [](const std::unique_ptr<Slot>& slot) {
+                    return slot->lease.has_value() &&
+                        !slot->pending_event.has_value();
+                }));
+    }
+
+    std::size_t pending_count() const noexcept {
+        return static_cast<std::size_t>(
+            std::count_if(
+                slots_.begin(),
+                slots_.end(),
+                [](const std::unique_ptr<Slot>& slot) {
+                    return slot->pending_event.
+                        has_value();
+                }));
+    }
+
+    bool owner_thread_matches() const noexcept {
+        return owner_thread_ ==
+            std::this_thread::get_id();
+    }
+
+    HttpStartResult failed_start(
+        const HttpFailure failure) noexcept {
+        return {
+            HttpStartCode::failed,
+            std::nullopt,
+            failure
+        };
+    }
+
+    void fail_session(
+        const std::error_code error) noexcept {
+        state_ = HttpSessionState::failed;
+        if (!error_) {
+            error_ = error;
+        }
+    }
+
+    void cleanup_unchecked() noexcept {
+        for (auto& slot : slots_) {
+            if (slot->in_multi &&
+                multi_ != nullptr) {
+                static_cast<void>(
+                    curl_multi_remove_handle(
+                        multi_,
+                        slot->easy));
+                slot->in_multi = false;
+            }
+            if (slot->easy != nullptr) {
+                curl_easy_cleanup(slot->easy);
+                slot->easy = nullptr;
+            }
+        }
+        if (multi_ != nullptr) {
+            static_cast<void>(
+                curl_multi_cleanup(multi_));
+            multi_ = nullptr;
+        }
+    }
+
+    HttpSessionConfig config_;
+    flow::PacketProducer& packet_producer_;
+    telemetry::TelemetrySession& telemetry_;
+    std::thread::id owner_thread_;
+    CURLM* multi_ = nullptr;
+    std::vector<std::unique_ptr<Slot>> slots_;
+    std::vector<flow::PacketLaneObservation>
+        observations_;
+    std::vector<flow::PacketPauseAction> actions_;
+    HttpSessionState state_ = HttpSessionState::open;
+    std::error_code error_{};
+};
+
 class CurlHttpTransferPort final :
     public HttpTransferPort {
 public:
@@ -331,15 +1462,10 @@ public:
         flow::PacketProducer& packet_producer,
         telemetry::TelemetrySession& telemetry)
             noexcept override {
-        static_cast<void>(config);
-        static_cast<void>(packet_producer);
-        static_cast<void>(telemetry);
-        return {
-            nullptr,
-            make_failure(
-                HttpFailureReason::multi_init_failed,
-                DownloadErrc::http_init_failed)
-        };
+        return CurlHttpTransferSession::create(
+            config,
+            packet_producer,
+            telemetry);
     }
 };
 

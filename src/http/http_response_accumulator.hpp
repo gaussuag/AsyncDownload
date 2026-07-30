@@ -19,6 +19,7 @@ struct ParsedContentRange {
 
 class HttpResponseAccumulator {
 public:
+    void reset() noexcept;
     [[nodiscard]] bool append(
         std::string_view line) noexcept;
     void begin_body() noexcept;

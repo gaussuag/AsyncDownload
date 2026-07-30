@@ -228,6 +228,22 @@ bool HttpResponseAccumulator::append(
     }
 }
 
+void HttpResponseAccumulator::reset() noexcept {
+    status_ = 0;
+    headers_complete_ = false;
+    body_started_ = false;
+    parser_failed_ = false;
+    accept_ranges_ = false;
+    content_length_.reset();
+    content_range_.reset();
+    content_range_invalid_ = false;
+    content_length_invalid_ = false;
+    content_encoding_.clear();
+    content_encoding_invalid_ = false;
+    etag_.clear();
+    last_modified_.clear();
+}
+
 void HttpResponseAccumulator::begin_body() noexcept {
     body_started_ = true;
 }
