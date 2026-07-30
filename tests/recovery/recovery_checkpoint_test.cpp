@@ -577,6 +577,137 @@ TEST(
 
 TEST(
     RecoveryCheckpointTest,
+    CorruptOrphanMetadataStartsFresh) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_corrupt_orphan");
+    const auto request = fresh_request(temp.path());
+    {
+        std::ofstream metadata(
+            request.paths.metadata_path,
+            std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(metadata.is_open());
+        metadata << "{broken";
+    }
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        opened.restored.disposition,
+        asyncdownload::recovery::
+            RecoveryDisposition::fresh);
+    EXPECT_EQ(
+        opened.stale_cleanup.status,
+        asyncdownload::recovery::
+            CleanupStatus::removed);
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.metadata_path));
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.temporary_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    CorruptCandidatePairRemainsUntouched) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_corrupt_pair");
+    const auto request = fresh_request(temp.path());
+    const auto bytes = part_contents();
+    write_part(request.paths.temporary_path, bytes);
+    {
+        std::ofstream metadata(
+            request.paths.metadata_path,
+            std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(metadata.is_open());
+        metadata << "{broken";
+    }
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    EXPECT_EQ(
+        opened.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_parse_failed));
+    EXPECT_EQ(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        read_file(request.paths.temporary_path),
+        bytes);
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.metadata_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    OverwriteDisabledPreservesOutputAndCheckpoint) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_no_overwrite");
+    auto request = fresh_request(temp.path());
+    request.overwrite_existing = false;
+    const std::vector<std::uint8_t> old_output(
+        8192,
+        0xB1);
+    write_part(
+        request.paths.output_path,
+        old_output);
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const std::vector<std::uint8_t> checkpoint_bytes(
+        8192,
+        0xB2);
+    ASSERT_FALSE(opened.checkpoint->write(
+        0,
+        checkpoint_bytes));
+    const auto finished =
+        static_cast<std::uint8_t>(
+            asyncdownload::core::BlockState::finished);
+    auto prepared = opened.checkpoint->prepare(
+        std::vector<std::uint8_t>{
+            finished,
+            finished
+        },
+        std::vector<
+            asyncdownload::recovery::RecoveryRangeFact>{{
+                {0},
+                {0, 8192},
+                8192,
+                8192,
+                2
+            }});
+    ASSERT_FALSE(prepared.error);
+    const auto committed =
+        opened.checkpoint->commit(
+            std::move(prepared.checkpoint));
+    ASSERT_FALSE(committed.error);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_FALSE(result.output_available);
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                file_write_failed));
+    EXPECT_EQ(
+        read_file(request.paths.output_path),
+        old_output);
+    EXPECT_EQ(
+        read_file(request.paths.temporary_path),
+        checkpoint_bytes);
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.metadata_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
     ConflictingIdentityRestartsFresh) {
     RecoveryTempDirectory temp(
         "asyncdownload_recovery_identity");

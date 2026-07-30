@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -286,16 +287,35 @@ RecoveryOpenResult RecoveryCheckpoint::open(
     try {
         auto implementation =
             std::make_unique<Implementation>(request);
-        const auto [metadata_error, loaded] =
-            implementation->metadata_store.load();
-        if (metadata_error) {
-            result.error = metadata_error;
-            return result;
-        }
-
+        std::error_code inventory_error;
         const auto part_exists =
             std::filesystem::exists(
-                request.paths.temporary_path);
+                request.paths.temporary_path,
+                inventory_error);
+        if (inventory_error) {
+            result.error = make_error_code(
+                DownloadErrc::open_file_failed);
+            return result;
+        }
+        const auto metadata_exists =
+            std::filesystem::exists(
+                request.paths.metadata_path,
+                inventory_error);
+        if (inventory_error) {
+            result.error = make_error_code(
+                DownloadErrc::metadata_parse_failed);
+            return result;
+        }
+        std::optional<core::MetadataState> loaded;
+        if (part_exists && metadata_exists) {
+            auto load_result =
+                implementation->metadata_store.load();
+            if (load_result.first) {
+                result.error = load_result.first;
+                return result;
+            }
+            loaded = std::move(load_result.second);
+        }
         const auto can_resume =
             part_exists &&
             loaded.has_value() &&
@@ -323,7 +343,7 @@ RecoveryOpenResult RecoveryCheckpoint::open(
                 return result;
             }
             result.stale_cleanup.status =
-                loaded.has_value() ?
+                metadata_exists ?
                     CleanupStatus::removed :
                     CleanupStatus::not_found;
 #if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)

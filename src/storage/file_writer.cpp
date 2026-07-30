@@ -1,6 +1,7 @@
 #include "file_writer.hpp"
 
 #include "asyncdownload/error.hpp"
+#include "storage/file_writer_fault_adapter.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -290,16 +291,54 @@ std::error_code FileWriter::finalize(const std::filesystem::path& output_path,
 
     close();
 
-    if (overwrite_existing) {
-        std::filesystem::remove(output_path, ec);
-        ec.clear();
+    if (!overwrite_existing) {
+        const auto output_exists =
+            std::filesystem::exists(output_path, ec);
+        if (ec || output_exists) {
+            return make_error_code(
+                DownloadErrc::file_write_failed);
+        }
     }
 
-    // 最终产物通过 rename 提升，避免把“正在下载中的 .part 文件”暴露成正式文件名。
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+    auto& fault_plan =
+        detail::file_writer_fault_plan();
+    if (fault_plan.fail_before_output_replace.exchange(
+            false,
+            std::memory_order_acq_rel)) {
+        return make_error_code(
+            DownloadErrc::file_write_failed);
+    }
+#endif
+
+#ifdef _WIN32
+    auto move_flags = MOVEFILE_WRITE_THROUGH;
+    if (overwrite_existing) {
+        move_flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    if (MoveFileExW(
+            path_.c_str(),
+            output_path.c_str(),
+            move_flags) != TRUE) {
+        return make_error_code(
+            DownloadErrc::file_write_failed);
+    }
+#else
     std::filesystem::rename(path_, output_path, ec);
     if (ec) {
-        return make_error_code(DownloadErrc::file_write_failed);
+        return make_error_code(
+            DownloadErrc::file_write_failed);
     }
+#endif
+
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+    if (fault_plan.stop_after_output_replace.exchange(
+            false,
+            std::memory_order_acq_rel)) {
+        return make_error_code(
+            DownloadErrc::internal_error);
+    }
+#endif
 
     path_ = output_path;
     return {};

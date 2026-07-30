@@ -25,6 +25,7 @@
 #include "range/range_fact_slot.hpp"
 #include "recovery/recovery_checkpoint.hpp"
 #include "recovery/recovery_fault_adapter.hpp"
+#include "storage/file_writer_fault_adapter.hpp"
 
 namespace {
 
@@ -90,6 +91,8 @@ protected:
             recovery_fault_plan().reset();
         asyncdownload::metadata::detail::
             metadata_fault_plan().reset();
+        asyncdownload::storage::detail::
+            file_writer_fault_plan().reset();
     }
 
     void TearDown() override {
@@ -97,6 +100,8 @@ protected:
             recovery_fault_plan().reset();
         asyncdownload::metadata::detail::
             metadata_fault_plan().reset();
+        asyncdownload::storage::detail::
+            file_writer_fault_plan().reset();
         std::error_code ec;
         const auto removed =
             std::filesystem::remove_all(root_, ec);
@@ -175,6 +180,36 @@ protected:
             std::istreambuf_iterator<char>(stream),
             std::istreambuf_iterator<char>()
         };
+    }
+
+    static void commit_complete(
+        asyncdownload::recovery::RecoveryCheckpoint&
+            checkpoint,
+        const std::vector<std::uint8_t>& bytes) {
+        ASSERT_FALSE(checkpoint.write(0, bytes));
+        const auto finished =
+            static_cast<std::uint8_t>(
+                asyncdownload::core::
+                    BlockState::finished);
+        auto prepared = checkpoint.prepare(
+            std::vector<std::uint8_t>{
+                finished,
+                finished
+            },
+            std::vector<
+                asyncdownload::recovery::
+                    RecoveryRangeFact>{{
+                    {0},
+                    {0, 8192},
+                    8192,
+                    8192,
+                    2
+                }});
+        ASSERT_FALSE(prepared.error);
+        const auto committed = checkpoint.commit(
+            std::move(prepared.checkpoint));
+        ASSERT_FALSE(committed.error);
+        ASSERT_EQ(committed.committed_vdl, 8192);
     }
 
     std::filesystem::path root_;
@@ -1342,6 +1377,113 @@ TEST_F(
             std::errc::permission_denied));
     EXPECT_TRUE(std::filesystem::exists(
         open_request.paths.output_path));
+    EXPECT_FALSE(std::filesystem::exists(
+        open_request.paths.temporary_path));
+    EXPECT_TRUE(std::filesystem::exists(
+        open_request.paths.metadata_path));
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    PromotionFailurePreservesOldOutputAndCheckpoint) {
+    const auto open_request = request();
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const std::vector<std::uint8_t> checkpoint_bytes(
+        8192,
+        0x91);
+    commit_complete(
+        *opened.checkpoint,
+        checkpoint_bytes);
+    const std::vector<std::uint8_t> old_output(
+        8192,
+        0x92);
+    {
+        std::ofstream output(
+            open_request.paths.output_path,
+            std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.is_open());
+        output.write(
+            reinterpret_cast<const char*>(
+                old_output.data()),
+            static_cast<std::streamsize>(
+                old_output.size()));
+    }
+    auto& fault_plan =
+        asyncdownload::storage::detail::
+            file_writer_fault_plan();
+    fault_plan.fail_before_output_replace.store(
+        true,
+        std::memory_order_release);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_FALSE(result.output_available);
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                file_write_failed));
+    EXPECT_EQ(
+        read_file(open_request.paths.output_path),
+        old_output);
+    EXPECT_EQ(
+        read_file(open_request.paths.temporary_path),
+        checkpoint_bytes);
+    EXPECT_TRUE(std::filesystem::exists(
+        open_request.paths.metadata_path));
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    CrashAfterPromotionSeesNewOutputWithoutNameGap) {
+    const auto open_request = request();
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const std::vector<std::uint8_t> checkpoint_bytes(
+        8192,
+        0xA1);
+    commit_complete(
+        *opened.checkpoint,
+        checkpoint_bytes);
+    const std::vector<std::uint8_t> old_output(
+        8192,
+        0xA2);
+    {
+        std::ofstream output(
+            open_request.paths.output_path,
+            std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.is_open());
+        output.write(
+            reinterpret_cast<const char*>(
+                old_output.data()),
+            static_cast<std::streamsize>(
+                old_output.size()));
+    }
+    auto& fault_plan =
+        asyncdownload::storage::detail::
+            file_writer_fault_plan();
+    fault_plan.stop_after_output_replace.store(
+        true,
+        std::memory_order_release);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_FALSE(result.output_available);
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                internal_error));
+    EXPECT_EQ(
+        read_file(open_request.paths.output_path),
+        checkpoint_bytes);
     EXPECT_FALSE(std::filesystem::exists(
         open_request.paths.temporary_path));
     EXPECT_TRUE(std::filesystem::exists(
