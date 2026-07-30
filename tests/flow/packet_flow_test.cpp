@@ -7,6 +7,8 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <future>
+#include <latch>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -472,6 +474,105 @@ TEST(PacketFlowTest, PublishesRangeCompleteAfterAllRangeData) {
     EXPECT_EQ(
         flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
         asyncdownload::flow::PacketReceiveCode::closed);
+}
+
+TEST(PacketFlowTest, CloseMarkerFollowsAllRegularPackets) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{11}, 2}, {0, 4}, 0, bytes}).accepted());
+    ASSERT_TRUE(flow->producer().flush(lane).accepted());
+    ASSERT_EQ(
+        flow->producer().publish({
+            asyncdownload::flow::ControlPacketKind::range_complete,
+            {{11}, 2},
+            4
+        }).code,
+        asyncdownload::flow::PacketPublishCode::published);
+    ASSERT_FALSE(flow->producer().close());
+
+    asyncdownload::flow::PacketLease packet;
+    ASSERT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::packet);
+    const auto data_sequence = packet.sequence();
+    packet.complete();
+    ASSERT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::packet);
+    const auto control_sequence = packet.sequence();
+    packet.complete();
+    EXPECT_GT(control_sequence, data_sequence);
+    EXPECT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::closed);
+}
+
+TEST(PacketFlowTest, CloseWakesTimedConsumer) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    std::latch ready(2);
+    auto received = std::async(std::launch::async, [&]() {
+        asyncdownload::flow::PacketLease packet;
+        ready.arrive_and_wait();
+        return flow->consumer().receive(
+            packet, std::chrono::seconds(5));
+    });
+    ready.arrive_and_wait();
+
+    ASSERT_FALSE(flow->producer().close());
+
+    ASSERT_EQ(
+        received.wait_for(std::chrono::seconds(1)),
+        std::future_status::ready);
+    const auto result = received.get();
+    EXPECT_EQ(result.code, asyncdownload::flow::PacketReceiveCode::closed);
+    EXPECT_FALSE(result.error);
+}
+
+TEST(PacketFlowTest, RejectsPublicationAfterClose) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    ASSERT_FALSE(flow->producer().close());
+
+    const auto published = flow->producer().publish({
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{3}, 1},
+        4
+    });
+
+    EXPECT_EQ(published.code, asyncdownload::flow::PacketPublishCode::closed);
+    EXPECT_FALSE(published.error);
+    asyncdownload::flow::PacketLease packet;
+    EXPECT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::closed);
+}
+
+TEST(PacketFlowTest, RejectsRangeCompleteWhileRangeDraftRemains) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{3}, 4}, {0, 8}, 0, bytes}).accepted());
+
+    const auto published = flow->producer().publish({
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{3}, 4},
+        8
+    });
+
+    EXPECT_EQ(published.code, asyncdownload::flow::PacketPublishCode::failed);
+    EXPECT_TRUE(published.error);
+    EXPECT_EQ(
+        flow->producer().snapshot().state,
+        asyncdownload::flow::PacketFlowState::failed);
+    ASSERT_FALSE(flow->producer().discard(lane));
 }
 
 TEST(PacketFlowTest, PreservesDependencyNeutralRangeValuesByValue) {

@@ -458,10 +458,15 @@ void reflect_packet_publication(
                 transfer.packet_error :
                 make_error_code(DownloadErrc::internal_error);
         }
-        if (transfer.session->stop_requested.load(std::memory_order_acquire) &&
-            transfer.packet_producer->snapshot().queued_packets >=
-                transfer.flow_control.packet_budget) {
-            return make_error_code(DownloadErrc::http_transfer_failed);
+        const auto snapshot =
+            transfer.packet_producer->snapshot();
+        if (snapshot.state == flow::PacketFlowState::failed) {
+            return snapshot.error ?
+                snapshot.error :
+                make_error_code(DownloadErrc::internal_error);
+        }
+        if (snapshot.state != flow::PacketFlowState::open) {
+            return make_error_code(DownloadErrc::internal_error);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -843,17 +848,26 @@ std::error_code stop_network_phase(core::SessionState& session,
     // 退出红线的第一步是先停网络生产，避免 Persistence 在 drain 队列时又收到
     // 新数据，从而把收尾阶段拉回“边消费边生产”的竞态。
     session.stop_requested.store(true, std::memory_order_release);
+    std::error_code first_error;
     for (auto& handle : handles) {
         const auto flush_error = flush_transfer_buffer_blocking(handle);
+        if (flush_error && !first_error) {
+            first_error = flush_error;
+        }
         if (flush_error) {
-            return flush_error;
+            const auto discard_error =
+                handle.packet_producer->discard(
+                    handle.packet_lane);
+            if (!first_error && discard_error) {
+                first_error = discard_error;
+            }
         }
 
         rollback_inflight_window(handle);
         release_transfer(multi, handle);
     }
 
-    return {};
+    return first_error;
 }
 
 std::error_code stop_persistence_phase(flow::PacketProducer& producer,

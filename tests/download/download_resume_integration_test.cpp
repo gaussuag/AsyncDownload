@@ -1127,6 +1127,7 @@ TEST(DownloadIntegrationTest, PreservesResumeArtifactsAfterServerFailure) {
     request.url = std::string("http://127.0.0.1:") + port_line + "/source.bin";
     request.output_path = output_file;
     request.options.max_connections = 4;
+    request.options.queue_capacity_packets = 1;
 
     auto future = std::async(std::launch::async, [request]() mutable {
         asyncdownload::DownloadClient client;
@@ -1143,6 +1144,7 @@ TEST(DownloadIntegrationTest, PreservesResumeArtifactsAfterServerFailure) {
     EXPECT_TRUE(std::filesystem::exists(part_file));
     EXPECT_TRUE(std::filesystem::exists(metadata_file));
     EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_GT(result.performance.queue_full_pause_count, 0U);
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
