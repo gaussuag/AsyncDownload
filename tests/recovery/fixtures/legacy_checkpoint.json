@@ -1,0 +1,37 @@
+{
+  "accept_ranges": true,
+  "bitmap_states": [
+    2,
+    1
+  ],
+  "block_size": 65536,
+  "crc_samples": [
+    {
+      "crc32": 305419896,
+      "length": 65536,
+      "offset": 65536
+    }
+  ],
+  "etag": "legacy-etag",
+  "io_alignment": 4096,
+  "last_modified": "Mon, 09 Mar 2026 08:50:10 GMT",
+  "output_path": "downloads/artifact.bin",
+  "ranges": [
+    {
+      "current_offset": 98304,
+      "end_offset": 131071,
+      "persisted_offset": 65536,
+      "range_id": 7,
+      "start_offset": 0,
+      "status": 3
+    }
+  ],
+  "resumed": true,
+  "temporary_path": "downloads/artifact.bin.part",
+  "total_size": 131072,
+  "unknown_legacy_extension": {
+    "ignored": true
+  },
+  "url": "https://example.com/artifact.bin",
+  "vdl_offset": 65536
+}

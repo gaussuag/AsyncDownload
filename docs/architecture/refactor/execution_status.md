@@ -4,12 +4,12 @@
 
 | Item | Value |
 | --- | --- |
-| Active stage | 4 — Recovery Checkpoint (unlocked) |
+| Active stage | 4 — Recovery Checkpoint |
 | Last passed stage | 3 — Range Lifecycle |
 | Stage 0 base | `622339136e563752885d8b5ee6a6a0157e28266c` |
 | Stage 0 test rollback point | `98f891f` |
-| Current branch | `codex/refactor-03-range-lifecycle` (Stage 3 evidence frontier) |
-| Next slice | Create the Stage 4 branch, read its ticket and phase contract, then run 04.1 |
+| Current branch | `codex/refactor-04-recovery-checkpoint` |
+| Next slice | 04.2 — add recovery value types, codec, and an unwired owning module |
 
 ## Stage ledger
 
@@ -19,7 +19,7 @@
 | 1 — Validated Download Policy | passed | `evidence/phase_01_validated_download_policy.md` | commits after `a2dee41` |
 | 2 — Packet Flow / Backpressure | passed | `evidence/phase_02_packet_flow_backpressure.md` | commits after `eca01fc` |
 | 3 — Range Lifecycle | passed | `evidence/phase_03_range_lifecycle.md` | commits after `f271997` |
-| 4 — Recovery Checkpoint | unlocked | pending | depends on Stage 3 |
+| 4 — Recovery Checkpoint | active | pending | depends on Stage 3 |
 | 5 — HTTP Transfer | locked | pending | depends on Stage 4 |
 | 6 — Telemetry Session | locked | pending | depends on Stage 5 |
 
