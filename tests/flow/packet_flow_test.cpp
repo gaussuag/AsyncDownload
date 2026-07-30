@@ -812,8 +812,10 @@ TEST(PacketFlowTest, RejectsZeroPacketBudgetWithoutCreatingFlow) {
     EXPECT_EQ(flow, nullptr);
 }
 
-TEST(PacketFlowTest, ConcurrentProducerConsumerPreservesEverySequence) {
-    constexpr std::size_t packet_count = 100'000;
+TEST(
+    PacketFlowTest,
+    ConcurrentProducerConsumerPreservesOneMillionSequencesAcrossBudgets) {
+    constexpr std::size_t packet_count = 333'334;
     for (const auto budget : {1U, 2U, 33U}) {
         asyncdownload::telemetry::TelemetrySession telemetry;
         std::promise<asyncdownload::flow::PacketFlow*> ready;

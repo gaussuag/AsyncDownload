@@ -534,6 +534,47 @@ TEST(
     EXPECT_FALSE(result.marked_finished);
 }
 
+TEST(
+    PersistenceThreadTest,
+    DrainsBufferedAccountingAfterTerminalError) {
+    TestPacket buffered{};
+    buffered.generation = 1;
+    buffered.lease_span = {0, 4096};
+    buffered.offset = 2048;
+    buffered.payload.assign(512, 0x41);
+    TestPacket jumped{};
+    jumped.generation = 3;
+    jumped.lease_span = {0, 4096};
+    jumped.offset = 0;
+    jumped.payload.assign(512, 0x42);
+
+    const auto result =
+        run_persistence_scenario({buffered, jumped});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    DrainsOriginalPacketAfterConflictingMapKey) {
+    TestPacket buffered{};
+    buffered.generation = 1;
+    buffered.lease_span = {0, 4096};
+    buffered.offset = 2048;
+    buffered.payload.assign(512, 0x43);
+    TestPacket conflicting = buffered;
+    conflicting.payload.assign(256, 0x44);
+
+    const auto result =
+        run_persistence_scenario({buffered, conflicting});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
 TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {
     const auto temp_root =
         std::filesystem::temp_directory_path() /

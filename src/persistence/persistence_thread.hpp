@@ -120,6 +120,9 @@ private:
     void drain_ordered_packets(
         RangeWriteState& range,
         bool sample_timing);
+    void drain_buffered_packets() noexcept;
+    [[nodiscard]] bool release_reorder_tracking(
+        std::size_t packet_bytes) noexcept;
     // 根据当前缺口大小更新 pause_for_gap。
     void update_gap_flag(RangeWriteState& range);
     // 达到字节阈值或时间阈值后，异步提交 flush + metadata 保存任务。

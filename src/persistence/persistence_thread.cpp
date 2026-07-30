@@ -214,6 +214,7 @@ void PersistenceThread::process_loop() {
 
     // 主循环退出并不代表最后一轮 flush 已经完成，所以这里还要等待挂起中的
     // flush/meta 任务结束，确保退出时磁盘和 metadata 是同一个版本。
+    drain_buffered_packets();
     wait_pending_flush();
 }
 
@@ -530,6 +531,23 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
                 return;
             }
             reorder_accounted = true;
+            if (current_out_of_order_packets_ ==
+                    std::numeric_limits<
+                        std::size_t>::max() ||
+                packet_bytes >
+                    static_cast<std::size_t>(
+                        std::numeric_limits<
+                            std::int64_t>::max()) ||
+                current_out_of_order_bytes_ >
+                    std::numeric_limits<
+                        std::int64_t>::max() -
+                        static_cast<std::int64_t>(
+                            packet_bytes)) {
+                packet.complete();
+                set_error(make_error_code(
+                    DownloadErrc::internal_error));
+                return;
+            }
             ++current_out_of_order_packets_;
             current_out_of_order_bytes_ +=
                 static_cast<std::int64_t>(packet_bytes);
@@ -545,18 +563,18 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
                     std::move(packet));
             static_cast<void>(position);
             if (!inserted) {
-                --current_out_of_order_packets_;
-                current_out_of_order_bytes_ -=
-                    static_cast<std::int64_t>(packet_bytes);
+                static_cast<void>(
+                    release_reorder_tracking(
+                        packet_bytes));
                 set_error(make_error_code(
                     DownloadErrc::internal_error));
                 return;
             }
         } catch (const std::bad_alloc&) {
             if (reorder_accounted) {
-                --current_out_of_order_packets_;
-                current_out_of_order_bytes_ -=
-                    static_cast<std::int64_t>(packet_bytes);
+                static_cast<void>(
+                    release_reorder_tracking(
+                        packet_bytes));
             }
             packet.complete();
             set_error(std::make_error_code(
@@ -564,9 +582,9 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
             return;
         } catch (...) {
             if (reorder_accounted) {
-                --current_out_of_order_packets_;
-                current_out_of_order_bytes_ -=
-                    static_cast<std::int64_t>(packet_bytes);
+                static_cast<void>(
+                    release_reorder_tracking(
+                        packet_bytes));
             }
             packet.complete();
             set_error(make_error_code(
@@ -810,12 +828,10 @@ void PersistenceThread::drain_ordered_packets(
             packet_size +
             sizeof(flow::DataPacket) +
             core::kMapNodeOverheadBytes;
-        if (current_out_of_order_packets_ > 0) {
-            --current_out_of_order_packets_;
+        if (!release_reorder_tracking(packet_bytes)) {
+            packet.complete();
+            return;
         }
-        current_out_of_order_bytes_ = std::max<std::int64_t>(0,
-            current_out_of_order_bytes_ -
-                static_cast<std::int64_t>(packet_bytes));
 
         const auto append_error = append_bytes(
             range, data->offset, data->payload, sample_timing);
@@ -836,6 +852,61 @@ void PersistenceThread::drain_ordered_packets(
     }
 
     update_gap_flag(range);
+}
+
+void PersistenceThread::drain_buffered_packets() noexcept {
+    std::scoped_lock lock(ranges_mutex_);
+    for (auto& range : ranges_) {
+        if (range == nullptr) {
+            continue;
+        }
+        while (!range->out_of_order.empty()) {
+            auto packet = std::move(
+                range->out_of_order.begin()->second);
+            range->out_of_order.erase(
+                range->out_of_order.begin());
+            const auto* data = packet.data();
+            if (data == nullptr) {
+                packet.complete();
+                set_error(make_error_code(
+                    DownloadErrc::internal_error));
+                continue;
+            }
+            const auto packet_bytes =
+                data->payload.size() +
+                sizeof(flow::DataPacket) +
+                core::kMapNodeOverheadBytes;
+            static_cast<void>(
+                release_reorder_tracking(packet_bytes));
+            packet.complete();
+        }
+    }
+}
+
+bool PersistenceThread::release_reorder_tracking(
+    const std::size_t packet_bytes) noexcept {
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+    if (range::detail::range_fault_plan()
+            .corrupt_next_reorder_tracking.exchange(
+                false,
+                std::memory_order_acq_rel)) {
+        current_out_of_order_packets_ = 0;
+    }
+#endif
+    if (packet_bytes >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::int64_t>::max()) ||
+        current_out_of_order_packets_ == 0 ||
+        current_out_of_order_bytes_ <
+            static_cast<std::int64_t>(packet_bytes)) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return false;
+    }
+    --current_out_of_order_packets_;
+    current_out_of_order_bytes_ -=
+        static_cast<std::int64_t>(packet_bytes);
+    return true;
 }
 
 void PersistenceThread::update_gap_flag(
