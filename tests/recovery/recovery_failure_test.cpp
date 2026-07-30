@@ -1286,3 +1286,64 @@ TEST_F(
     EXPECT_TRUE(std::filesystem::exists(
         open_request.paths.temporary_path));
 }
+
+TEST_F(
+    RecoveryFailureTest,
+    MetadataCleanupFailureDoesNotHideOutput) {
+    const auto open_request = request();
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const std::vector<std::uint8_t> bytes(
+        8192,
+        0x81);
+    ASSERT_FALSE(opened.checkpoint->write(0, bytes));
+    const auto finished =
+        static_cast<std::uint8_t>(
+            asyncdownload::core::BlockState::finished);
+    auto prepared = opened.checkpoint->prepare(
+        std::vector<std::uint8_t>{
+            finished,
+            finished
+        },
+        std::vector<
+            asyncdownload::recovery::RecoveryRangeFact>{{
+                {0},
+                {0, 8192},
+                8192,
+                8192,
+                2
+            }});
+    ASSERT_FALSE(prepared.error);
+    const auto committed =
+        opened.checkpoint->commit(
+            std::move(prepared.checkpoint));
+    ASSERT_FALSE(committed.error);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.fail_next_metadata_cleanup.store(
+        true,
+        std::memory_order_release);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_TRUE(result.output_available);
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(
+        result.metadata_cleanup.status,
+        asyncdownload::recovery::
+            CleanupStatus::failed);
+    EXPECT_EQ(
+        result.metadata_cleanup.error,
+        std::make_error_code(
+            std::errc::permission_denied));
+    EXPECT_TRUE(std::filesystem::exists(
+        open_request.paths.output_path));
+    EXPECT_FALSE(std::filesystem::exists(
+        open_request.paths.temporary_path));
+    EXPECT_TRUE(std::filesystem::exists(
+        open_request.paths.metadata_path));
+}

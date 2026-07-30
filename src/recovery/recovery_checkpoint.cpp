@@ -756,11 +756,62 @@ CheckpointCommitResult RecoveryCheckpoint::commit(
 }
 
 FinalizeResult RecoveryCheckpoint::finalize() noexcept {
-    return {
-        false,
-        {},
-        internal_error()
-    };
+    FinalizeResult result{};
+    if (implementation_ == nullptr) {
+        result.error = internal_error();
+        return result;
+    }
+    {
+        std::scoped_lock lock(
+            implementation_->state_mutex);
+        if (implementation_->prepared_generation != 0 ||
+            implementation_->active_generation != 0 ||
+            implementation_->last_committed_vdl !=
+                implementation_->remote.total_size) {
+            result.error = internal_error();
+            return result;
+        }
+    }
+
+    result.error =
+        implementation_->file_writer.finalize(
+            implementation_->paths.output_path,
+            implementation_->overwrite_existing);
+    if (result.error) {
+        return result;
+    }
+    result.output_available = true;
+
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+    if (detail::recovery_fault_plan().
+            fail_next_metadata_cleanup.exchange(
+                false,
+                std::memory_order_acq_rel)) {
+        result.metadata_cleanup = {
+            CleanupStatus::failed,
+            std::make_error_code(
+                std::errc::permission_denied)
+        };
+        return result;
+    }
+#endif
+
+    std::error_code cleanup_error;
+    const auto removed = std::filesystem::remove(
+        implementation_->paths.metadata_path,
+        cleanup_error);
+    if (cleanup_error) {
+        result.metadata_cleanup = {
+            CleanupStatus::failed,
+            cleanup_error
+        };
+    } else {
+        result.metadata_cleanup.status =
+            removed ?
+                CleanupStatus::removed :
+                CleanupStatus::not_found;
+    }
+    return result;
 }
 
 void RecoveryCheckpoint::close_preserving_artifacts()

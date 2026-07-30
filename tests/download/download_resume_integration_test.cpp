@@ -1614,6 +1614,9 @@ TEST(DownloadIntegrationTest, FinalizesAlreadyCompleteStateWithoutRangeSupport) 
 
     ASSERT_TRUE(result.ok()) << result.error.message();
     EXPECT_TRUE(result.resumed);
+    EXPECT_EQ(
+        result.completed_ranges,
+        total_size / block_size);
     const auto requests = read_logged_requests(request_log);
     EXPECT_TRUE(std::none_of(
         requests.begin(),

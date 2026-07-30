@@ -851,29 +851,20 @@ void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handle
     return session.telemetry_session_.final_summary(now);
 }
 
-std::error_code finalize_storage_phase(storage::FileWriter& file_writer,
-                                       metadata::MetadataStore& metadata_store,
-                                       const core::SessionState& session,
-                                       const core::AtomicBlockBitmap& bitmap,
-                                       std::error_code failure) noexcept {
+std::error_code finalize_storage_phase(
+    recovery::RecoveryCheckpoint& checkpoint,
+    const core::SessionState& session,
+    const core::AtomicBlockBitmap& bitmap,
+    std::error_code failure) noexcept {
     const auto completed_bytes = bitmap.contiguous_finished_bytes(
         session.effective_policy.persistence().block_bytes,
         session.total_size);
     if (!failure && completed_bytes >= session.total_size) {
-        auto finalize_error = file_writer.finalize(
-            session.paths.output_path,
-            session.effective_policy.persistence().overwrite_existing);
-        if (finalize_error) {
-            return finalize_error;
-        }
-
-        const auto remove_metadata_error = metadata_store.remove();
-        static_cast<void>(remove_metadata_error);
-        return {};
+        return checkpoint.finalize().error;
     }
 
     // 如果任务失败，就保留 .part 和 metadata 供下次恢复使用，不在这里做破坏性清理。
-    file_writer.close();
+    checkpoint.close_preserving_artifacts();
     if (!failure) {
         return make_error_code(DownloadErrc::http_transfer_failed);
     }
@@ -974,10 +965,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
         auto recovery_checkpoint =
             std::move(recovery_open.checkpoint);
-        auto& file_writer =
-            recovery_checkpoint->legacy_file_writer();
-        auto& metadata_store =
-            recovery_checkpoint->legacy_metadata_store();
         core::AtomicBlockBitmap bitmap(
             recovery_open.restored.bitmap_states.size());
         bitmap.restore(
@@ -996,15 +983,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         if (safe_vdl >= session.total_size) {
             // 恢复后如果发现整个文件其实已经完整可靠，就直接 finalize，
             // 不再走任何网络或持久化线程。
-            auto finalize_error = file_writer.finalize(session.paths.output_path,
-                session.effective_policy.persistence().overwrite_existing);
-            if (finalize_error) {
-                result.error = finalize_error;
+            const auto finalize_result =
+                recovery_checkpoint->finalize();
+            if (finalize_result.error) {
+                result.error = finalize_result.error;
                 return result;
             }
-
-            const auto remove_metadata_error = metadata_store.remove();
-            static_cast<void>(remove_metadata_error);
             result.total_bytes = session.total_size;
             result.downloaded_bytes = finished_bytes;
             result.persisted_bytes = finished_bytes;
@@ -1023,7 +1007,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             session.total_size);
         const auto initial_plan = scheduler.plan_initial(bitmap);
         if (initial_plan.error || initial_plan.ranges.empty()) {
-            file_writer.close();
+            recovery_checkpoint->
+                close_preserving_artifacts();
             result.error = initial_plan.error ?
                 initial_plan.error :
                 make_error_code(DownloadErrc::internal_error);
@@ -1037,7 +1022,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             initial_plan.ranges);
         if (lifecycle_creation.error ||
             lifecycle_creation.value == nullptr) {
-            file_writer.close();
+            recovery_checkpoint->
+                close_preserving_artifacts();
             result.error = lifecycle_creation.error ?
                 lifecycle_creation.error :
                 make_error_code(DownloadErrc::internal_error);
@@ -1052,7 +1038,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             session.telemetry_session_,
             packet_flow);
         if (packet_flow_error) {
-            file_writer.close();
+            recovery_checkpoint->
+                close_preserving_artifacts();
             result.error = packet_flow_error;
             result.performance =
                 build_performance_summary(session, Clock::now());
@@ -1101,7 +1088,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             static_cast<void>(close_error);
             persistence.stop();
             persistence.join();
-            file_writer.close();
+            recovery_checkpoint->
+                close_preserving_artifacts();
             result.error = applied.error ?
                 applied.error :
                 initial_geometry_error;
@@ -1120,7 +1108,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             static_cast<void>(close_error);
             persistence.stop();
             persistence.join();
-            file_writer.close();
+            recovery_checkpoint->
+                close_preserving_artifacts();
             result.error = make_error_code(DownloadErrc::http_init_failed);
             result.performance = build_performance_summary(session, Clock::now());
             return result;
@@ -1499,8 +1488,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         cleanup_network_resources(multi, handles);
-        failure = finalize_storage_phase(file_writer,
-            metadata_store,
+        failure = finalize_storage_phase(
+            *recovery_checkpoint,
             session,
             bitmap,
             failure);

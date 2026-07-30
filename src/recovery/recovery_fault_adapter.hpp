@@ -27,6 +27,8 @@ struct RecoveryFaultPlan {
         crc_read_count{0};
     std::atomic<bool>
         fail_next_checkpoint_submit{false};
+    std::atomic<bool>
+        fail_next_metadata_cleanup{false};
 
     void reset() noexcept {
         fail_next_metadata_invalidate.store(
@@ -54,6 +56,9 @@ struct RecoveryFaultPlan {
             0,
             std::memory_order_release);
         fail_next_checkpoint_submit.store(
+            false,
+            std::memory_order_release);
+        fail_next_metadata_cleanup.store(
             false,
             std::memory_order_release);
     }

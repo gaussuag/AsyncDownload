@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "asyncdownload/error.hpp"
+#include "core/block_bitmap.hpp"
 #include "core/crc32.hpp"
 #include "download/download_policy.hpp"
 #include "metadata/metadata_store.hpp"
@@ -535,6 +536,47 @@ TEST(
 
 TEST(
     RecoveryCheckpointTest,
+    ReportsNotFoundWhenFinalizeMetadataIsAbsent) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_finalize_no_metadata");
+    const auto request = fresh_request(temp.path());
+    const auto bytes = part_contents();
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 2};
+    const auto tail = std::span<const std::uint8_t>(
+        bytes.data() + 4096,
+        4096);
+    state.crc_samples.push_back({
+        4096,
+        asyncdownload::core::crc32(
+            std::as_bytes(tail)),
+        4096
+    });
+    save_candidate(request, state, bytes);
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    ASSERT_TRUE(std::filesystem::remove(
+        request.paths.metadata_path));
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_TRUE(result.output_available);
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(
+        result.metadata_cleanup.status,
+        asyncdownload::recovery::
+            CleanupStatus::not_found);
+    EXPECT_FALSE(result.metadata_cleanup.error);
+    EXPECT_EQ(
+        read_file(request.paths.output_path),
+        bytes);
+}
+
+TEST(
+    RecoveryCheckpointTest,
     ConflictingIdentityRestartsFresh) {
     RecoveryTempDirectory temp(
         "asyncdownload_recovery_identity");
@@ -678,4 +720,84 @@ TEST(
     ASSERT_FALSE(second_result.error);
     EXPECT_EQ(second_result.generation, 2U);
     EXPECT_EQ(second_result.committed_vdl, 0);
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    RejectsFinalizeBeforeFullCommittedVdl) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_finalize_incomplete");
+    const auto request = fresh_request(temp.path());
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_FALSE(result.output_available);
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                internal_error));
+    EXPECT_TRUE(std::filesystem::exists(
+        request.paths.temporary_path));
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.output_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    FinalizesFullCommittedCheckpoint) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_finalize_complete");
+    const auto request = fresh_request(temp.path());
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const auto bytes = part_contents();
+    ASSERT_FALSE(opened.checkpoint->write(0, bytes));
+    const auto finished =
+        static_cast<std::uint8_t>(
+            asyncdownload::core::BlockState::finished);
+    auto prepared = opened.checkpoint->prepare(
+        std::vector<std::uint8_t>{
+            finished,
+            finished
+        },
+        std::vector<
+            asyncdownload::recovery::RecoveryRangeFact>{{
+                {0},
+                {0, 8192},
+                8192,
+                8192,
+                2
+            }});
+    ASSERT_FALSE(prepared.error);
+    const auto committed =
+        opened.checkpoint->commit(
+            std::move(prepared.checkpoint));
+    ASSERT_FALSE(committed.error);
+    ASSERT_EQ(committed.committed_vdl, 8192);
+
+    const auto result = opened.checkpoint->finalize();
+
+    EXPECT_TRUE(result.output_available);
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(
+        result.metadata_cleanup.status,
+        asyncdownload::recovery::
+            CleanupStatus::removed);
+    EXPECT_FALSE(result.metadata_cleanup.error);
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.temporary_path));
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.metadata_path));
+    EXPECT_EQ(
+        read_file(request.paths.output_path),
+        bytes);
 }
