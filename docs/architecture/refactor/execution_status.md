@@ -4,12 +4,12 @@
 
 | Item | Value |
 | --- | --- |
-| Active stage | 4 — Recovery Checkpoint |
-| Last passed stage | 3 — Range Lifecycle |
+| Active stage | 5 — HTTP Transfer |
+| Last passed stage | 4 — Recovery Checkpoint |
 | Stage 0 base | `622339136e563752885d8b5ee6a6a0157e28266c` |
 | Stage 0 test rollback point | `98f891f` |
-| Current branch | `codex/refactor-04-recovery-checkpoint` |
-| Next slice | 04.2 — add recovery value types, codec, and an unwired owning module |
+| Current branch | `codex/refactor-05-http-transfer` |
+| Next slice | 05.1 — characterize probe, status, pause replay, ports, and known gaps |
 
 ## Stage ledger
 
@@ -19,8 +19,8 @@
 | 1 — Validated Download Policy | passed | `evidence/phase_01_validated_download_policy.md` | commits after `a2dee41` |
 | 2 — Packet Flow / Backpressure | passed | `evidence/phase_02_packet_flow_backpressure.md` | commits after `eca01fc` |
 | 3 — Range Lifecycle | passed | `evidence/phase_03_range_lifecycle.md` | commits after `f271997` |
-| 4 — Recovery Checkpoint | active | pending | depends on Stage 3 |
-| 5 — HTTP Transfer | locked | pending | depends on Stage 4 |
+| 4 — Recovery Checkpoint | passed | `evidence/phase_04_recovery_checkpoint.md` | commits after `af1a61d` |
+| 5 — HTTP Transfer | active | pending | depends on Stage 4 |
 | 6 — Telemetry Session | locked | pending | depends on Stage 5 |
 
 ## Persistent environment facts
@@ -47,5 +47,11 @@
   Release has the same 2 architecture skips.
 - Stage 3 WPR attempted artifact is `build/profiles/20260731_032735_phase-03-gate`; WPR start was
   denied by the same local system-performance tracing policy and error code.
+- Stage 4 Debug and Release main test binaries each run 203 tests: 201 pass and the same 2
+  architecture skips. Packet Flow fault tests pass 8/8, Range fault tests 6/6, and Recovery fault
+  tests 16/16 in both configurations.
+- Stage 4 formal benchmark artifact is
+  `build/benchmarks/20260731_053020_phase-04-post`; all 160 runs pass and all summaries have the
+  exact 10-key schema.
 - `skills/asyncdownload-performance` and `skills/history-archive` are absent at current HEAD but
   available in base commit `7a96af2`; their workflows govern this execution as a fallback.
