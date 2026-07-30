@@ -371,7 +371,7 @@ public:
     PacketFlow* owner = nullptr;
     download::FlowControlPolicy policy;
     telemetry::TelemetrySession& telemetry;
-    detail::MoodycamelPacketQueueAdapter queue;
+    detail::PacketQueueAdapter queue;
     std::vector<std::unique_ptr<LaneState>> lanes;
     std::vector<const PacketLaneObservation*> eligible_scratch;
     std::vector<std::uint8_t> seen_scratch;
@@ -681,6 +681,13 @@ PacketAdmission PacketProducer::accept(
         };
     }
     try {
+#if defined(ASYNCDOWNLOAD_PACKET_FLOW_FAULT_TEST)
+        if (detail::packet_queue_fault_plan()
+                .fail_next_payload_allocation.exchange(
+                    false, std::memory_order_acq_rel)) {
+            throw std::bad_alloc();
+        }
+#endif
         lane_state->payload.insert(
             lane_state->payload.end(),
             chunk.bytes.begin(),
@@ -1109,6 +1116,11 @@ std::error_code PacketConsumer::fail(
         return make_error_code(DownloadErrc::internal_error);
     }
     implementation.fail(error);
+#if defined(ASYNCDOWNLOAD_PACKET_FLOW_FAULT_TEST)
+    detail::packet_queue_fault_plan().consumer_fail_started.store(
+        true, std::memory_order_release);
+    detail::packet_queue_fault_plan().consumer_fail_started.notify_all();
+#endif
     implementation.wait_for_producer_operations();
 
     detail::PacketEnvelope envelope{};
