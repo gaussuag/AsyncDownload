@@ -6,6 +6,7 @@
 #include "core/memory_accounting.hpp"
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
+#include "download/download_policy.hpp"
 #include "download/http_probe.hpp"
 #include "download/range_scheduler.hpp"
 #include "metadata/metadata_store.hpp"
@@ -902,6 +903,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         // 第一层先做最基础的请求合法性校验，避免后面创建网络和文件资源后再回滚。
         if (request.url.empty() || request.output_path.empty()) {
             result.error = make_error_code(DownloadErrc::invalid_request);
+            return result;
+        }
+
+        const auto validated_policy =
+            validate_download_options(request.options);
+        if (!validated_policy.ok()) {
+            result.error = validated_policy.failure.error;
             return result;
         }
 
