@@ -4,10 +4,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -17,11 +20,20 @@
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
 #include "flow/packet_flow.hpp"
-#include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
-#include "storage/file_writer.hpp"
+#include "recovery/recovery_checkpoint.hpp"
 
 namespace {
+
+static_assert(std::is_constructible_v<
+    asyncdownload::persistence::PersistenceThread,
+    asyncdownload::core::SessionState&,
+    asyncdownload::download::PersistencePolicy,
+    asyncdownload::flow::PacketConsumer&,
+    asyncdownload::core::AtomicBlockBitmap&,
+    asyncdownload::recovery::RecoveryCheckpoint&,
+    BS::thread_pool<>&,
+    std::size_t>);
 
 struct TestPacket {
     std::size_t range_id = 0;
@@ -143,6 +155,33 @@ asyncdownload::download::EffectiveDownloadPolicy make_effective_policy(
     return std::move(*effective.value);
 }
 
+std::unique_ptr<
+    asyncdownload::recovery::RecoveryCheckpoint>
+open_checkpoint(
+    const asyncdownload::core::SessionState& session) {
+    asyncdownload::recovery::RecoveryOpenRequest request{};
+    request.paths = session.paths;
+    request.remote.url = session.url;
+    request.remote.total_size = session.total_size;
+    request.remote.accept_ranges =
+        session.effective_policy.remote_facts().
+            accept_ranges;
+    request.remote.etag = session.etag;
+    request.remote.last_modified =
+        session.last_modified;
+    request.policy =
+        session.effective_policy.recovery_identity();
+    request.overwrite_existing =
+        session.effective_policy.persistence().
+            overwrite_existing;
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    EXPECT_FALSE(opened.error);
+    EXPECT_NE(opened.checkpoint, nullptr);
+    return std::move(opened.checkpoint);
+}
+
 void persist_single_range_at_tail_capacity(
     const std::filesystem::path& temp_root,
     const std::int64_t total_size) {
@@ -175,21 +214,15 @@ void persist_single_range_at_tail_capacity(
         asyncdownload::core::required_block_count(
             session.total_size,
             policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(
-        session.paths.temporary_path,
-        session.total_size,
-        false,
-        true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         policy,
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
@@ -219,17 +252,22 @@ void persist_single_range_at_tail_capacity(
         session.persisted_bytes.load(std::memory_order_relaxed),
         total_size);
 
-    std::vector<std::byte> stored;
-    EXPECT_FALSE(writer.read(
-        0,
-        static_cast<std::size_t>(total_size),
-        stored));
+    checkpoint->close_preserving_artifacts();
+    std::ifstream stored_file(
+        session.paths.temporary_path,
+        std::ios::binary);
+    ASSERT_TRUE(stored_file.is_open());
+    const std::vector<char> stored{
+        std::istreambuf_iterator<char>(stored_file),
+        std::istreambuf_iterator<char>()
+    };
     ASSERT_EQ(stored.size(), static_cast<std::size_t>(total_size));
     for (const auto byte : stored) {
-        EXPECT_EQ(byte, std::byte{0x5A});
+        EXPECT_EQ(
+            static_cast<unsigned char>(byte),
+            0x5A);
     }
 
-    writer.close();
     EXPECT_EQ(
         std::filesystem::file_size(session.paths.temporary_path, ec),
         static_cast<std::uintmax_t>(total_size));
@@ -250,7 +288,7 @@ PersistenceScenarioResult run_persistence_scenario(
     const std::vector<TestPacket>& packets,
     const std::vector<
         asyncdownload::flow::ControlPacket>& controls = {},
-    const bool close_writer_before_start = false,
+    const bool close_checkpoint_before_start = false,
     const std::int64_t total_size = 4096) {
     static std::atomic<std::uint64_t> sequence{0};
     const auto temp_root =
@@ -287,22 +325,15 @@ PersistenceScenarioResult run_persistence_scenario(
         asyncdownload::core::required_block_count(
             total_size,
             policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    EXPECT_FALSE(writer.open(
-        session.paths.temporary_path,
-        session.total_size,
-        false,
-        true));
-    asyncdownload::metadata::MetadataStore store(
-        session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    EXPECT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         policy,
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers,
         1);
     asyncdownload::range::RangeFactSlot facts({0}, 0);
@@ -310,7 +341,7 @@ PersistenceScenarioResult run_persistence_scenario(
         persistence,
         facts,
         total_size);
-    if (!close_writer_before_start) {
+    if (!close_checkpoint_before_start) {
         persistence.start();
     }
 
@@ -340,8 +371,8 @@ PersistenceScenarioResult run_persistence_scenario(
     const auto close_error =
         packet_flow->producer().close();
     static_cast<void>(close_error);
-    if (close_writer_before_start) {
-        writer.close();
+    if (close_checkpoint_before_start) {
+        checkpoint->close_preserving_artifacts();
         persistence.start();
     }
     persistence.stop();
@@ -356,7 +387,7 @@ PersistenceScenarioResult run_persistence_scenario(
         fact_snapshot.has_value() &&
             fact_snapshot->committed_generation != 0
     };
-    writer.close();
+    checkpoint->close_preserving_artifacts();
     const auto removed = std::filesystem::remove_all(
         temp_root,
         filesystem_error);
@@ -811,12 +842,16 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        *checkpoint,
+        workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
     submit_range_registration(
@@ -841,7 +876,7 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
@@ -875,12 +910,16 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        *checkpoint,
+        workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
     submit_range_registration(
@@ -903,7 +942,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(bitmap.load(0), asyncdownload::core::BlockState::downloading);
@@ -940,12 +979,16 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        *checkpoint,
+        workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
     submit_range_registration(
@@ -970,7 +1013,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(packet_flow->producer().snapshot().queued_packets, 0U);
@@ -1007,12 +1050,16 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        *checkpoint,
+        workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
     submit_range_registration(
@@ -1035,7 +1082,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(session.persisted_bytes.load(std::memory_order_relaxed), 4096);
@@ -1073,12 +1120,16 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(
         asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
-    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        *checkpoint,
+        workers);
 
     asyncdownload::range::RangeFactSlot facts({0}, 0);
     submit_range_registration(
@@ -1125,7 +1176,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     ASSERT_FALSE(packet_flow->producer().close());
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(bitmap.load(0), asyncdownload::core::BlockState::finished);
@@ -1170,22 +1221,15 @@ TEST(
     ASSERT_FALSE(
         packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(1);
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(
-        session.paths.temporary_path,
-        session.total_size,
-        false,
-        true));
-    asyncdownload::metadata::MetadataStore store(
-        session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         policy,
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers,
         1);
     asyncdownload::range::RangeFactSlot facts({0}, 0);
@@ -1265,7 +1309,7 @@ TEST(
     const auto close_error = packet_flow->producer().close();
     persistence.stop();
     persistence.join();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
 
     EXPECT_FALSE(close_error);
     EXPECT_EQ(registered.ticket, 1U);

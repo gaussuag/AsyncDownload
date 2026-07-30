@@ -5,6 +5,7 @@
 #include "core/constants.hpp"
 #include "core/crc32.hpp"
 #include "range/range_fault_adapter.hpp"
+#include "recovery/recovery_checkpoint.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,16 +25,14 @@ PersistenceThread::PersistenceThread(core::SessionState& session,
                                      download::PersistencePolicy policy,
                                      flow::PacketConsumer& packet_consumer,
                                      core::AtomicBlockBitmap& bitmap,
-                                     storage::FileWriter& file_writer,
-                                     metadata::MetadataStore& metadata_store,
+                                     recovery::RecoveryCheckpoint& checkpoint,
                                      BS::thread_pool<>& workers,
                                      const std::size_t initial_range_count)
     : session_(session),
       policy_(std::move(policy)),
       packet_consumer_(packet_consumer),
       bitmap_(bitmap),
-      file_writer_(file_writer),
-      metadata_store_(metadata_store),
+      checkpoint_(checkpoint),
       workers_(workers),
       geometry_capacity_(std::max(
           initial_range_count,
@@ -662,7 +661,7 @@ std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
                                                const bool tail_write) {
     static_cast<void>(sample_timing);
     static_cast<void>(tail_write);
-    return file_writer_.write(offset, bytes);
+    return checkpoint_.write(offset, bytes);
 }
 
 std::error_code PersistenceThread::flush_tail(
@@ -819,7 +818,8 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
     last_flush_time_ = now;
 
     pending_flush_ = workers_.submit_task([this, snapshot]() mutable {
-        auto flush_error = file_writer_.flush();
+        auto flush_error =
+            checkpoint_.legacy_flush_part();
         if (flush_error) {
             return flush_error;
         }
@@ -829,7 +829,8 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
         snapshot.vdl_offset = bitmap_.contiguous_finished_bytes(policy_.block_bytes,
             session_.total_size);
         snapshot.crc_samples = build_crc_samples(snapshot);
-        auto metadata_error = metadata_store_.save(snapshot);
+        auto metadata_error =
+            checkpoint_.legacy_save_metadata(snapshot);
         return metadata_error;
     });
 }
@@ -948,7 +949,11 @@ PersistenceThread::build_crc_samples(const core::MetadataState& state) const {
         const auto length = static_cast<std::size_t>(std::min(block_size,
             state.total_size - offset));
         std::vector<std::byte> bytes;
-        const auto read_error = file_writer_.read(offset, length, bytes);
+        const auto read_error =
+            checkpoint_.legacy_read_part(
+                offset,
+                length,
+                bytes);
         if (read_error) {
             continue;
         }

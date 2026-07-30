@@ -490,4 +490,24 @@ RecoveryCheckpoint::legacy_metadata_store() noexcept {
     return implementation_->metadata_store;
 }
 
+std::error_code RecoveryCheckpoint::legacy_flush_part()
+    noexcept {
+    return implementation_->file_writer.flush();
+}
+
+std::error_code RecoveryCheckpoint::legacy_read_part(
+    const std::int64_t offset,
+    const std::size_t length,
+    std::vector<std::byte>& output) noexcept {
+    return implementation_->file_writer.read(
+        offset,
+        length,
+        output);
+}
+
+std::error_code RecoveryCheckpoint::legacy_save_metadata(
+    const core::MetadataState& state) noexcept {
+    return implementation_->metadata_store.save(state);
+}
+
 }

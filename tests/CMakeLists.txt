@@ -73,6 +73,7 @@ add_executable(asyncdownload_range_lifecycle_fault_tests
     ${CMAKE_SOURCE_DIR}/src/persistence/persistence_thread.cpp
     ${CMAKE_SOURCE_DIR}/src/range/range_fact_slot.cpp
     ${CMAKE_SOURCE_DIR}/src/range/range_lifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/src/recovery/recovery_checkpoint.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/file_writer.cpp
     ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_collector.cpp
     ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_session.cpp

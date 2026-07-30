@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -15,11 +16,10 @@
 #include "core/models.hpp"
 #include "download/download_policy.hpp"
 #include "flow/packet_flow.hpp"
-#include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "range/range_fault_adapter.hpp"
 #include "range/range_lifecycle.hpp"
-#include "storage/file_writer.hpp"
+#include "recovery/recovery_checkpoint.hpp"
 
 namespace {
 
@@ -49,12 +49,60 @@ effective_fault_policy() {
 class RangeLifecycleFaultTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        static std::atomic<std::uint64_t> next_id{0};
+        root_ = std::filesystem::temp_directory_path() /
+            ("asyncdownload_range_fault_" +
+             std::to_string(next_id.fetch_add(
+                 1,
+                 std::memory_order_relaxed)));
+        std::error_code ec;
+        std::filesystem::create_directories(root_, ec);
+        ASSERT_FALSE(ec);
         asyncdownload::range::detail::range_fault_plan().reset();
     }
 
     void TearDown() override {
         asyncdownload::range::detail::range_fault_plan().reset();
+        std::error_code ec;
+        const auto removed =
+            std::filesystem::remove_all(root_, ec);
+        static_cast<void>(removed);
     }
+
+    std::unique_ptr<
+        asyncdownload::recovery::RecoveryCheckpoint>
+    open_checkpoint(
+        asyncdownload::core::SessionState& session) {
+        if (session.paths.temporary_path.empty()) {
+            session.paths.output_path =
+                root_ / "output.bin";
+            session.paths.temporary_path =
+                root_ / "output.bin.part";
+            session.paths.metadata_path =
+                root_ / "output.bin.config.json";
+            session.url =
+                "http://127.0.0.1/fault.bin";
+        }
+        asyncdownload::recovery::RecoveryOpenRequest
+            request{};
+        request.paths = session.paths;
+        request.remote.url = session.url;
+        request.remote.total_size = session.total_size;
+        request.remote.accept_ranges =
+            session.effective_policy.remote_facts().
+                accept_ranges;
+        request.policy =
+            session.effective_policy.recovery_identity();
+        request.overwrite_existing = true;
+        auto opened =
+            asyncdownload::recovery::RecoveryCheckpoint::
+                open(request);
+        EXPECT_FALSE(opened.error);
+        EXPECT_NE(opened.checkpoint, nullptr);
+        return std::move(opened.checkpoint);
+    }
+
+    std::filesystem::path root_;
 };
 
 }
@@ -160,17 +208,15 @@ TEST_F(
         session.telemetry_session_,
         packet_flow));
     asyncdownload::core::AtomicBlockBitmap bitmap(1);
-    asyncdownload::storage::FileWriter writer;
-    asyncdownload::metadata::MetadataStore store(
-        "unused.config.json");
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         session.effective_policy.persistence(),
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers,
         1);
     auto& plan =
@@ -213,17 +259,15 @@ TEST_F(
         session.telemetry_session_,
         packet_flow));
     asyncdownload::core::AtomicBlockBitmap bitmap(1);
-    asyncdownload::storage::FileWriter writer;
-    asyncdownload::metadata::MetadataStore store(
-        "unused.config.json");
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         session.effective_policy.persistence(),
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers,
         1);
     auto& plan =
@@ -295,22 +339,15 @@ TEST_F(
     ASSERT_FALSE(
         packet_flow->producer().open_lane(lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(1);
-    asyncdownload::storage::FileWriter writer;
-    ASSERT_FALSE(writer.open(
-        session.paths.temporary_path,
-        session.total_size,
-        false,
-        true));
-    asyncdownload::metadata::MetadataStore store(
-        session.paths.metadata_path);
+    auto checkpoint = open_checkpoint(session);
+    ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
         session,
         session.effective_policy.persistence(),
         packet_flow->consumer(),
         bitmap,
-        writer,
-        store,
+        *checkpoint,
         workers,
         1);
     asyncdownload::range::RangeFactSlot facts({0}, 0);
@@ -356,7 +393,7 @@ TEST_F(
     persistence.join();
     const auto flow_snapshot =
         packet_flow->producer().snapshot();
-    writer.close();
+    checkpoint->close_preserving_artifacts();
     const auto removed = std::filesystem::remove_all(
         temp_root,
         filesystem_error);

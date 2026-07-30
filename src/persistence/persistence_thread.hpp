@@ -4,10 +4,8 @@
 #include "core/models.hpp"
 #include "download/download_policy.hpp"
 #include "flow/packet_flow.hpp"
-#include "metadata/metadata_store.hpp"
 #include "persistence/range_write_state.hpp"
 #include "range/range_lifecycle.hpp"
-#include "storage/file_writer.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
 
@@ -23,6 +21,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+namespace asyncdownload::recovery {
+class RecoveryCheckpoint;
+}
 
 namespace asyncdownload::persistence {
 
@@ -60,8 +62,7 @@ public:
                       download::PersistencePolicy policy,
                       flow::PacketConsumer& packet_consumer,
                       core::AtomicBlockBitmap& bitmap,
-                      storage::FileWriter& file_writer,
-                      metadata::MetadataStore& metadata_store,
+                      recovery::RecoveryCheckpoint& checkpoint,
                       BS::thread_pool<>& workers,
                       std::size_t initial_range_count = 0);
     ~PersistenceThread();
@@ -133,8 +134,7 @@ private:
     const download::PersistencePolicy policy_;
     flow::PacketConsumer& packet_consumer_;
     core::AtomicBlockBitmap& bitmap_;
-    storage::FileWriter& file_writer_;
-    metadata::MetadataStore& metadata_store_;
+    recovery::RecoveryCheckpoint& checkpoint_;
     BS::thread_pool<>& workers_;
     std::vector<std::unique_ptr<RangeWriteState>>
         ranges_;

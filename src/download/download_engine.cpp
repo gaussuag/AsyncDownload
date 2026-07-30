@@ -1064,8 +1064,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             session.effective_policy.persistence(),
             packet_flow->consumer(),
             bitmap,
-            file_writer,
-            metadata_store,
+            *recovery_checkpoint,
             workers,
             initial_plan.ranges.size());
         persistence.start();
