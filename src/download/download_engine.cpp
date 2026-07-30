@@ -11,6 +11,7 @@
 #include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
+#include "range/range_lifecycle.hpp"
 #include "storage/file_writer.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
@@ -20,9 +21,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <filesystem>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -44,6 +45,7 @@ struct TransferHandle {
     FlowControlPolicy flow_control{};
     CURL* easy = nullptr;
     core::RangeContext* range = nullptr;
+    std::optional<range::RangeLease> lease;
     std::string range_header;
     std::int64_t request_start = 0;
     std::int64_t request_end = -1;
@@ -274,6 +276,78 @@ void rebuild_bitmap_from_ranges(
     }
 }
 
+[[nodiscard]] core::RangeContext* find_range_projection(
+    const std::vector<std::unique_ptr<core::RangeContext>>& ranges,
+    const range::RangeId id) noexcept {
+    if (id.value > std::numeric_limits<std::size_t>::max()) {
+        return nullptr;
+    }
+    const auto found = std::find_if(
+        ranges.begin(),
+        ranges.end(),
+        [id](const auto& candidate) {
+            return candidate != nullptr &&
+                candidate->range_id ==
+                    static_cast<std::size_t>(id.value);
+        });
+    return found == ranges.end() ? nullptr : found->get();
+}
+
+[[nodiscard]] std::error_code apply_geometry_effects(
+    const range::EffectBatch<2>& effects,
+    std::vector<std::unique_ptr<core::RangeContext>>& ranges,
+    persistence::PersistenceThread& persistence) noexcept {
+    try {
+        for (std::size_t index = 0;
+             index < effects.size;
+             ++index) {
+            if (const auto* resize =
+                    std::get_if<range::ResizeRangeEffect>(
+                        &effects.values[index])) {
+                auto* projection =
+                    find_range_projection(ranges, resize->range);
+                if (projection == nullptr ||
+                    resize->new_end <= projection->start_offset) {
+                    return make_error_code(
+                        DownloadErrc::internal_error);
+                }
+                projection->end_offset.store(
+                    resize->new_end - 1,
+                    std::memory_order_release);
+                continue;
+            }
+
+            const auto* registration =
+                std::get_if<range::RegisterRangeEffect>(
+                    &effects.values[index]);
+            if (registration == nullptr ||
+                registration->range.value >
+                    std::numeric_limits<std::size_t>::max() ||
+                registration->bytes.begin >=
+                    registration->bytes.end ||
+                find_range_projection(
+                    ranges,
+                    registration->range) != nullptr) {
+                return make_error_code(
+                    DownloadErrc::internal_error);
+            }
+            auto projection =
+                std::make_unique<core::RangeContext>(
+                    static_cast<std::size_t>(
+                        registration->range.value),
+                    registration->bytes.begin,
+                    registration->bytes.end - 1);
+            persistence.register_range(projection.get());
+            ranges.push_back(std::move(projection));
+        }
+        return {};
+    } catch (const std::bad_alloc&) {
+        return std::make_error_code(std::errc::not_enough_memory);
+    } catch (...) {
+        return make_error_code(DownloadErrc::internal_error);
+    }
+}
+
 [[nodiscard]] std::error_code validate_resumed_blocks(const core::MetadataState& state,
                                                       storage::FileWriter& file_writer,
                                                       core::AtomicBlockBitmap& bitmap) noexcept {
@@ -315,7 +389,8 @@ void rebuild_bitmap_from_ranges(
 }
 
 void rollback_inflight_window(TransferHandle& transfer) noexcept {
-    if (transfer.range == nullptr) {
+    if (transfer.range == nullptr ||
+        !transfer.lease.has_value()) {
         return;
     }
 
@@ -330,18 +405,14 @@ void rollback_inflight_window(TransferHandle& transfer) noexcept {
 
 [[nodiscard]] std::error_code publish_range_complete(
     flow::PacketProducer& producer,
-    const core::RangeContext& range) noexcept {
-    const auto end = range.end_offset.load(std::memory_order_acquire);
-    if (end == std::numeric_limits<std::int64_t>::max()) {
+    const range::PublishRangeCompleteEffect& effect) noexcept {
+    if (effect.expected_end <= 0) {
         return std::make_error_code(std::errc::invalid_argument);
     }
     const auto published = producer.publish({
         flow::ControlPacketKind::range_complete,
-        {
-            {static_cast<std::uint64_t>(range.range_id)},
-            0
-        },
-        end + 1
+        effect.completion,
+        effect.expected_end
     });
     if (published.code != flow::PacketPublishCode::published) {
         return published.error ?
@@ -432,23 +503,27 @@ void update_speed(TransferHandle& transfer) noexcept {
 [[nodiscard]] std::error_code arm_transfer(TransferHandle& transfer,
                                            CURLM* multi,
                                            const core::SessionState& session,
-                                           core::RangeContext& range,
-                                           const RangeScheduler& scheduler) noexcept {
-    const auto window = scheduler.next_window(range);
-    if (window.first > window.second) {
+                                           core::RangeContext& projection,
+                                           range::RangeLease lease) noexcept {
+    if (lease.bytes.begin >= lease.bytes.end) {
         transfer.range = nullptr;
         return {};
     }
 
     // 派发 window 前先把逻辑租约登记到 range.current_offset。
     // 即使后面发生失败，也可以借助 rollback_inflight_window 把这段租约收回。
-    range.current_offset.store(window.second + 1, std::memory_order_release);
-    mark_range_status(range, core::RangeStatus::downloading);
+    projection.current_offset.store(
+        lease.bytes.end,
+        std::memory_order_release);
+    mark_range_status(
+        projection,
+        core::RangeStatus::downloading);
 
-    transfer.range = &range;
-    transfer.request_start = window.first;
-    transfer.request_end = window.second;
-    transfer.next_offset = window.first;
+    transfer.range = &projection;
+    transfer.lease = lease;
+    transfer.request_start = lease.bytes.begin;
+    transfer.request_end = lease.bytes.end - 1;
+    transfer.next_offset = lease.bytes.begin;
     transfer.request_bytes = 0;
     transfer.response_code = 0;
     transfer.speed_bytes_per_second = 0.0;
@@ -470,7 +545,10 @@ void update_speed(TransferHandle& transfer) noexcept {
                                                                void* user_data) -> size_t {
         auto* current = static_cast<TransferHandle*>(user_data);
         const auto bytes = size * nmemb;
-        if (bytes == 0 || current == nullptr || current->range == nullptr) {
+        if (bytes == 0 ||
+            current == nullptr ||
+            current->range == nullptr ||
+            !current->lease.has_value()) {
             return 0;
         }
 
@@ -517,17 +595,8 @@ void update_speed(TransferHandle& transfer) noexcept {
         const auto admission = current->packet_producer->accept(
             current->packet_lane,
             {
-                {
-                    {
-                        static_cast<std::uint64_t>(
-                            current->range->range_id)
-                    },
-                    0
-                },
-                {
-                    current->request_start,
-                    current->request_end + 1
-                },
+                current->lease->id,
+                current->lease->bytes,
                 current->next_offset,
                 std::span<const std::uint8_t>(
                     reinterpret_cast<const std::uint8_t*>(data),
@@ -585,6 +654,7 @@ void update_speed(TransferHandle& transfer) noexcept {
 
     if (curl_multi_add_handle(multi, transfer.easy) != CURLM_OK) {
         transfer.range = nullptr;
+        transfer.lease.reset();
         return make_error_code(DownloadErrc::http_transfer_failed);
     }
 
@@ -681,61 +751,87 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 [[nodiscard]] std::error_code finalize_completed_request(
     TransferHandle& transfer,
     core::SessionState& session,
-    std::deque<core::RangeContext*>& pending_ranges) noexcept {
-    if (transfer.range == nullptr) {
+    range::RangeLifecycle& lifecycle) noexcept {
+    if (transfer.range == nullptr ||
+        !transfer.lease.has_value()) {
         return {};
     }
+
+    const auto fail_lease =
+        [&transfer, &lifecycle](
+            const std::error_code error) noexcept {
+            rollback_inflight_window(transfer);
+            mark_range_status(
+                *transfer.range,
+                core::RangeStatus::failed);
+            const auto applied = lifecycle.apply(
+                range::LeaseFailed{
+                    transfer.lease->id,
+                    transfer.next_offset,
+                    error
+                });
+            return applied.error ? applied.error : error;
+        };
 
     // 这里处理的是“一个 HTTP window 请求结束了”，不是“整个下载任务结束了”。
     // 所以它既负责校验这次请求，也负责决定后续应该继续调度还是宣告 range 完成。
     update_speed(transfer);
     if (const auto flush_error = drain_packet_lane(transfer); flush_error) {
-        rollback_inflight_window(transfer);
-        mark_range_status(*transfer.range, core::RangeStatus::failed);
-        return flush_error;
+        return fail_lease(flush_error);
     }
 
     if (transfer.curl_result != CURLE_OK) {
-        rollback_inflight_window(transfer);
-        mark_range_status(*transfer.range, core::RangeStatus::failed);
-        return make_error_code(DownloadErrc::http_transfer_failed);
+        return fail_lease(
+            make_error_code(DownloadErrc::http_transfer_failed));
     }
 
     if (!response_is_valid(session, transfer)) {
-        rollback_inflight_window(transfer);
-        mark_range_status(*transfer.range, core::RangeStatus::failed);
-        return make_error_code(DownloadErrc::http_invalid_response);
+        return fail_lease(
+            make_error_code(DownloadErrc::http_invalid_response));
     }
 
     if (transfer.next_offset <= transfer.request_end) {
-        rollback_inflight_window(transfer);
-        mark_range_status(*transfer.range, core::RangeStatus::failed);
-        return make_error_code(DownloadErrc::http_transfer_failed);
+        return fail_lease(
+            make_error_code(DownloadErrc::http_transfer_failed));
     }
 
     transfer.range->pause_for_gap.store(false, std::memory_order_release);
     transfer.paused_by_window_boundary = false;
     update_transfer_pause_state(transfer);
 
-    const auto next_start = transfer.range->current_offset.load(std::memory_order_acquire);
-    const auto end = transfer.range->end_offset.load(std::memory_order_acquire);
-    if (next_start <= end) {
-        // 这个 range 还有尾巴没下载完，就把它重新放回待调度队列，
-        // 后面会继续为它派发下一个 window。
+    const auto applied = lifecycle.apply(
+        range::LeaseSucceeded{
+            transfer.lease->id,
+            transfer.next_offset
+        });
+    if (applied.error) {
+        mark_range_status(
+            *transfer.range,
+            core::RangeStatus::failed);
+        return applied.error;
+    }
+    if (applied.scheduler_may_run) {
         mark_range_status(*transfer.range, core::RangeStatus::empty);
-        pending_ranges.push_back(transfer.range);
-    } else if (!transfer.range->completion_notified.exchange(true, std::memory_order_acq_rel)) {
-        // 真正的 finished 由 Persistence 线程在 flush tail 后确认；
-        // Orchestrator 这里只负责发一个“网络阶段已完成”的控制消息。
+    }
+    for (std::size_t index = 0;
+         index < applied.effects.size;
+         ++index) {
+        const auto* completion =
+            std::get_if<range::PublishRangeCompleteEffect>(
+                &applied.effects.values[index]);
+        if (completion == nullptr) {
+            return make_error_code(DownloadErrc::internal_error);
+        }
         const auto publish_error = publish_range_complete(
             *transfer.packet_producer,
-            *transfer.range);
+            *completion);
         if (publish_error) {
             return publish_error;
         }
     }
 
     transfer.range = nullptr;
+    transfer.lease.reset();
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
@@ -752,6 +848,7 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
     // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
     // 不销毁底层 easy 对象本身。
     transfer.range = nullptr;
+    transfer.lease.reset();
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
@@ -1029,10 +1126,42 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         RangeScheduler scheduler(
             session.effective_policy.scheduling(),
             session.total_size);
-        auto ranges = scheduler.build_initial_ranges(bitmap);
-        std::deque<core::RangeContext*> pending_ranges;
-        for (const auto& range : ranges) {
-            pending_ranges.push_back(range.get());
+        const auto initial_plan = scheduler.plan_initial(bitmap);
+        if (initial_plan.error || initial_plan.ranges.empty()) {
+            file_writer.close();
+            result.error = initial_plan.error ?
+                initial_plan.error :
+                make_error_code(DownloadErrc::internal_error);
+            result.performance =
+                build_performance_summary(session, Clock::now());
+            return result;
+        }
+        auto lifecycle_creation = range::RangeLifecycle::create(
+            session.total_size,
+            session.effective_policy.scheduling(),
+            initial_plan.ranges);
+        if (lifecycle_creation.error ||
+            lifecycle_creation.value == nullptr) {
+            file_writer.close();
+            result.error = lifecycle_creation.error ?
+                lifecycle_creation.error :
+                make_error_code(DownloadErrc::internal_error);
+            result.performance =
+                build_performance_summary(session, Clock::now());
+            return result;
+        }
+        auto lifecycle = std::move(lifecycle_creation.value);
+        std::vector<std::unique_ptr<core::RangeContext>> ranges;
+        ranges.reserve(initial_plan.ranges.size());
+        for (std::size_t index = 0;
+             index < initial_plan.ranges.size();
+             ++index) {
+            const auto span = initial_plan.ranges[index];
+            ranges.push_back(
+                std::make_unique<core::RangeContext>(
+                    index,
+                    span.begin,
+                    span.end - 1));
         }
 
         std::unique_ptr<flow::PacketFlow> packet_flow;
@@ -1118,55 +1247,79 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 break;
             }
 
-            // 空闲 handle 会优先消费 pending_ranges；如果暂时没有待派发 range，
-            // 调度器再尝试从最大未分发尾部里做一次安全窃取。
             for (auto& handle : handles) {
                 if (handle.range != nullptr || handle.in_multi || failure) {
                     continue;
                 }
 
-                while (true) {
-                    if (pending_ranges.empty()) {
-                        auto stolen = scheduler.steal_largest_range(ranges);
-                        if (!stolen) {
-                            break;
-                        }
+                const auto acquired = lifecycle->acquire();
+                if (acquired.error) {
+                    failure = acquired.error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
+                if (!acquired.lease.has_value()) {
+                    continue;
+                }
+                if (const auto geometry_error =
+                        apply_geometry_effects(
+                            acquired.effects,
+                            ranges,
+                            persistence);
+                    geometry_error) {
+                    const auto applied = lifecycle->apply(
+                        range::EffectApplicationFailed{
+                            geometry_error
+                        });
+                    failure = applied.error ?
+                        applied.error :
+                        geometry_error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
 
-                        persistence.register_range(stolen.get());
-                        pending_ranges.push_back(stolen.get());
-                        ranges.push_back(std::move(stolen));
-                    }
+                auto* projection = find_range_projection(
+                    ranges,
+                    acquired.lease->id.range);
+                if (projection == nullptr) {
+                    const auto error =
+                        make_error_code(
+                            DownloadErrc::internal_error);
+                    const auto applied = lifecycle->apply(
+                        range::EffectApplicationFailed{error});
+                    failure = applied.error ?
+                        applied.error :
+                        error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
 
-                    auto* range = pending_ranges.front();
-                    pending_ranges.pop_front();
-                    if (range == nullptr || range->marked_finished.load(std::memory_order_acquire)) {
-                        continue;
-                    }
-
-                    if (range->current_offset.load(std::memory_order_acquire) >
-                        range->end_offset.load(std::memory_order_acquire)) {
-                        // 某些 range 在调度阶段可能已经被逻辑推进到完成态，但还没来得及
-                        // 通知 Persistence，这里补发 completion control packet。
-                        if (!range->completion_notified.exchange(true, std::memory_order_acq_rel)) {
-                            const auto publish_error =
-                                publish_range_complete(
-                                    packet_flow->producer(),
-                                    *range);
-                            if (publish_error) {
-                                failure = publish_error;
-                                session.stop_requested.store(
-                                    true,
-                                    std::memory_order_release);
-                            }
-                        }
-                        continue;
-                    }
-
-                    const auto arm_error = arm_transfer(handle, multi, session, *range, scheduler);
-                    if (arm_error) {
-                        failure = arm_error;
-                        session.stop_requested.store(true, std::memory_order_release);
-                    }
+                const auto lease = *acquired.lease;
+                const auto arm_error = arm_transfer(
+                    handle,
+                    multi,
+                    session,
+                    *projection,
+                    lease);
+                if (arm_error) {
+                    const auto applied = lifecycle->apply(
+                        range::LeaseFailed{
+                            lease.id,
+                            lease.bytes.begin,
+                            arm_error
+                        });
+                    failure = applied.error ?
+                        applied.error :
+                        arm_error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
                     break;
                 }
             }
@@ -1225,7 +1378,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 // 还是发出 range_complete 控制消息交给 Persistence 做最终收尾。
                 const auto finalize_error = finalize_completed_request(*transfer,
                     session,
-                    pending_ranges);
+                    *lifecycle);
                 if (finalize_error) {
                     failure = finalize_error;
                     session.stop_requested.store(true, std::memory_order_release);
@@ -1239,13 +1392,23 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 emit_progress_at = now + std::chrono::milliseconds(200);
             }
 
-            // 只有当没有活动句柄且没有待派发 range 时，网络调度阶段才算真正完成。
             const auto has_active = std::any_of(handles.begin(), handles.end(),
                 [](const TransferHandle& handle) {
                     return handle.in_multi || handle.range != nullptr;
                 });
-            if (!has_active && pending_ranges.empty()) {
-                break;
+            if (!has_active) {
+                const auto lifecycle_snapshot =
+                    lifecycle->snapshot();
+                if (lifecycle_snapshot.error) {
+                    failure = lifecycle_snapshot.error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
+                if (!lifecycle_snapshot.value.has_schedulable_work) {
+                    break;
+                }
             }
 
             int num_fds = 0;
