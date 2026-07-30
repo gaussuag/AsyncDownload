@@ -42,6 +42,7 @@ struct TransferHandle {
     core::SessionState* session = nullptr;
     DataQueue* data_queue = nullptr;
     DataQueue::producer_token_t* data_queue_producer = nullptr;
+    FlowControlPolicy flow_control{};
     CURL* easy = nullptr;
     core::RangeContext* range = nullptr;
     std::string range_header;
@@ -470,7 +471,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
     while (!flush_transfer_buffer(transfer)) {
         if (transfer.session->stop_requested.load(std::memory_order_acquire) &&
             transfer.session->queued_packets.load(std::memory_order_relaxed) >=
-                transfer.session->options.queue_capacity_packets) {
+                transfer.flow_control.packet_budget) {
             return make_error_code(DownloadErrc::http_transfer_failed);
         }
 
@@ -575,7 +576,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
         if (core::should_pause_for_backpressure(current_bytes,
                 projected_accounted > previous_accounted ?
                     projected_accounted - previous_accounted : 0,
-                current->session->options.backpressure_high_bytes)) {
+                current->flow_control.memory_high_bytes)) {
             start_memory_pause(*current);
             return CURL_WRITEFUNC_PAUSE;
         }
@@ -617,8 +618,7 @@ void reset_transfer_buffer(TransferHandle& transfer) noexcept {
 }
 
 void resume_paused_transfers(std::vector<TransferHandle>& handles,
-                             const std::size_t queue_capacity_packets,
-                             const std::size_t low_watermark) noexcept {
+                             const FlowControlPolicy& policy) noexcept {
     const auto current_bytes = core::global_memory_accounting().current_bytes();
     for (auto& handle : handles) {
         if (!handle.in_multi) {
@@ -626,10 +626,12 @@ void resume_paused_transfers(std::vector<TransferHandle>& handles,
         }
 
         const auto queue_can_resume = handle.queue_pause_active &&
-            handle.session->queued_packets.load(std::memory_order_relaxed) < queue_capacity_packets &&
-            current_bytes <= low_watermark;
+            handle.session->queued_packets.load(std::memory_order_relaxed) <
+                policy.packet_budget &&
+            current_bytes <= policy.memory_low_bytes;
 
-        if (handle.paused_by_memory && current_bytes > low_watermark) {
+        if (handle.paused_by_memory &&
+            current_bytes > policy.memory_low_bytes) {
             continue;
         }
 
@@ -689,9 +691,9 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 }
 
 void apply_memory_backpressure(std::vector<TransferHandle>& handles,
-                               const std::size_t high_watermark) noexcept {
+                               const FlowControlPolicy& policy) noexcept {
     const auto current_bytes = core::global_memory_accounting().current_bytes();
-    if (current_bytes <= high_watermark) {
+    if (current_bytes <= policy.memory_high_bytes) {
         return;
     }
 
@@ -1067,7 +1069,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         constexpr std::size_t kQueueExplicitProducers = 1;
         constexpr std::size_t kQueueImplicitProducers = 1;
         DataQueue data_queue(
-            session.options.queue_capacity_packets,
+            effective_policy.flow_control().packet_budget,
             kQueueExplicitProducers,
             kQueueImplicitProducers);
         DataQueue::producer_token_t network_queue_producer(data_queue);
@@ -1107,6 +1109,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             handle.session = &session;
             handle.data_queue = &data_queue;
             handle.data_queue_producer = &network_queue_producer;
+            handle.flow_control = effective_policy.flow_control();
             handle.easy = curl_easy_init();
             if (handle.easy == nullptr) {
                 failure = make_error_code(DownloadErrc::http_init_failed);
@@ -1179,10 +1182,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             // gap pause 和 memory backpressure 都是在事件循环里集中执行，避免在
             // write callback 里直接操作其他 handle，保持控制流简单。
             apply_gap_pauses(handles);
-            apply_memory_backpressure(handles, session.options.backpressure_high_bytes);
-            resume_paused_transfers(handles,
-                session.options.queue_capacity_packets,
-                session.options.backpressure_low_bytes);
+            apply_memory_backpressure(
+                handles,
+                effective_policy.flow_control());
+            resume_paused_transfers(
+                handles,
+                effective_policy.flow_control());
 
             int running_handles = 0;
             const auto perform_status = curl_multi_perform(multi, &running_handles);

@@ -38,7 +38,8 @@ bool should_pause_for_backpressure(const std::size_t current_bytes,
         return false;
     }
 
-    return current_bytes + incoming_bytes > high_watermark;
+    return incoming_bytes > high_watermark ||
+        current_bytes > high_watermark - incoming_bytes;
 }
 
 MemoryAccounting& global_memory_accounting() noexcept {
