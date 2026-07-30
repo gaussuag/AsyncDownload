@@ -1,7 +1,10 @@
 ﻿#include "range_scheduler.hpp"
 
+#include "asyncdownload/error.hpp"
+
 #include <algorithm>
 #include <cstdint>
+#include <new>
 #include <utility>
 
 namespace asyncdownload::download {
@@ -40,6 +43,101 @@ RangeScheduler::RangeScheduler(SchedulingPolicy policy,
                                const std::int64_t total_size) noexcept
     : policy_(std::move(policy)),
       total_size_(total_size) {}
+
+RangePlanResult RangeScheduler::plan_initial(
+    const core::AtomicBlockBitmap& bitmap) const noexcept {
+    RangePlanResult result;
+    try {
+        if (!policy_.issue_range_requests) {
+            if (total_size_ > 0) {
+                result.ranges.push_back({0, total_size_});
+            }
+            return result;
+        }
+        const auto spans =
+            split_spans(build_unfinished_spans(bitmap));
+        result.ranges.reserve(spans.size());
+        for (const auto& [begin, inclusive_end] : spans) {
+            if (begin <= inclusive_end) {
+                result.ranges.push_back({
+                    begin,
+                    inclusive_end + 1
+                });
+            }
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        result.ranges.clear();
+        result.error =
+            std::make_error_code(std::errc::not_enough_memory);
+        return result;
+    } catch (...) {
+        result.ranges.clear();
+        result.error = make_error_code(DownloadErrc::internal_error);
+        return result;
+    }
+}
+
+range::ByteSpan RangeScheduler::next_window(
+    const RangeCandidate& candidate) const noexcept {
+    if (candidate.dispatch_cursor < candidate.bytes.begin ||
+        candidate.dispatch_cursor >= candidate.bytes.end) {
+        return {};
+    }
+    if (!policy_.issue_range_requests) {
+        return {0, total_size_};
+    }
+    const auto remaining =
+        candidate.bytes.end - candidate.dispatch_cursor;
+    const auto extent =
+        std::min(remaining, policy_.transfer_window_bytes);
+    return {
+        candidate.dispatch_cursor,
+        candidate.dispatch_cursor + extent
+    };
+}
+
+std::optional<StealPlan> RangeScheduler::choose_steal(
+    const std::span<const RangeCandidate> candidates) const noexcept {
+    if (!policy_.allow_work_stealing) {
+        return std::nullopt;
+    }
+
+    const RangeCandidate* donor = nullptr;
+    range::ByteOffset donor_remaining = 0;
+    for (const auto& candidate : candidates) {
+        if ((candidate.phase != range::RangePhase::ready &&
+             candidate.phase != range::RangePhase::leased) ||
+            candidate.dispatch_cursor < candidate.bytes.begin ||
+            candidate.dispatch_cursor >= candidate.bytes.end) {
+            continue;
+        }
+        const auto remaining =
+            candidate.bytes.end - candidate.dispatch_cursor;
+        if (remaining > donor_remaining) {
+            donor = &candidate;
+            donor_remaining = remaining;
+        }
+    }
+
+    if (donor == nullptr ||
+        !has_two_units(donor_remaining, policy_.block_bytes) ||
+        (policy_.connection_limit >= 16 &&
+         !has_two_units(
+             donor_remaining,
+             policy_.transfer_window_bytes))) {
+        return std::nullopt;
+    }
+
+    const auto split = align_down(
+        donor->dispatch_cursor + donor_remaining / 2,
+        policy_.block_bytes);
+    if (split <= donor->dispatch_cursor ||
+        split >= donor->bytes.end) {
+        return std::nullopt;
+    }
+    return StealPlan{donor->id, split};
+}
 
 std::vector<std::unique_ptr<core::RangeContext>>
 RangeScheduler::build_initial_ranges(const core::AtomicBlockBitmap& bitmap) noexcept {

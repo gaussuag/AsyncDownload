@@ -33,4 +33,21 @@ struct ByteSpan {
     friend bool operator==(const ByteSpan&, const ByteSpan&) = default;
 };
 
+enum class RangePhase : std::uint8_t {
+    ready = 0,
+    leased = 1,
+    awaiting_persistence = 2,
+    finished = 3,
+    failed = 4,
+    cancelled = 5
+};
+
+struct RangeLease {
+    LeaseId id{};
+    ByteSpan bytes{};
+    bool use_http_range = true;
+
+    friend bool operator==(const RangeLease&, const RangeLease&) = default;
+};
+
 }

@@ -3,18 +3,48 @@
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
 #include "download/download_policy.hpp"
+#include "range/range_types.hpp"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 namespace asyncdownload::download {
 
+struct RangeCandidate {
+    range::RangeId id{};
+    range::ByteSpan bytes{};
+    range::ByteOffset dispatch_cursor = 0;
+    range::RangePhase phase = range::RangePhase::ready;
+};
+
+struct StealPlan {
+    range::RangeId donor{};
+    range::ByteOffset split = 0;
+};
+
+struct RangePlanResult {
+    std::vector<range::ByteSpan> ranges;
+    std::error_code error;
+};
+
 class RangeScheduler {
 public:
     RangeScheduler(SchedulingPolicy policy,
                    std::int64_t total_size) noexcept;
+
+    [[nodiscard]] RangePlanResult
+    plan_initial(const core::AtomicBlockBitmap& bitmap) const noexcept;
+
+    [[nodiscard]] range::ByteSpan
+    next_window(const RangeCandidate& candidate) const noexcept;
+
+    [[nodiscard]] std::optional<StealPlan>
+    choose_steal(std::span<const RangeCandidate> candidates) const noexcept;
 
     // 根据当前 bitmap 生成初始 RangeContext 列表，只覆盖未完成区域。
     [[nodiscard]] std::vector<std::unique_ptr<core::RangeContext>>
