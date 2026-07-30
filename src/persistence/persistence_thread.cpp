@@ -606,20 +606,55 @@ void PersistenceThread::handle_range_complete(
         set_error(make_error_code(DownloadErrc::internal_error));
         return;
     }
-    if (control.completion.generation !=
+    if (control.completion.generation <
         range->last_observed_lease_generation) {
+        return;
+    }
+    if (range->committed) {
+        if (range->pending_completion ==
+                control.completion &&
+            control.expected_end == range->bytes.end &&
+            range->persisted_through ==
+                control.expected_end) {
+            return;
+        }
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (control.completion.generation !=
+            range->last_observed_lease_generation ||
+        control.completion.generation == 0 ||
+        control.expected_end != range->bytes.end ||
+        range->persisted_through !=
+            control.expected_end ||
+        range->gap_blocked ||
+        !range->out_of_order.empty()) {
         set_error(make_error_code(
             DownloadErrc::internal_error));
         return;
     }
     range->observed_activity = true;
     range->pending_completion = control.completion;
+    range->observed_dispatch_through = std::max(
+        range->observed_dispatch_through,
+        control.expected_end);
+    if (range->legacy_projection != nullptr) {
+        range->legacy_projection->current_offset.store(
+            range->observed_dispatch_through,
+            std::memory_order_release);
+    }
 
     // 网络层认定一个 range 的 HTTP 请求已经全部结束后，Persistence 仍然要做
     // 两件事：把最后没凑满对齐块的 tail 刷掉，以及把状态正式推进到 finished。
     const auto flush_error = flush_tail(*range, false);
     if (flush_error) {
         set_error(flush_error);
+        return;
+    }
+    if (range->tail.length != 0) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
         return;
     }
 

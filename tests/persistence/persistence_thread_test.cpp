@@ -232,7 +232,9 @@ struct PersistenceScenarioResult {
 PersistenceScenarioResult run_persistence_scenario(
     const std::vector<TestPacket>& packets,
     const std::vector<
-        asyncdownload::flow::ControlPacket>& controls = {}) {
+        asyncdownload::flow::ControlPacket>& controls = {},
+    const bool close_writer_before_start = false,
+    const std::int64_t total_size = 4096) {
     static std::atomic<std::uint64_t> sequence{0};
     const auto temp_root =
         std::filesystem::temp_directory_path() /
@@ -253,7 +255,7 @@ PersistenceScenarioResult run_persistence_scenario(
     policy.flush_threshold_bytes = 4096;
     policy.flush_interval = std::chrono::milliseconds(10);
     asyncdownload::core::SessionState session(
-        make_effective_policy(policy, 4096));
+        make_effective_policy(policy, total_size));
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path =
         temp_root / "output.bin.part";
@@ -264,7 +266,10 @@ PersistenceScenarioResult run_persistence_scenario(
     asyncdownload::flow::ProducerLane lane;
     EXPECT_FALSE(
         packet_flow->producer().open_lane(lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(1);
+    asyncdownload::core::AtomicBlockBitmap bitmap(
+        asyncdownload::core::required_block_count(
+            total_size,
+            policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     EXPECT_FALSE(writer.open(
         session.paths.temporary_path,
@@ -283,9 +288,14 @@ PersistenceScenarioResult run_persistence_scenario(
         store,
         workers,
         1);
-    asyncdownload::core::RangeContext range(0, 0, 4095);
+    asyncdownload::core::RangeContext range(
+        0,
+        0,
+        total_size - 1);
     EXPECT_FALSE(persistence.register_range(&range));
-    persistence.start();
+    if (!close_writer_before_start) {
+        persistence.start();
+    }
 
     for (const auto& packet : packets) {
         enqueue_data_packet(
@@ -313,6 +323,10 @@ PersistenceScenarioResult run_persistence_scenario(
     const auto close_error =
         packet_flow->producer().close();
     static_cast<void>(close_error);
+    if (close_writer_before_start) {
+        writer.close();
+        persistence.start();
+    }
     persistence.stop();
     persistence.join();
     PersistenceScenarioResult result{
@@ -573,6 +587,172 @@ TEST(
     EXPECT_TRUE(result.error);
     EXPECT_EQ(result.flow.queued_packets, 0U);
     EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsCompletionWhileGapRemains) {
+    TestPacket buffered{};
+    buffered.generation = 1;
+    buffered.lease_span = {0, 4096};
+    buffered.offset = 2048;
+    buffered.payload.assign(512, 0x45);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4096
+    };
+
+    const auto result =
+        run_persistence_scenario({buffered}, {completion});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_FALSE(result.marked_finished);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsCompletionBeforeFinalPersistedFrontier) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4096};
+    packet.offset = 0;
+    packet.payload.assign(512, 0x46);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4096
+    };
+
+    const auto result =
+        run_persistence_scenario({packet}, {completion});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_FALSE(result.marked_finished);
+    EXPECT_EQ(result.persisted_through, 512);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsCompletionExpectedEndMismatch) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4096};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x47);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        2048
+    };
+
+    const auto result =
+        run_persistence_scenario({packet}, {completion});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_FALSE(result.marked_finished);
+}
+
+TEST(
+    PersistenceThreadTest,
+    DoesNotCommitWhenFinalTailWriteFails) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4095};
+    packet.offset = 0;
+    packet.payload.assign(4095, 0x48);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4095
+    };
+
+    const auto result = run_persistence_scenario(
+        {packet},
+        {completion},
+        true,
+        4095);
+
+    EXPECT_TRUE(result.error);
+    EXPECT_FALSE(result.marked_finished);
+}
+
+TEST(
+    PersistenceThreadTest,
+    TreatsDuplicateCompletionAsIdempotent) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4096};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x49);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4096
+    };
+
+    const auto result = run_persistence_scenario(
+        {packet},
+        {completion, completion});
+
+    EXPECT_FALSE(result.error);
+    EXPECT_TRUE(result.marked_finished);
+    EXPECT_EQ(result.persisted_through, 4096);
+}
+
+TEST(
+    PersistenceThreadTest,
+    IgnoresStaleCompletionForOlderGeneration) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 512};
+    first.offset = 0;
+    first.payload.assign(512, 0x4A);
+    TestPacket second{};
+    second.generation = 2;
+    second.lease_span = {512, 1024};
+    second.offset = 512;
+    second.payload.assign(512, 0x4B);
+    const asyncdownload::flow::ControlPacket stale{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4096
+    };
+
+    const auto result =
+        run_persistence_scenario({first, second}, {stale});
+
+    EXPECT_FALSE(result.error);
+    EXPECT_FALSE(result.marked_finished);
+    EXPECT_EQ(result.persisted_through, 1024);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsConflictingDuplicateCompletion) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4096};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x4C);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        4096
+    };
+    const asyncdownload::flow::ControlPacket conflicting{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 1},
+        2048
+    };
+
+    const auto result = run_persistence_scenario(
+        {packet},
+        {completion, conflicting});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_TRUE(result.marked_finished);
 }
 
 TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {
