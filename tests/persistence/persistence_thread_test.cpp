@@ -13,7 +13,6 @@
 #include <thread-pool/BS_thread_pool.hpp>
 
 #include "core/block_bitmap.hpp"
-#include "core/memory_accounting.hpp"
 #include "core/models.hpp"
 #include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
@@ -115,7 +114,6 @@ asyncdownload::download::EffectiveDownloadPolicy make_effective_policy(
 void persist_single_range_at_tail_capacity(
     const std::filesystem::path& temp_root,
     const std::int64_t total_size) {
-    asyncdownload::core::global_memory_accounting().reset();
     std::error_code ec;
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
@@ -226,7 +224,6 @@ TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {
 }
 
 TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
-    asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root = std::filesystem::temp_directory_path() / "asyncdownload_gap_pause_test";
     std::error_code ec;
@@ -286,7 +283,6 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
 }
 
 TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
-    asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root =
         std::filesystem::temp_directory_path() / "asyncdownload_downloading_bitmap_test";
@@ -350,7 +346,6 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
 }
 
 TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
-    asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root =
         std::filesystem::temp_directory_path() / "asyncdownload_queue_bytes_tracking_test";
@@ -416,7 +411,6 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
 }
 
 TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
-    asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root =
         std::filesystem::temp_directory_path() / "asyncdownload_packet_latency_sampling_test";
@@ -482,7 +476,6 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
 }
 
 TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
-    asyncdownload::core::global_memory_accounting().reset();
 
     const auto temp_root = std::filesystem::temp_directory_path() / "asyncdownload_gap_resume_test";
     std::error_code ec;

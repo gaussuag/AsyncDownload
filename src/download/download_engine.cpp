@@ -3,7 +3,6 @@
 #include "asyncdownload/error.hpp"
 #include "core/block_bitmap.hpp"
 #include "core/crc32.hpp"
-#include "core/memory_accounting.hpp"
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
 #include "download/download_policy.hpp"
@@ -170,7 +169,10 @@ void invoke_progress(core::SessionState& session,
             handles.front().packet_producer == nullptr ?
         0 :
         handles.front().packet_producer->snapshot().queued_packets;
-    snapshot.memory_bytes = core::global_memory_accounting().current_bytes();
+    snapshot.memory_bytes = handles.empty() ||
+            handles.front().packet_producer == nullptr ?
+        0 :
+        handles.front().packet_producer->snapshot().accounted_bytes;
     snapshot.resumed = session.resumed;
 
     for (const auto& range : ranges) {
@@ -634,7 +636,10 @@ void reflect_packet_publication(
 
 void resume_paused_transfers(std::vector<TransferHandle>& handles,
                              const FlowControlPolicy& policy) noexcept {
-    const auto current_bytes = core::global_memory_accounting().current_bytes();
+    const auto current_bytes = handles.empty() ||
+            handles.front().packet_producer == nullptr ?
+        0 :
+        handles.front().packet_producer->snapshot().accounted_bytes;
     for (auto& handle : handles) {
         if (!handle.in_multi) {
             continue;
@@ -707,7 +712,10 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 
 void apply_memory_backpressure(std::vector<TransferHandle>& handles,
                                const FlowControlPolicy& policy) noexcept {
-    const auto current_bytes = core::global_memory_accounting().current_bytes();
+    const auto current_bytes = handles.empty() ||
+            handles.front().packet_producer == nullptr ?
+        0 :
+        handles.front().packet_producer->snapshot().accounted_bytes;
     if (current_bytes <= policy.memory_high_bytes) {
         return;
     }
@@ -943,10 +951,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.error = make_error_code(DownloadErrc::http_init_failed);
             return result;
         }
-
-        // 每次新任务开始前都重置全局内存会计，避免上一次任务异常退出后的残留统计
-        // 污染当前这次背压判断。
-        core::global_memory_accounting().reset();
 
         // 先做远端探测，拿到文件大小、Range 能力、ETag、Last-Modified。
         // 后面的恢复判定、分片调度和完整性校验都依赖这一步的结果。

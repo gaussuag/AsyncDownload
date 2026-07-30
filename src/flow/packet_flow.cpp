@@ -3,7 +3,6 @@
 #include "asyncdownload/error.hpp"
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "core/constants.hpp"
-#include "core/memory_accounting.hpp"
 #include "flow/packet_queue_adapter.hpp"
 
 #include <algorithm>
@@ -119,10 +118,22 @@ public:
         state.store(PacketFlowState::failed, std::memory_order_release);
     }
 
-    void add_accounting(const std::size_t bytes) noexcept {
-        const auto current = core::global_memory_accounting().add(bytes);
-        accounted_bytes.fetch_add(bytes, std::memory_order_acq_rel);
-        telemetry.record_memory_sample(current);
+    [[nodiscard]] bool add_accounting(const std::size_t bytes) noexcept {
+        auto current = accounted_bytes.load(std::memory_order_acquire);
+        while (true) {
+            if (bytes > std::numeric_limits<std::size_t>::max() - current) {
+                fail(make_error_code(DownloadErrc::internal_error));
+                return false;
+            }
+            if (accounted_bytes.compare_exchange_weak(
+                    current,
+                    current + bytes,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                telemetry.record_memory_sample(current + bytes);
+                return true;
+            }
+        }
     }
 
     [[nodiscard]] bool release_accounting(const std::size_t bytes) noexcept {
@@ -137,8 +148,6 @@ public:
                     current - bytes,
                     std::memory_order_acq_rel,
                     std::memory_order_acquire)) {
-                static_cast<void>(
-                    core::global_memory_accounting().subtract(bytes));
                 return true;
             }
         }
@@ -424,8 +433,10 @@ std::error_code PacketLease::account_reorder_node() noexcept {
         return error;
     }
 
-    owner_->implementation_->add_accounting(
-        core::kMapNodeOverheadBytes);
+    if (!owner_->implementation_->add_accounting(
+            core::kMapNodeOverheadBytes)) {
+        return owner_->implementation_->first_error();
+    }
     accounted_bytes_ += core::kMapNodeOverheadBytes;
     reorder_node_accounted_ = true;
     return {};
@@ -580,8 +591,8 @@ PacketAdmission PacketProducer::accept(
     const auto projected_accounted =
         sizeof(DataPacket) + projected_payload;
     const auto delta = projected_accounted - lane_state->accounted_bytes;
-    const auto current =
-        core::global_memory_accounting().current_bytes();
+    const auto current = implementation.accounted_bytes.load(
+        std::memory_order_acquire);
     if (delta != 0 &&
         current != 0 &&
         (delta > implementation.policy.memory_high_bytes ||
@@ -596,7 +607,15 @@ PacketAdmission PacketProducer::accept(
         };
     }
 
-    implementation.add_accounting(delta);
+    if (!implementation.add_accounting(delta)) {
+        return {
+            PacketAdmissionCode::failed,
+            0,
+            published_bytes,
+            lane_state->pause_mask,
+            implementation.first_error()
+        };
+    }
     try {
         lane_state->payload.insert(
             lane_state->payload.end(),
@@ -823,8 +842,8 @@ PacketReconcileResult PacketProducer::reconcile(
         });
 
     std::size_t action_count = 0;
-    const auto current =
-        core::global_memory_accounting().current_bytes();
+    const auto current = implementation.accounted_bytes.load(
+        std::memory_order_acquire);
     if (current > implementation.policy.memory_high_bytes &&
         !eligible.empty()) {
         const auto pause_count =

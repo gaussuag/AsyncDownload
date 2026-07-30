@@ -2,7 +2,6 @@
 
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "core/constants.hpp"
-#include "core/memory_accounting.hpp"
 #include "flow/packet_flow.hpp"
 
 #include <array>
@@ -53,7 +52,6 @@ TEST(PacketFlowTest, CreatesOneProducerAndOneConsumerFromValidatedPolicy) {
 
 TEST(PacketFlowTest, EnforcesLogicalHardBudgetAtOneTwoAndThirtyThree) {
     for (const auto budget : {1U, 2U, 33U}) {
-        asyncdownload::core::global_memory_accounting().reset();
         asyncdownload::telemetry::TelemetrySession telemetry;
         auto flow = make_flow(telemetry, budget);
         asyncdownload::flow::ProducerLane lane;
@@ -118,7 +116,6 @@ TEST(PacketFlowTest, EnforcesLogicalHardBudgetAtOneTwoAndThirtyThree) {
 }
 
 TEST(PacketFlowTest, ControlBypassesDataAdmissionBudgetWithoutBeingDropped) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry, 1);
     asyncdownload::flow::ProducerLane lane;
@@ -155,8 +152,56 @@ TEST(PacketFlowTest, ControlBypassesDataAdmissionBudgetWithoutBeingDropped) {
         asyncdownload::flow::PacketReceiveCode::closed);
 }
 
+TEST(PacketFlowTest, ConcurrentDownloadInstancesDoNotShareAccounting) {
+    asyncdownload::telemetry::TelemetrySession first_telemetry;
+    asyncdownload::telemetry::TelemetrySession second_telemetry;
+    auto policy = test_policy();
+    policy.memory_high_bytes = 128;
+    policy.memory_low_bytes = 64;
+    std::unique_ptr<asyncdownload::flow::PacketFlow> first;
+    std::unique_ptr<asyncdownload::flow::PacketFlow> second;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        policy, first_telemetry, first));
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        policy, second_telemetry, second));
+    asyncdownload::flow::ProducerLane first_lane;
+    asyncdownload::flow::ProducerLane second_lane;
+    ASSERT_FALSE(first->producer().open_lane(first_lane));
+    ASSERT_FALSE(second->producer().open_lane(second_lane));
+    std::vector<std::uint8_t> bytes(129, 5);
+
+    const auto first_admission = first->producer().accept(
+        first_lane,
+        {
+            {{1}, 1},
+            {0, static_cast<std::int64_t>(bytes.size())},
+            0,
+            bytes
+        });
+    const auto second_admission = second->producer().accept(
+        second_lane,
+        {
+            {{2}, 1},
+            {0, static_cast<std::int64_t>(bytes.size())},
+            0,
+            bytes
+        });
+
+    EXPECT_TRUE(first_admission.accepted());
+    EXPECT_TRUE(second_admission.accepted());
+    EXPECT_EQ(
+        first->producer().snapshot().accounted_bytes,
+        sizeof(asyncdownload::flow::DataPacket) + bytes.size());
+    EXPECT_EQ(
+        second->producer().snapshot().accounted_bytes,
+        sizeof(asyncdownload::flow::DataPacket) + bytes.size());
+    ASSERT_FALSE(first->producer().discard(first_lane));
+    ASSERT_FALSE(second->producer().discard(second_lane));
+    EXPECT_EQ(first->producer().snapshot().accounted_bytes, 0U);
+    EXPECT_EQ(second->producer().snapshot().accounted_bytes, 0U);
+}
+
 TEST(PacketFlowTest, AcceptsContiguousChunksIntoOneLaneDraft) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -206,7 +251,6 @@ TEST(PacketFlowTest, AcceptsContiguousChunksIntoOneLaneDraft) {
 }
 
 TEST(PacketFlowTest, RejectsNonContiguousChunkWithoutMutatingDraft) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -235,7 +279,6 @@ TEST(PacketFlowTest, RejectsNonContiguousChunkWithoutMutatingDraft) {
 }
 
 TEST(PacketFlowTest, RejectsChunkOutsideLeaseSpanWithoutMutation) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -258,7 +301,6 @@ TEST(PacketFlowTest, RejectsChunkOutsideLeaseSpanWithoutMutation) {
 }
 
 TEST(PacketFlowTest, RejectsOffsetSizeOverflowWithoutMutation) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -281,7 +323,6 @@ TEST(PacketFlowTest, RejectsOffsetSizeOverflowWithoutMutation) {
 }
 
 TEST(PacketFlowTest, RejectsChunkLargerThanAggregationTargetWithoutMutation) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -308,7 +349,6 @@ TEST(PacketFlowTest, RejectsChunkLargerThanAggregationTargetWithoutMutation) {
 }
 
 TEST(PacketFlowTest, RejectsNonPositiveCompletionExpectedEnd) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
 
@@ -329,7 +369,6 @@ TEST(PacketFlowTest, RejectsNonPositiveCompletionExpectedEnd) {
 }
 
 TEST(PacketFlowTest, PublishesAtCurrentSixtyFourKibAggregationShape) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -362,7 +401,6 @@ TEST(PacketFlowTest, PublishesAtCurrentSixtyFourKibAggregationShape) {
 }
 
 TEST(PacketFlowTest, ReorderNodeAddsExactlyFortyEightBytesOnce) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
@@ -396,7 +434,6 @@ TEST(PacketFlowTest, ReorderNodeAddsExactlyFortyEightBytesOnce) {
 }
 
 TEST(PacketFlowTest, PublishesRangeCompleteAfterAllRangeData) {
-    asyncdownload::core::global_memory_accounting().reset();
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);
     asyncdownload::flow::ProducerLane lane;
