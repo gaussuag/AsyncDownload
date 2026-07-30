@@ -86,6 +86,12 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
             range_header = request_range
 
         content_length = end - start + 1
+        response_content_length = (
+            content_length +
+            self.server.content_length_delta
+        )
+        if self.command == "GET" and self.server.get_status:
+            status = HTTPStatus(self.server.get_status)
         if self.server.force_content_encoding:
             content_encoding = self.server.force_content_encoding
 
@@ -97,7 +103,10 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream")
         if not omit_content_length:
-            self.send_header("Content-Length", str(content_length))
+            self.send_header(
+                "Content-Length",
+                str(response_content_length),
+            )
         if not self.server.disable_ranges:
             self.send_header(
                 "Accept-Ranges",
@@ -105,8 +114,14 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
             )
         self.send_header("ETag", f'"{self.server.etag}"')
         self.send_header("Last-Modified", self.date_time_string(self.server.last_modified))
-        if status == HTTPStatus.PARTIAL_CONTENT:
+        if (
+            status == HTTPStatus.PARTIAL_CONTENT
+            and content_range
+            and not self.server.omit_content_range
+        ):
             self.send_header("Content-Range", content_range)
+            if self.server.duplicate_content_range:
+                self.send_header("Content-Range", content_range)
         if content_encoding:
             self.send_header("Content-Encoding", content_encoding)
         self.end_headers()
@@ -159,6 +174,10 @@ class RangeServer(ThreadingHTTPServer):
         content_range_total_delta,
         content_range_value,
         accept_ranges_value,
+        omit_content_range,
+        duplicate_content_range,
+        content_length_delta,
+        get_status,
         force_content_encoding,
         redirect_path,
     ):
@@ -175,6 +194,10 @@ class RangeServer(ThreadingHTTPServer):
         self.content_range_total_delta = content_range_total_delta
         self.content_range_value = content_range_value
         self.accept_ranges_value = accept_ranges_value
+        self.omit_content_range = omit_content_range
+        self.duplicate_content_range = duplicate_content_range
+        self.content_length_delta = content_length_delta
+        self.get_status = get_status
         self.force_content_encoding = force_content_encoding
         self.redirect_path = redirect_path
         self.request_log_lock = threading.Lock()
@@ -232,6 +255,10 @@ def main():
     parser.add_argument("--content-range-total-delta", type=int, default=0)
     parser.add_argument("--content-range-value", default="")
     parser.add_argument("--accept-ranges-value", default="bytes")
+    parser.add_argument("--omit-content-range", action="store_true")
+    parser.add_argument("--duplicate-content-range", action="store_true")
+    parser.add_argument("--content-length-delta", type=int, default=0)
+    parser.add_argument("--get-status", type=int, default=0)
     parser.add_argument("--force-content-encoding", default="")
     parser.add_argument("--redirect-path", default="")
     args = parser.parse_args()
@@ -240,7 +267,8 @@ def main():
         args.delay_ms, args.request_log, args.disable_ranges, args.ignore_range_requests,
         args.head_status, args.omit_head_content_length, args.content_range_start_delta,
         args.content_range_total_delta, args.content_range_value, args.accept_ranges_value,
-        args.force_content_encoding, args.redirect_path)
+        args.omit_content_range, args.duplicate_content_range, args.content_length_delta,
+        args.get_status, args.force_content_encoding, args.redirect_path)
     actual_port = server.server_address[1]
     print(actual_port, flush=True)
     try:

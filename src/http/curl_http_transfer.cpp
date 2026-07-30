@@ -864,6 +864,24 @@ private:
             finish_callback();
             return CURL_WRITEFUNC_ERROR;
         }
+        const auto response_status =
+            slot.response.status();
+        if ((response_status >= 100 &&
+             response_status < 200) ||
+            (response_status >= 300 &&
+             response_status < 400)) {
+            slot.response.begin_body();
+            finish_callback();
+            return bytes;
+        }
+        const auto response_failure =
+            validate_response(slot);
+        if (response_failure.error) {
+            slot.callback_failure =
+                response_failure;
+            finish_callback();
+            return CURL_WRITEFUNC_ERROR;
+        }
         slot.response.begin_body();
         const auto remaining =
             slot.lease->bytes.end -
@@ -1139,10 +1157,16 @@ private:
                     slot.easy));
             slot.in_multi = false;
         }
-        const auto flush_error =
-            flush_lane(slot);
         HttpFailure failure =
             slot.callback_failure;
+        if (!failure.error) {
+            failure =
+                validate_response(
+                    slot,
+                    response_code);
+        }
+        const auto flush_error =
+            flush_lane(slot);
         if (!failure.error && flush_error) {
             failure = {
                 HttpFailureReason::
@@ -1157,16 +1181,6 @@ private:
                     transport_failed,
                 DownloadErrc::
                     http_transfer_failed);
-        }
-        if (!failure.error &&
-            !legacy_response_valid(
-                slot,
-                response_code)) {
-            failure = make_failure(
-                HttpFailureReason::
-                    response_status_invalid,
-                DownloadErrc::
-                    http_invalid_response);
         }
         if (!failure.error &&
             slot.lease.has_value() &&
@@ -1197,24 +1211,108 @@ private:
         }
     }
 
-    bool legacy_response_valid(
+    HttpFailure validate_response(
         const Slot& slot,
-        const long response_code) const noexcept {
+        const long response_code = 0) const noexcept {
         if (!slot.lease.has_value()) {
-            return false;
+            return make_failure(
+                HttpFailureReason::
+                    protocol_order_invalid,
+                DownloadErrc::internal_error);
         }
-        if (slot.lease->use_http_range) {
-            const auto whole_object =
-                slot.lease->bytes.begin == 0 &&
-                slot.lease->bytes.end ==
-                    config_.total_size;
-            return whole_object
-                ? response_code == 200 ||
-                    response_code == 206
-                : response_code == 206;
+        const auto& response = slot.response;
+        const auto status = response.status();
+        if (!response.headers_complete() ||
+            status == 0 ||
+            (response_code != 0 &&
+             status != response_code)) {
+            return make_failure(
+                HttpFailureReason::
+                    response_status_invalid,
+                DownloadErrc::
+                    http_invalid_response);
         }
-        return response_code == 200 ||
-            response_code == 206;
+        const auto whole_object =
+            slot.lease->bytes.begin == 0 &&
+            slot.lease->bytes.end ==
+                config_.total_size;
+        const auto partial_range =
+            slot.lease->use_http_range &&
+            !whole_object;
+        if ((partial_range && status != 206) ||
+            (!slot.lease->use_http_range &&
+             status != 200) ||
+            (slot.lease->use_http_range &&
+             whole_object &&
+             status != 200 &&
+             status != 206)) {
+            return make_failure(
+                HttpFailureReason::
+                    response_status_invalid,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        if (response.content_range_invalid()) {
+            return make_failure(
+                HttpFailureReason::
+                    content_range_malformed,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        const auto requires_content_range =
+            status == 206;
+        if (requires_content_range &&
+            !response.content_range().has_value()) {
+            return make_failure(
+                HttpFailureReason::
+                    content_range_missing,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        if (!requires_content_range &&
+            response.content_range().has_value()) {
+            return make_failure(
+                HttpFailureReason::
+                    content_range_mismatch,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        if (requires_content_range) {
+            const auto& content_range =
+                *response.content_range();
+            if (content_range.first !=
+                    slot.lease->bytes.begin ||
+                content_range.last !=
+                    slot.lease->bytes.end - 1 ||
+                content_range.total !=
+                    config_.total_size) {
+                return make_failure(
+                    HttpFailureReason::
+                        content_range_mismatch,
+                    DownloadErrc::
+                        http_invalid_response);
+            }
+        }
+        if (response.content_length_invalid()) {
+            return make_failure(
+                HttpFailureReason::
+                    content_length_malformed,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        const auto expected_length =
+            slot.lease->bytes.end -
+            slot.lease->bytes.begin;
+        if (response.content_length().has_value() &&
+            *response.content_length() !=
+                expected_length) {
+            return make_failure(
+                HttpFailureReason::
+                    content_length_mismatch,
+                DownloadErrc::
+                    http_invalid_response);
+        }
+        return {};
     }
 
     std::error_code flush_lane(

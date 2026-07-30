@@ -1530,6 +1530,8 @@ TEST(HttpTransferCharacterizationTest, RejectsIgnoredPartialRangeWithoutRetry) {
             return logged.method != "GET" ||
                 logged.response_status == 200;
         }));
+    EXPECT_EQ(result.downloaded_bytes, 0);
+    EXPECT_EQ(result.persisted_bytes, 0);
     EXPECT_FALSE(std::filesystem::exists(output_file));
     EXPECT_TRUE(std::filesystem::exists(
         std::filesystem::path(output_file.string() + ".part")));
@@ -1541,7 +1543,7 @@ TEST(HttpTransferCharacterizationTest, RejectsIgnoredPartialRangeWithoutRetry) {
 #endif
 }
 
-TEST(HttpTransferCharacterizationTest, ExposesMissingContentRangeValidation) {
+TEST(HttpTransferContractTest, RejectsShiftedContentRangeBeforeBodyAdmission) {
 #ifndef _WIN32
     GTEST_SKIP() << "This integration test currently uses Windows process control.";
 #else
@@ -1586,7 +1588,13 @@ TEST(HttpTransferCharacterizationTest, ExposesMissingContentRangeValidation) {
     const auto result = client.download(request);
     stop_child(server, 0);
 
-    ASSERT_TRUE(result.ok()) << result.error.message();
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::http_invalid_response));
+    EXPECT_EQ(result.downloaded_bytes, 0);
+    EXPECT_EQ(result.persisted_bytes, 0);
     const auto requests = read_logged_requests(request_log);
     EXPECT_TRUE(std::any_of(
         requests.begin(),
@@ -1595,12 +1603,134 @@ TEST(HttpTransferCharacterizationTest, ExposesMissingContentRangeValidation) {
             return logged.method == "GET" &&
                 logged.response_content_range.starts_with("bytes 1-");
         }));
-    EXPECT_TRUE(files_equal(source_file, output_file));
+    EXPECT_FALSE(std::filesystem::exists(output_file));
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(removed);
 #endif
 }
+
+struct InvalidTransferHeaderCase {
+    const char* name;
+    std::wstring server_arguments;
+};
+
+class InvalidTransferHeaderTest :
+    public ::testing::TestWithParam<
+        InvalidTransferHeaderCase> {};
+
+TEST_P(InvalidTransferHeaderTest, RejectsBeforeBodyAdmission) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root(
+            "asyncdownload_http_invalid_transfer_header");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 4 * 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) + L" " +
+        GetParam().server_arguments;
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line =
+        read_line_from_pipe(
+            server.stdout_read,
+            5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") +
+        port_line +
+        "/source.bin";
+    request.output_path = output_file;
+    request.options.max_connections = 4;
+    request.options.scheduler_window_bytes =
+        1024 * 1024;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                http_invalid_response));
+    EXPECT_EQ(result.downloaded_bytes, 0);
+    EXPECT_EQ(result.persisted_bytes, 0);
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    const auto requests =
+        read_logged_requests(request_log);
+    const auto get_count = std::count_if(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        });
+    EXPECT_GT(get_count, 0);
+    EXPECT_LE(get_count, 4);
+
+    const auto removed =
+        std::filesystem::remove_all(
+            temp_root,
+            ec);
+    static_cast<void>(removed);
+#endif
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    HttpTransferContract,
+    InvalidTransferHeaderTest,
+    ::testing::Values(
+        InvalidTransferHeaderCase{
+            "MissingContentRange",
+            L"--omit-content-range"
+        },
+        InvalidTransferHeaderCase{
+            "MalformedContentRange",
+            L"--content-range-value malformed"
+        },
+        InvalidTransferHeaderCase{
+            "DuplicateContentRange",
+            L"--duplicate-content-range"
+        },
+        InvalidTransferHeaderCase{
+            "MismatchedContentRangeTotal",
+            L"--content-range-total-delta 1"
+        },
+        InvalidTransferHeaderCase{
+            "MismatchedContentLength",
+            L"--content-length-delta 1"
+        },
+        InvalidTransferHeaderCase{
+            "InvalidStatus",
+            L"--get-status 500"
+        }),
+    [](const ::testing::TestParamInfo<
+        InvalidTransferHeaderCase>& info) {
+        return info.param.name;
+    });
 
 TEST(HttpTransferCharacterizationTest, ReplaysPausedWritesWithoutDuplicateOutput) {
 #ifndef _WIN32
