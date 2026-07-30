@@ -35,6 +35,27 @@ TEST(PublicCompatibilityTest, SupportsAggregateRequestInitialization) {
     EXPECT_FALSE(request.progress_callback);
 }
 
+TEST(PublicCompatibilityTest, SupportsPositionalDownloadOptionsInitialization) {
+    const asyncdownload::DownloadOptions options{
+        4,
+        4096,
+        4 * 1024 * 1024,
+        256 * 1024 * 1024,
+        128 * 1024 * 1024,
+        64 * 1024,
+        4 * 1024,
+        32 * 1024 * 1024,
+        16 * 1024 * 1024,
+        std::chrono::milliseconds(2000),
+        true};
+
+    EXPECT_EQ(options.max_connections, 4U);
+    EXPECT_EQ(options.queue_capacity_packets, 4096U);
+    EXPECT_EQ(options.scheduler_window_bytes, 4U * 1024U * 1024U);
+    EXPECT_EQ(options.flush_interval, std::chrono::milliseconds(2000));
+    EXPECT_TRUE(options.overwrite_existing);
+}
+
 TEST(PublicCompatibilityTest, RejectsMissingUrlBeforeIo) {
     asyncdownload::DownloadClient client;
     asyncdownload::DownloadRequest request{};
