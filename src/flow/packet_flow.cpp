@@ -35,6 +35,23 @@ struct LaneState {
     std::uint8_t pause_mask = 0;
 };
 
+template <typename Callback>
+class ScopeExit {
+public:
+    explicit ScopeExit(Callback callback) noexcept
+        : callback_(std::move(callback)) {}
+
+    ~ScopeExit() {
+        callback_();
+    }
+
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+private:
+    Callback callback_;
+};
+
 [[nodiscard]] bool checked_add(const std::size_t lhs,
                                const std::size_t rhs,
                                std::size_t& result) noexcept {
@@ -91,6 +108,37 @@ public:
 
     [[nodiscard]] bool producer_thread_matches() const noexcept {
         return producer_thread == std::this_thread::get_id();
+    }
+
+    [[nodiscard]] bool begin_producer_operation() noexcept {
+        active_producer_operations.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (state.load(std::memory_order_acquire) ==
+            PacketFlowState::open) {
+            return true;
+        }
+        end_producer_operation();
+        return false;
+    }
+
+    void end_producer_operation() noexcept {
+        const auto previous =
+            active_producer_operations.fetch_sub(
+                1, std::memory_order_acq_rel);
+        if (previous == 1) {
+            active_producer_operations.notify_all();
+        }
+    }
+
+    void wait_for_producer_operations() noexcept {
+        auto active = active_producer_operations.load(
+            std::memory_order_acquire);
+        while (active != 0) {
+            active_producer_operations.wait(
+                active, std::memory_order_acquire);
+            active = active_producer_operations.load(
+                std::memory_order_acquire);
+        }
     }
 
     [[nodiscard]] bool consumer_thread_matches_or_bind() noexcept {
@@ -325,10 +373,13 @@ public:
     telemetry::TelemetrySession& telemetry;
     detail::MoodycamelPacketQueueAdapter queue;
     std::vector<std::unique_ptr<LaneState>> lanes;
+    std::vector<const PacketLaneObservation*> eligible_scratch;
+    std::vector<std::uint8_t> seen_scratch;
     std::atomic<PacketFlowState> state{PacketFlowState::open};
     std::atomic<std::size_t> queued_packets{0};
     std::atomic<std::size_t> accounted_bytes{0};
     std::atomic<std::uint64_t> published_data_bytes{0};
+    std::atomic<std::size_t> active_producer_operations{0};
     PacketSequence next_sequence = 1;
     std::thread::id producer_thread;
     std::mutex consumer_thread_mutex;
@@ -463,11 +514,17 @@ PacketProducer::PacketProducer(PacketFlow& owner) noexcept
 std::error_code PacketProducer::open_lane(ProducerLane& lane) noexcept {
     auto& implementation = *owner_.implementation_;
     if (!implementation.producer_thread_matches() ||
-        lane.owner_ != nullptr ||
-        implementation.state.load(std::memory_order_acquire) !=
-            PacketFlowState::open) {
+        lane.owner_ != nullptr) {
         return make_error_code(DownloadErrc::internal_error);
     }
+    if (!implementation.begin_producer_operation()) {
+        return implementation.first_error() ?
+            implementation.first_error() :
+            make_error_code(DownloadErrc::internal_error);
+    }
+    ScopeExit operation([&implementation]() noexcept {
+        implementation.end_producer_operation();
+    });
 
     try {
         auto state = std::make_unique<LaneState>();
@@ -475,6 +532,10 @@ std::error_code PacketProducer::open_lane(ProducerLane& lane) noexcept {
             implementation.lanes.size() + 1);
         state->active = true;
         state->payload.reserve(AGGREGATED_PACKET_BYTES);
+        implementation.eligible_scratch.reserve(
+            implementation.lanes.size() + 1);
+        implementation.seen_scratch.resize(
+            implementation.lanes.size() + 2, 0);
         lane.owner_ = &owner_;
         lane.id_ = state->id;
         implementation.lanes.push_back(std::move(state));
@@ -504,9 +565,9 @@ PacketAdmission PacketProducer::accept(
         };
     }
 
-    const auto flow_state =
-        implementation.state.load(std::memory_order_acquire);
-    if (flow_state != PacketFlowState::open) {
+    if (!implementation.begin_producer_operation()) {
+        const auto flow_state =
+            implementation.state.load(std::memory_order_acquire);
         return {
             flow_state == PacketFlowState::failed ?
                 PacketAdmissionCode::failed :
@@ -518,6 +579,9 @@ PacketAdmission PacketProducer::accept(
                 implementation.first_error() : std::error_code{}
         };
     }
+    ScopeExit operation([&implementation]() noexcept {
+        implementation.end_producer_operation();
+    });
 
     range::ByteOffset chunk_end = 0;
     if (chunk.bytes.empty() ||
@@ -677,6 +741,23 @@ PacketAdmission PacketProducer::flush(ProducerLane& lane) noexcept {
             make_error_code(DownloadErrc::internal_error)
         };
     }
+    if (!implementation.begin_producer_operation()) {
+        const auto flow_state =
+            implementation.state.load(std::memory_order_acquire);
+        return {
+            flow_state == PacketFlowState::failed ?
+                PacketAdmissionCode::failed :
+                PacketAdmissionCode::closed,
+            0,
+            0,
+            lane_state->pause_mask,
+            flow_state == PacketFlowState::failed ?
+                implementation.first_error() : std::error_code{}
+        };
+    }
+    ScopeExit operation([&implementation]() noexcept {
+        implementation.end_producer_operation();
+    });
     return implementation.publish_draft(*lane_state);
 }
 
@@ -716,6 +797,20 @@ PacketPublishResult PacketProducer::publish(
             make_error_code(DownloadErrc::internal_error)
         };
     }
+    if (!implementation.begin_producer_operation()) {
+        const auto flow_state =
+            implementation.state.load(std::memory_order_acquire);
+        return {
+            flow_state == PacketFlowState::failed ?
+                PacketPublishCode::failed :
+                PacketPublishCode::closed,
+            flow_state == PacketFlowState::failed ?
+                implementation.first_error() : std::error_code{}
+        };
+    }
+    ScopeExit operation([&implementation]() noexcept {
+        implementation.end_producer_operation();
+    });
     const auto flow_state =
         implementation.state.load(std::memory_order_acquire);
     if (flow_state != PacketFlowState::open) {
@@ -794,30 +889,23 @@ PacketReconcileResult PacketProducer::reconcile(
         };
     }
 
-    std::vector<const PacketLaneObservation*> eligible;
-    std::vector<bool> seen;
-    try {
-        eligible.reserve(observations.size());
-        seen.resize(implementation.lanes.size() + 1, false);
-    } catch (...) {
-        return {
-            0,
-            std::make_error_code(std::errc::not_enough_memory)
-        };
-    }
+    auto& eligible = implementation.eligible_scratch;
+    auto& seen = implementation.seen_scratch;
+    eligible.clear();
+    std::fill(seen.begin(), seen.end(), 0);
 
     for (const auto& observation : observations) {
         if (observation.lane_id == 0 ||
             observation.lane_id > implementation.lanes.size() ||
             !std::isfinite(observation.bytes_per_second) ||
             observation.bytes_per_second < 0.0 ||
-            seen[observation.lane_id]) {
+            seen[observation.lane_id] != 0) {
             return {
                 0,
                 std::make_error_code(std::errc::invalid_argument)
             };
         }
-        seen[observation.lane_id] = true;
+        seen[observation.lane_id] = 1;
         auto* lane = implementation.lanes[
             observation.lane_id - 1].get();
         if (lane == nullptr || !lane->active) {
@@ -914,6 +1002,14 @@ std::error_code PacketProducer::close() noexcept {
     if (!implementation.producer_thread_matches()) {
         return make_error_code(DownloadErrc::internal_error);
     }
+    if (!implementation.begin_producer_operation()) {
+        return implementation.first_error() ?
+            implementation.first_error() :
+            make_error_code(DownloadErrc::internal_error);
+    }
+    ScopeExit operation([&implementation]() noexcept {
+        implementation.end_producer_operation();
+    });
     for (const auto& lane : implementation.lanes) {
         if (lane != nullptr &&
             lane->active &&
@@ -1013,6 +1109,7 @@ std::error_code PacketConsumer::fail(
         return make_error_code(DownloadErrc::internal_error);
     }
     implementation.fail(error);
+    implementation.wait_for_producer_operations();
 
     detail::PacketEnvelope envelope{};
     while (implementation.queue.receive(

@@ -52,6 +52,41 @@ TEST(PacketFlowTest, CreatesOneProducerAndOneConsumerFromValidatedPolicy) {
     EXPECT_FALSE(received.error);
 }
 
+TEST(PacketFlowTest, RejectsWrongThreadColdMutationWithoutSideEffect) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    auto wrong_thread_error = std::async(std::launch::async, [&]() {
+        asyncdownload::flow::ProducerLane lane;
+        return flow->producer().open_lane(lane);
+    });
+
+    EXPECT_TRUE(wrong_thread_error.get());
+    const auto before = flow->producer().snapshot();
+    EXPECT_EQ(before.state, asyncdownload::flow::PacketFlowState::open);
+    EXPECT_EQ(before.queued_packets, 0U);
+    EXPECT_EQ(before.accounted_bytes, 0U);
+
+    asyncdownload::flow::PacketLease packet;
+    EXPECT_EQ(
+        flow->consumer().receive(
+            packet, std::chrono::microseconds(0)).code,
+        asyncdownload::flow::PacketReceiveCode::timeout);
+    auto wrong_consumer_error =
+        std::async(std::launch::async, [&]() {
+            return flow->consumer().fail(
+                std::make_error_code(std::errc::io_error));
+        });
+    EXPECT_TRUE(wrong_consumer_error.get());
+    EXPECT_EQ(
+        flow->producer().snapshot().state,
+        asyncdownload::flow::PacketFlowState::open);
+    ASSERT_FALSE(flow->producer().close());
+    EXPECT_EQ(
+        flow->consumer().receive(
+            packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::closed);
+}
+
 TEST(PacketFlowTest, EnforcesLogicalHardBudgetAtOneTwoAndThirtyThree) {
     for (const auto budget : {1U, 2U, 33U}) {
         asyncdownload::telemetry::TelemetrySession telemetry;
@@ -203,6 +238,38 @@ TEST(PacketFlowTest, ConcurrentDownloadInstancesDoNotShareAccounting) {
     EXPECT_EQ(second->producer().snapshot().accounted_bytes, 0U);
 }
 
+TEST(PacketFlowTest, ConsumerFailureDrainsQueuedAccounting) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{4}, 1}, {0, 4}, 0, bytes}).accepted());
+    ASSERT_TRUE(flow->producer().flush(lane).accepted());
+    ASSERT_EQ(
+        flow->producer().publish({
+            asyncdownload::flow::ControlPacketKind::range_complete,
+            {{4}, 1},
+            4
+        }).code,
+        asyncdownload::flow::PacketPublishCode::published);
+    ASSERT_EQ(flow->producer().snapshot().queued_packets, 2U);
+    ASSERT_GT(flow->producer().snapshot().accounted_bytes, 0U);
+
+    const auto failure = std::make_error_code(std::errc::io_error);
+    ASSERT_FALSE(flow->consumer().fail(failure));
+    const auto snapshot = flow->producer().snapshot();
+    EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::failed);
+    EXPECT_EQ(snapshot.error, failure);
+    EXPECT_EQ(snapshot.queued_packets, 0U);
+    EXPECT_EQ(snapshot.accounted_bytes, 0U);
+
+    EXPECT_FALSE(flow->consumer().fail(
+        std::make_error_code(std::errc::no_space_on_device)));
+    EXPECT_EQ(flow->producer().snapshot().error, failure);
+}
+
 TEST(PacketFlowTest, QueuePauseCountsOnlyOnEpisodeEntry) {
     asyncdownload::telemetry::TelemetrySession telemetry;
     telemetry.record_task_started();
@@ -225,6 +292,8 @@ TEST(PacketFlowTest, QueuePauseCountsOnlyOnEpisodeEntry) {
     EXPECT_EQ(
         repeated.code,
         asyncdownload::flow::PacketAdmissionCode::packet_budget_exhausted);
+    EXPECT_EQ(first.consumed_bytes, 0U);
+    EXPECT_EQ(repeated.consumed_bytes, 0U);
     auto summary = telemetry.final_summary();
     EXPECT_EQ(summary.total_pause_count, 1U);
     EXPECT_EQ(summary.queue_full_pause_count, 1U);
@@ -282,6 +351,8 @@ TEST(PacketFlowTest, MemoryPauseCountsOnlyOnEpisodeEntry) {
     EXPECT_EQ(
         repeated.code,
         asyncdownload::flow::PacketAdmissionCode::memory_budget_exhausted);
+    EXPECT_EQ(paused.consumed_bytes, 0U);
+    EXPECT_EQ(repeated.consumed_bytes, 0U);
     const auto summary = telemetry.final_summary();
     EXPECT_EQ(summary.total_pause_count, 1U);
     EXPECT_EQ(summary.queue_full_pause_count, 0U);
