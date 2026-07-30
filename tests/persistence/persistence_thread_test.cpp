@@ -1,4 +1,16 @@
-#include "asyncdownload/types.hpp"
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <concurrentqueue/blockingconcurrentqueue.h>
+#include <gtest/gtest.h>
+#include <thread-pool/BS_thread_pool.hpp>
+
 #include "core/block_bitmap.hpp"
 #include "core/memory_accounting.hpp"
 #include "core/models.hpp"
@@ -6,24 +18,15 @@
 #include "persistence/persistence_thread.hpp"
 #include "storage/file_writer.hpp"
 
-#include <gtest/gtest.h>
-
-#include <concurrentqueue/blockingconcurrentqueue.h>
-#include <thread-pool/BS_thread_pool.hpp>
-
-#include <chrono>
-#include <filesystem>
-#include <functional>
-#include <thread>
-#include <vector>
-
 namespace {
 
 void enqueue_data_packet(
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket>& queue,
     asyncdownload::core::SessionState& session,
     asyncdownload::core::DataPacket packet) {
-    const auto accounted = asyncdownload::core::global_packet_overhead(packet.payload.size(), false);
+    const auto accounted = asyncdownload::core::global_packet_overhead(
+        packet.payload.size(),
+        false);
     packet.accounted_bytes = accounted;
     const auto current_bytes = asyncdownload::core::global_memory_accounting().add(accounted);
     static_cast<void>(current_bytes);
@@ -43,6 +46,122 @@ bool wait_for_condition(const std::function<bool()>& predicate,
     return predicate();
 }
 
+void persist_single_range_at_tail_capacity(
+    const std::filesystem::path& temp_root,
+    const std::int64_t total_size) {
+    asyncdownload::core::global_memory_accounting().reset();
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES;
+    policy.io_alignment_bytes =
+        asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES;
+    policy.max_gap_bytes =
+        asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES;
+    policy.flush_threshold_bytes =
+        asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES;
+    policy.flush_interval = std::chrono::milliseconds(10);
+
+    asyncdownload::core::SessionState session{};
+    session.paths.output_path = temp_root / "output.bin";
+    session.paths.temporary_path = temp_root / "output.bin.part";
+    session.paths.metadata_path = temp_root / "output.bin.config.json";
+    session.url = "http://127.0.0.1/test.bin";
+    session.total_size = total_size;
+    session.accept_ranges = true;
+    session.telemetry_session_.record_task_started();
+
+    moodycamel::BlockingConcurrentQueue<
+        asyncdownload::core::DataPacket> queue(16);
+    asyncdownload::core::AtomicBlockBitmap bitmap(
+        asyncdownload::core::required_block_count(
+            session.total_size,
+            policy.block_bytes));
+    asyncdownload::storage::FileWriter writer;
+    ASSERT_FALSE(writer.open(
+        session.paths.temporary_path,
+        session.total_size,
+        false,
+        true));
+    asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread persistence(
+        session,
+        policy,
+        queue,
+        bitmap,
+        writer,
+        store,
+        workers);
+
+    asyncdownload::core::RangeContext range(0, 0, total_size - 1);
+    persistence.register_range(&range);
+    persistence.start();
+
+    asyncdownload::core::DataPacket packet{};
+    packet.kind = asyncdownload::core::PacketKind::data;
+    packet.range_id = 0;
+    packet.offset = 0;
+    packet.payload.assign(static_cast<std::size_t>(total_size), 0x5A);
+    enqueue_data_packet(queue, session, std::move(packet));
+
+    asyncdownload::core::DataPacket complete{};
+    complete.kind = asyncdownload::core::PacketKind::range_complete;
+    complete.range_id = 0;
+    queue.enqueue(std::move(complete));
+    session.queued_packets.fetch_add(1, std::memory_order_relaxed);
+
+    ASSERT_TRUE(wait_for_condition([&range]() {
+        return range.marked_finished.load(std::memory_order_acquire);
+    }, std::chrono::milliseconds(1000)));
+
+    persistence.stop();
+    persistence.join();
+    EXPECT_FALSE(persistence.error());
+    EXPECT_EQ(
+        session.persisted_bytes.load(std::memory_order_relaxed),
+        total_size);
+
+    std::vector<std::byte> stored;
+    EXPECT_FALSE(writer.read(
+        0,
+        static_cast<std::size_t>(total_size),
+        stored));
+    ASSERT_EQ(stored.size(), static_cast<std::size_t>(total_size));
+    for (const auto byte : stored) {
+        EXPECT_EQ(byte, std::byte{0x5A});
+    }
+
+    writer.close();
+    EXPECT_EQ(
+        std::filesystem::file_size(session.paths.temporary_path, ec),
+        static_cast<std::uintmax_t>(total_size));
+    EXPECT_FALSE(ec);
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+}
+
+TEST(PersistenceThreadTest, AcceptsValidatedAlignmentAtTailCapacity) {
+    const auto temp_root =
+        std::filesystem::temp_directory_path() /
+        "asyncdownload_tail_capacity_test";
+    persist_single_range_at_tail_capacity(
+        temp_root,
+        asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES);
+}
+
+TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {
+    const auto temp_root =
+        std::filesystem::temp_directory_path() /
+        "asyncdownload_final_tail_test";
+    persist_single_range_at_tail_capacity(
+        temp_root,
+        asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES + 907);
+}
+
 TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     asyncdownload::core::global_memory_accounting().reset();
 
@@ -51,32 +170,31 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
 
-    asyncdownload::DownloadOptions options{};
-    options.block_size = 4096;
-    options.io_alignment = 4096;
-    options.max_gap_bytes = 4096;
-    options.flush_threshold_bytes = 4096;
-    options.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
 
     asyncdownload::core::SessionState session{};
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, queue, bitmap, writer, store, workers);
+        session, policy, queue, bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -110,32 +228,31 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
 
-    asyncdownload::DownloadOptions options{};
-    options.block_size = 64 * 1024;
-    options.io_alignment = 4096;
-    options.max_gap_bytes = 64 * 1024;
-    options.flush_threshold_bytes = 4096;
-    options.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 64 * 1024;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 64 * 1024;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
 
     asyncdownload::core::SessionState session{};
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, queue, bitmap, writer, store, workers);
+        session, policy, queue, bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -172,32 +289,31 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
 
-    asyncdownload::DownloadOptions options{};
-    options.block_size = 4096;
-    options.io_alignment = 4096;
-    options.max_gap_bytes = 4096;
-    options.flush_threshold_bytes = 4096;
-    options.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
 
     asyncdownload::core::SessionState session{};
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.options = options;
     session.total_size = 4096;
     session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, queue, bitmap, writer, store, workers);
+        session, policy, queue, bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -236,32 +352,31 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
 
-    asyncdownload::DownloadOptions options{};
-    options.block_size = 4096;
-    options.io_alignment = 4096;
-    options.max_gap_bytes = 4096;
-    options.flush_threshold_bytes = 4096;
-    options.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
 
     asyncdownload::core::SessionState session{};
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.options = options;
     session.total_size = 4096;
     session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, queue, bitmap, writer, store, workers);
+        session, policy, queue, bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);
@@ -299,32 +414,31 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     std::filesystem::create_directories(temp_root, ec);
     ASSERT_FALSE(ec);
 
-    asyncdownload::DownloadOptions options{};
-    options.block_size = 4096;
-    options.io_alignment = 4096;
-    options.max_gap_bytes = 4096;
-    options.flush_threshold_bytes = 4096;
-    options.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
 
     asyncdownload::core::SessionState session{};
     session.paths.output_path = temp_root / "output.bin";
     session.paths.temporary_path = temp_root / "output.bin.part";
     session.paths.metadata_path = temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
-    session.options = options;
     session.total_size = 12 * 1024;
     session.accept_ranges = true;
     session.telemetry_session_.record_task_started();
 
     moodycamel::BlockingConcurrentQueue<asyncdownload::core::DataPacket> queue(16);
     asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, options.block_size));
+        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(session.paths.temporary_path, session.total_size, false, true));
     asyncdownload::metadata::MetadataStore store(session.paths.metadata_path);
     BS::thread_pool<> workers(1);
     asyncdownload::persistence::PersistenceThread persistence(
-        session, queue, bitmap, writer, store, workers);
+        session, policy, queue, bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
     persistence.register_range(&range);

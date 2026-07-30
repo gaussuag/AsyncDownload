@@ -1075,6 +1075,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         DataQueue::producer_token_t network_queue_producer(data_queue);
         BS::thread_pool<> workers(effective_policy.scheduling().connection_limit);
         persistence::PersistenceThread persistence(session,
+            effective_policy.persistence(),
             data_queue,
             bitmap,
             file_writer,

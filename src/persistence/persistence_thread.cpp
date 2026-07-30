@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <utility>
 
 namespace asyncdownload::persistence {
 
@@ -17,12 +18,15 @@ namespace {
 } // namespace
 
 PersistenceThread::PersistenceThread(core::SessionState& session,
-                                     moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue,
+                                     download::PersistencePolicy policy,
+                                     moodycamel::BlockingConcurrentQueue<
+                                         core::DataPacket>& data_queue,
                                      core::AtomicBlockBitmap& bitmap,
                                      storage::FileWriter& file_writer,
                                      metadata::MetadataStore& metadata_store,
                                      BS::thread_pool<>& workers)
     : session_(session),
+      policy_(std::move(policy)),
       data_queue_(data_queue),
       bitmap_(bitmap),
       file_writer_(file_writer),
@@ -152,7 +156,8 @@ void PersistenceThread::handle_data_packet(core::DataPacket packet) {
         // 回调线程不能阻塞等待缺口补齐，所以乱序包先进入 map。
         // Persistence 线程只要等到 expected offset 到达，就能把后续连续片段一起链式写下去。
         packet.accounted_bytes += core::kMapNodeOverheadBytes;
-        const auto queued_memory = core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
+        const auto queued_memory =
+            core::global_memory_accounting().add(core::kMapNodeOverheadBytes);
         session_.telemetry_session_.record_memory_sample(queued_memory);
         ++current_out_of_order_packets_;
         current_out_of_order_bytes_ += static_cast<std::int64_t>(packet.accounted_bytes);
@@ -200,7 +205,7 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
     static_cast<void>(sample_timing);
     auto cursor = offset;
     std::size_t index = 0;
-    const auto alignment = session_.options.io_alignment;
+    const auto alignment = policy_.io_alignment_bytes;
 
     while (index < bytes.size()) {
         if (range.tail_buffer.length > 0) {
@@ -266,7 +271,7 @@ std::error_code PersistenceThread::append_bytes(core::RangeContext& range,
 
         bitmap_.mark_downloading_range(cursor,
             cursor + static_cast<std::int64_t>(aligned_bytes),
-            session_.options.block_size,
+            policy_.block_bytes,
             session_.total_size);
         bytes_since_flush_ += aligned_bytes;
         session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(aligned_bytes),
@@ -296,8 +301,10 @@ std::error_code PersistenceThread::flush_tail(core::RangeContext& range, const b
     const auto remaining = static_cast<std::size_t>(std::max<std::int64_t>(0,
         session_.total_size - range.tail_buffer.offset));
     const auto write_size = std::min(remaining,
-        std::max(range.tail_buffer.length, std::min(session_.options.io_alignment, remaining)));
-    std::array<std::uint8_t, 4096> bytes{};
+        std::max(
+            range.tail_buffer.length,
+            std::min(policy_.io_alignment_bytes, remaining)));
+    std::array<std::uint8_t, core::TAIL_BUFFER_CAPACITY_BYTES> bytes{};
     std::memcpy(bytes.data(), range.tail_buffer.data.data(), range.tail_buffer.length);
 
     // range 结束时即使不足 4KB 也要把尾巴刷掉，否则 metadata 看起来完成了，
@@ -312,7 +319,7 @@ std::error_code PersistenceThread::flush_tail(core::RangeContext& range, const b
 
     bitmap_.mark_downloading_range(range.tail_buffer.offset,
         range.tail_buffer.offset + static_cast<std::int64_t>(write_size),
-        session_.options.block_size,
+        policy_.block_bytes,
         session_.total_size);
     bytes_since_flush_ += range.tail_buffer.length;
     session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(range.tail_buffer.length),
@@ -329,7 +336,7 @@ void PersistenceThread::update_finished_blocks(const core::RangeContext& range) 
     // 去决定哪些 block 可以升级到 finished。
     bitmap_.mark_finished_range(range.start_offset,
         range.persisted_offset,
-        session_.options.block_size,
+        policy_.block_bytes,
         session_.total_size);
 }
 
@@ -372,7 +379,7 @@ void PersistenceThread::update_gap_flag(core::RangeContext& range) {
     // gap 太大说明这个 range 前面有长时间补不上的洞，再继续接收后续数据只会
     // 无限堆积内存，所以让 Orchestrator 暂停这个 handle，等缺口被补齐后再恢复。
     const auto gap = range.out_of_order_queue.begin()->first - range.persisted_offset;
-    range.pause_for_gap.store(gap > static_cast<std::int64_t>(session_.options.max_gap_bytes),
+    range.pause_for_gap.store(gap > policy_.max_gap_bytes,
         std::memory_order_release);
 }
 
@@ -389,8 +396,11 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto interval_elapsed = now - last_flush_time_ >= session_.options.flush_interval;
-    if (!force && bytes_since_flush_ < session_.options.flush_threshold_bytes && !interval_elapsed) {
+    const auto interval_elapsed =
+        now - last_flush_time_ >= policy_.flush_interval;
+    if (!force &&
+        bytes_since_flush_ < policy_.flush_threshold_bytes &&
+        !interval_elapsed) {
         return;
     }
 
@@ -408,7 +418,7 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
 
         // CRC 只对 VDL 之后仍被标成 finished 的块采样，因为 VDL 之前的数据已经由
         // “最长连续安全前沿”语义兜底，恢复时不需要再逐块复查。
-        snapshot.vdl_offset = bitmap_.contiguous_finished_bytes(session_.options.block_size,
+        snapshot.vdl_offset = bitmap_.contiguous_finished_bytes(policy_.block_bytes,
             session_.total_size);
         snapshot.crc_samples = build_crc_samples(snapshot);
         auto metadata_error = metadata_store_.save(snapshot);
@@ -432,7 +442,7 @@ void PersistenceThread::poll_pending_flush() {
     }
 
     // 只有 flush 和 metadata 都成功后，新的 VDL 才算真正对外可见。
-    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(session_.options.block_size,
+    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(policy_.block_bytes,
         session_.total_size), std::memory_order_release);
 }
 
@@ -448,7 +458,7 @@ void PersistenceThread::wait_pending_flush() {
     }
 
     // 退出阶段也要按同样的顺序推进 VDL，避免最后一轮已写盘数据没有进入恢复元数据。
-    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(session_.options.block_size,
+    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(policy_.block_bytes,
         session_.total_size), std::memory_order_release);
 }
 
@@ -462,11 +472,11 @@ core::MetadataState PersistenceThread::build_metadata_state() const {
     state.resumed = session_.resumed;
     state.etag = session_.etag;
     state.last_modified = session_.last_modified;
-    state.block_size = session_.options.block_size;
-    state.io_alignment = session_.options.io_alignment;
+    state.block_size = policy_.block_bytes;
+    state.io_alignment = policy_.io_alignment_bytes;
 
     core::AtomicBlockBitmap snapshot_bitmap(core::required_block_count(session_.total_size,
-        session_.options.block_size));
+        policy_.block_bytes));
     snapshot_bitmap.restore(bitmap_.snapshot());
 
     // metadata 快照不能只信 bitmap 当前值，因为某些 range 的 persisted_offset
@@ -488,13 +498,13 @@ core::MetadataState PersistenceThread::build_metadata_state() const {
         if (range->persisted_offset > range->start_offset) {
             snapshot_bitmap.mark_finished_range(range->start_offset,
                 range->persisted_offset,
-                session_.options.block_size,
+                policy_.block_bytes,
                 session_.total_size);
         }
     }
 
     state.bitmap_states = snapshot_bitmap.snapshot();
-    state.vdl_offset = snapshot_bitmap.contiguous_finished_bytes(session_.options.block_size,
+    state.vdl_offset = snapshot_bitmap.contiguous_finished_bytes(policy_.block_bytes,
         session_.total_size);
     return state;
 }

@@ -2,6 +2,7 @@
 
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
+#include "download/download_policy.hpp"
 #include "metadata/metadata_store.hpp"
 #include "storage/file_writer.hpp"
 
@@ -25,6 +26,7 @@ public:
     // 4. 位图推进
     // 5. flush / metadata / VDL 更新
     PersistenceThread(core::SessionState& session,
+                      download::PersistencePolicy policy,
                       moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue,
                       core::AtomicBlockBitmap& bitmap,
                       storage::FileWriter& file_writer,
@@ -93,6 +95,7 @@ private:
     void set_error(std::error_code error);
 
     core::SessionState& session_;
+    const download::PersistencePolicy policy_;
     moodycamel::BlockingConcurrentQueue<core::DataPacket>& data_queue_;
     core::AtomicBlockBitmap& bitmap_;
     storage::FileWriter& file_writer_;
