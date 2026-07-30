@@ -573,3 +573,79 @@ TEST_F(
     EXPECT_FALSE(close_error);
     EXPECT_FALSE(persistence.error());
 }
+
+TEST_F(
+    RecoveryFailureTest,
+    SecondCrcReadFailureRetainsLastMetadata) {
+    auto open_request = request();
+    open_request.remote.total_size = 12288;
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const auto empty =
+        static_cast<std::uint8_t>(
+            asyncdownload::core::BlockState::empty);
+    const auto finished =
+        static_cast<std::uint8_t>(
+            asyncdownload::core::BlockState::finished);
+    const std::vector<
+        asyncdownload::recovery::RecoveryRangeFact>
+        ranges;
+    auto baseline =
+        opened.checkpoint->prepare(
+            std::vector<std::uint8_t>{
+                empty,
+                empty,
+                empty
+            },
+            ranges);
+    ASSERT_FALSE(baseline.error);
+    const auto baseline_result =
+        opened.checkpoint->commit(
+            std::move(baseline.checkpoint));
+    ASSERT_FALSE(baseline_result.error);
+    const auto metadata_before =
+        read_file(open_request.paths.metadata_path);
+    const std::vector<std::uint8_t> bytes(
+        4096,
+        0x63);
+    ASSERT_FALSE(
+        opened.checkpoint->write(4096, bytes));
+    ASSERT_FALSE(
+        opened.checkpoint->write(8192, bytes));
+    auto candidate =
+        opened.checkpoint->prepare(
+            std::vector<std::uint8_t>{
+                empty,
+                finished,
+                finished
+            },
+            ranges);
+    ASSERT_FALSE(candidate.error);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.fail_crc_read_number.store(
+        2,
+        std::memory_order_release);
+    fault_plan.crc_read_count.store(
+        0,
+        std::memory_order_release);
+
+    const auto committed =
+        opened.checkpoint->commit(
+            std::move(candidate.checkpoint));
+
+    EXPECT_EQ(
+        committed.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                file_read_failed));
+    EXPECT_EQ(committed.generation, 2U);
+    EXPECT_EQ(committed.committed_vdl, 0);
+    EXPECT_EQ(
+        read_file(open_request.paths.metadata_path),
+        metadata_before);
+}

@@ -706,13 +706,30 @@ CheckpointCommitResult RecoveryCheckpoint::commit(
                         prepared.state.total_size -
                             offset));
             std::vector<std::byte> bytes;
-            const auto read_error =
-                implementation_->file_writer.read(
-                    offset,
-                    length,
-                    bytes);
+            std::error_code read_error;
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+            const auto read_number =
+                fault_plan.crc_read_count.fetch_add(
+                    1,
+                    std::memory_order_acq_rel) + 1;
+            if (fault_plan.fail_crc_read_number.load(
+                    std::memory_order_acquire) ==
+                read_number) {
+                read_error = make_error_code(
+                    DownloadErrc::file_read_failed);
+            } else {
+#endif
+                read_error =
+                    implementation_->file_writer.read(
+                        offset,
+                        length,
+                        bytes);
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+            }
+#endif
             if (read_error) {
-                continue;
+                finish(read_error);
+                return result;
             }
             prepared.state.crc_samples.push_back({
                 offset,
