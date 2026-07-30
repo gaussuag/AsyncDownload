@@ -602,6 +602,9 @@ TEST(DownloadIntegrationTest, ResumeAfterInterruptedCliDownload) {
         append_log(trace_file, std::string("cli_start_error=") +
             std::to_string(static_cast<unsigned long long>(g_last_start_process_error)));
         stop_child(server, 0);
+        if (g_last_start_process_error == ERROR_ELEVATION_REQUIRED) {
+            GTEST_SKIP() << "CreateProcess error=740";
+        }
         FAIL() << "failed to start CLI process, error=" << g_last_start_process_error;
     }
     append_log(trace_file, "cli_started");
@@ -718,7 +721,19 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
         quote_arg(output_file.wstring()) + L" --config " +
         quote_arg(config_file.wstring()) + L" --summary-file " +
         quote_arg(summary_file.wstring());
-    ASSERT_TRUE(start_process(cli, cli_path.wstring(), cli_command, workspace_root, false));
+    if (!start_process(
+            cli,
+            cli_path.wstring(),
+            cli_command,
+            workspace_root,
+            false)) {
+        stop_child(server, 0);
+        if (g_last_start_process_error == ERROR_ELEVATION_REQUIRED) {
+            GTEST_SKIP() << "CreateProcess error=740";
+        }
+        FAIL() << "failed to start CLI process, error="
+               << g_last_start_process_error;
+    }
     ASSERT_EQ(cli.wait(20000), WAIT_OBJECT_0);
     const auto exit_code = cli.exit_code();
     cli.close();
