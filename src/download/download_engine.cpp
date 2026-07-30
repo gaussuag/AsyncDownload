@@ -14,8 +14,6 @@
 
 #include <thread-pool/BS_thread_pool.hpp>
 
-#include <curl/curl.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -47,40 +45,10 @@ struct PendingLease {
     std::size_t ack_count = 0;
 };
 
-struct TransferHandle {
-    // TransferHandle 代表一个可复用的 easy handle 槽位。
-    // 它既保存 libcurl 句柄，也保存当前绑定到哪个 range/window，以及暂停原因、
-    // 响应码、速度等运行期状态。
-    core::SessionState* session = nullptr;
-    flow::PacketProducer* packet_producer = nullptr;
-    flow::ProducerLane packet_lane;
-    FlowControlPolicy flow_control{};
-    CURL* easy = nullptr;
-    std::optional<range::RangeLease> lease;
-    std::optional<PendingLease> pending_lease;
-    std::string range_header;
-    std::int64_t request_start = 0;
-    std::int64_t request_end = -1;
-    std::int64_t next_offset = 0;
-    std::int64_t request_bytes = 0;
-    long response_code = 0;
-    double speed_bytes_per_second = 0.0;
-    bool in_multi = false;
-    bool paused_by_gap = false;
-    bool paused_by_window_boundary = false;
-    CURLcode curl_result = CURLE_OK;
-    std::error_code packet_error;
-    Clock::time_point request_started{};
+struct ActiveTransfer {
+    http::TransferToken token{};
+    range::RangeLease lease{};
 };
-
-void record_first_network_byte(core::SessionState& session,
-                               const std::size_t bytes) noexcept {
-    if (bytes == 0) {
-        return;
-    }
-
-    session.telemetry_session_.record_first_byte_received();
-}
 
 [[nodiscard]] std::optional<std::int64_t> merged_downloaded_bytes(
     const core::SessionState& session,
@@ -100,7 +68,9 @@ void record_first_network_byte(core::SessionState& session,
 [[nodiscard]] std::error_code invoke_progress(
     core::SessionState& session,
     range::RangeLifecycle& lifecycle,
-    const std::vector<TransferHandle>& handles) noexcept {
+    flow::PacketProducer& packet_producer,
+    const http::HttpSessionSnapshot& http_snapshot)
+        noexcept {
     if (!session.progress_callback) {
         return {};
     }
@@ -110,10 +80,8 @@ void record_first_network_byte(core::SessionState& session,
         return lifecycle_snapshot.error;
     }
     auto snapshot = session.telemetry_session_.current_snapshot();
-    const auto flow_snapshot = handles.empty() ||
-            handles.front().packet_producer == nullptr ?
-        flow::PacketFlowSnapshot{} :
-        handles.front().packet_producer->snapshot();
+    const auto flow_snapshot =
+        packet_producer.snapshot();
     snapshot.total_bytes = session.total_size;
     snapshot.downloaded_bytes =
         merged_downloaded_bytes(session, flow_snapshot).value_or(
@@ -126,39 +94,18 @@ void record_first_network_byte(core::SessionState& session,
     snapshot.memory_bytes = flow_snapshot.accounted_bytes;
     snapshot.resumed = session.resumed;
 
-    for (const auto& lifecycle_range :
-         lifecycle_snapshot.value.ranges) {
-        const auto transfer_paused = std::any_of(
-            handles.begin(),
-            handles.end(),
-            [&lifecycle_range](
-                const TransferHandle& handle) {
-                const auto id = handle.lease.has_value() ?
-                    std::optional<range::RangeId>{
-                        handle.lease->id.range
-                    } :
-                    handle.pending_lease.has_value() ?
-                        std::optional<range::RangeId>{
-                            handle.pending_lease->lease.id.range
-                        } :
-                        std::nullopt;
-                return id == lifecycle_range.id &&
-                    (handle.paused_by_window_boundary ||
-                     (handle.packet_producer != nullptr &&
-                      handle.packet_producer->paused(
-                          handle.packet_lane)));
-            });
-        if (lifecycle_range.gap_blocked ||
-            transfer_paused) {
-            ++snapshot.paused_ranges;
-        }
-    }
-
-    snapshot.active_requests = static_cast<std::size_t>(std::count_if(handles.begin(),
-        handles.end(),
-        [](const TransferHandle& handle) {
-            return handle.in_multi;
-        }));
+    const auto gap_paused = static_cast<std::size_t>(
+        std::count_if(
+            lifecycle_snapshot.value.ranges.begin(),
+            lifecycle_snapshot.value.ranges.end(),
+            [](const range::RangeSnapshot& current) {
+                return current.gap_blocked;
+            }));
+    snapshot.paused_ranges = std::max(
+        gap_paused,
+        http_snapshot.paused_transfers);
+    snapshot.active_requests =
+        http_snapshot.active_transfers;
 
     try {
         session.progress_callback(snapshot);
@@ -298,7 +245,8 @@ void rebuild_bitmap_from_ranges(
 
 [[nodiscard]] std::error_code drain_geometry_acks(
     persistence::PersistenceThread& persistence,
-    std::vector<TransferHandle>& handles) noexcept {
+    std::vector<PendingLease>& pending_leases)
+        noexcept {
     while (true) {
         const auto polled =
             persistence.poll_range_geometry_ack();
@@ -310,13 +258,10 @@ void rebuild_bitmap_from_ranges(
         }
 
         bool matched = false;
-        for (auto& handle : handles) {
-            if (!handle.pending_lease.has_value()) {
-                continue;
-            }
+        for (auto& pending : pending_leases) {
             auto expected = std::span<ExpectedGeometryAck>(
-                handle.pending_lease->acks.data(),
-                handle.pending_lease->ack_count);
+                pending.acks.data(),
+                pending.ack_count);
             const auto found = std::find_if(
                 expected.begin(),
                 expected.end(),
@@ -363,366 +308,10 @@ void rebuild_bitmap_from_ranges(
     return {};
 }
 
-[[nodiscard]] bool response_is_valid(const core::SessionState& session,
-                                     const TransferHandle& transfer) noexcept {
-    // Range 模式下，除非这个请求覆盖整个文件，否则必须看到 206。
-    // 否则服务端可能忽略了 Range 头，继续下载会把数据布局全部打乱。
-    if (session.effective_policy.scheduling().issue_range_requests) {
-        if (transfer.request_start == 0 && transfer.request_end >= session.total_size - 1) {
-            return transfer.response_code == 200 || transfer.response_code == 206;
-        }
-
-        return transfer.response_code == 206;
-    }
-
-    return transfer.response_code == 200 || transfer.response_code == 206;
-}
-
-void update_speed(TransferHandle& transfer) noexcept {
-    // 先用 libcurl 自带的速度统计；若当前平台或当前时刻拿不到，就退回到
-    // “本次 window 已接收字节 / 已运行时间”的粗略估算。
-    curl_off_t speed = 0;
-    if (curl_easy_getinfo(transfer.easy, CURLINFO_SPEED_DOWNLOAD_T, &speed) == CURLE_OK &&
-        speed > 0) {
-        transfer.speed_bytes_per_second = static_cast<double>(speed);
-        return;
-    }
-
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - transfer.request_started);
-    if (elapsed.count() > 0) {
-        transfer.speed_bytes_per_second =
-            static_cast<double>(transfer.request_bytes) * 1000.0 / elapsed.count();
-    }
-}
-
-[[nodiscard]] flow::PacketAdmission flush_packet_lane(
-    TransferHandle& transfer) noexcept {
-    auto result =
-        transfer.packet_producer->flush(transfer.packet_lane);
-    if (result.code == flow::PacketAdmissionCode::failed) {
-        transfer.packet_error = result.error;
-    } else if (result.code == flow::PacketAdmissionCode::closed) {
-        transfer.packet_error =
-            make_error_code(DownloadErrc::internal_error);
-    }
-    return result;
-}
-
-[[nodiscard]] std::error_code drain_packet_lane(
-    TransferHandle& transfer) noexcept {
-    while (true) {
-        const auto flushed = flush_packet_lane(transfer);
-        if (flushed.accepted()) {
-            return {};
-        }
-        if (flushed.code == flow::PacketAdmissionCode::failed ||
-            flushed.code == flow::PacketAdmissionCode::closed) {
-            return transfer.packet_error ?
-                transfer.packet_error :
-                make_error_code(DownloadErrc::internal_error);
-        }
-        const auto snapshot =
-            transfer.packet_producer->snapshot();
-        if (snapshot.state == flow::PacketFlowState::failed) {
-            return snapshot.error ?
-                snapshot.error :
-                make_error_code(DownloadErrc::internal_error);
-        }
-        if (snapshot.state != flow::PacketFlowState::open) {
-            return make_error_code(DownloadErrc::internal_error);
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
-[[nodiscard]] std::error_code arm_transfer(TransferHandle& transfer,
-                                           CURLM* multi,
-                                           const core::SessionState& session,
-                                           range::RangeLease lease) noexcept {
-    if (lease.bytes.begin >= lease.bytes.end) {
-        return {};
-    }
-
-    transfer.lease = lease;
-    transfer.request_start = lease.bytes.begin;
-    transfer.request_end = lease.bytes.end - 1;
-    transfer.next_offset = lease.bytes.begin;
-    transfer.request_bytes = 0;
-    transfer.response_code = 0;
-    transfer.speed_bytes_per_second = 0.0;
-    transfer.paused_by_gap = false;
-    transfer.paused_by_window_boundary = false;
-    transfer.curl_result = CURLE_OK;
-    transfer.packet_error = {};
-    transfer.request_started = Clock::now();
-    transfer.range_header.clear();
-
-    curl_easy_reset(transfer.easy);
-    curl_easy_setopt(transfer.easy, CURLOPT_URL, session.url.c_str());
-    curl_easy_setopt(transfer.easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
-    curl_easy_setopt(transfer.easy, CURLOPT_WRITEFUNCTION, +[](char* data,
-                                                               const size_t size,
-                                                               const size_t nmemb,
-                                                               void* user_data) -> size_t {
-        auto* current = static_cast<TransferHandle*>(user_data);
-        const auto bytes = size * nmemb;
-        if (bytes == 0 ||
-            current == nullptr ||
-            !current->lease.has_value()) {
-            return 0;
-        }
-
-        // stop_requested 表示主线程已经决定收尾，回调这里直接返回失败，
-        // 让 libcurl 尽快结束该请求。
-        if (current->session->stop_requested.load(std::memory_order_acquire)) {
-            return 0;
-        }
-
-        const auto remaining = current->request_end - current->next_offset + 1;
-        if (remaining <= 0) {
-            const auto flushed = flush_packet_lane(*current);
-            if (!flushed.accepted()) {
-                if (current->packet_error) {
-                    return 0;
-                }
-                return CURL_WRITEFUNC_PAUSE;
-            }
-
-            // 如果服务端继续往回调里塞数据，但逻辑 window 已经没有剩余额度，
-            // 就暂停接收，避免把后续字节算进错误的区间。
-            if (!current->paused_by_window_boundary) {
-                current->session->telemetry_session_.record_pause(
-                    telemetry::TelemetryPauseReason::none, false);
-            }
-            current->paused_by_window_boundary = true;
-            return CURL_WRITEFUNC_PAUSE;
-        }
-
-        const auto allowed = std::min<std::size_t>(bytes, static_cast<std::size_t>(remaining));
-        if (allowed != bytes) {
-            // window 化调度要求一个请求只能覆盖分配给它的那段字节。
-            // 只要回调给出的数据超出当前 window，就把这次传输视为异常。
-            return 0;
-        }
-
-        if (current->request_end == std::numeric_limits<std::int64_t>::max()) {
-            current->packet_error =
-                std::make_error_code(std::errc::invalid_argument);
-            return 0;
-        }
-        const auto admission = current->packet_producer->accept(
-            current->packet_lane,
-            {
-                current->lease->id,
-                current->lease->bytes,
-                current->next_offset,
-                std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t*>(data),
-                    allowed)
-            });
-        if (!admission.accepted()) {
-            if (admission.code ==
-                flow::PacketAdmissionCode::memory_budget_exhausted) {
-                return CURL_WRITEFUNC_PAUSE;
-            }
-            if (admission.code ==
-                    flow::PacketAdmissionCode::packet_budget_exhausted ||
-                admission.code ==
-                    flow::PacketAdmissionCode::backend_temporarily_unavailable) {
-                return CURL_WRITEFUNC_PAUSE;
-            }
-            current->packet_error = admission.error ?
-                admission.error :
-                make_error_code(DownloadErrc::internal_error);
-            return 0;
-        }
-        record_first_network_byte(*current->session, allowed);
-        current->next_offset += static_cast<std::int64_t>(allowed);
-        current->request_bytes += static_cast<std::int64_t>(allowed);
-        return allowed;
-    });
-    curl_easy_setopt(transfer.easy, CURLOPT_WRITEDATA, &transfer);
-    curl_easy_setopt(transfer.easy, CURLOPT_PRIVATE, &transfer);
-    curl_easy_setopt(transfer.easy, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_ACCEPT_ENCODING, "");
-    // 每个 window 请求都强制走新的连接，避免 multi 的连接缓存把并发 range
-    // 折叠到同一条 TCP 连接上。
-    curl_easy_setopt(transfer.easy, CURLOPT_FRESH_CONNECT, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_FORBID_REUSE, 1L);
-    curl_easy_setopt(transfer.easy, CURLOPT_PIPEWAIT, 0L);
-
-    if (session.effective_policy.scheduling().issue_range_requests) {
-        transfer.range_header = std::to_string(transfer.request_start) + "-" +
-            std::to_string(transfer.request_end);
-        curl_easy_setopt(transfer.easy, CURLOPT_RANGE, transfer.range_header.c_str());
-    }
-
-    if (curl_multi_add_handle(multi, transfer.easy) != CURLM_OK) {
-        transfer.lease.reset();
-        return make_error_code(DownloadErrc::http_transfer_failed);
-    }
-
-    transfer.in_multi = true;
-    return {};
-}
-
-[[nodiscard]] std::error_code apply_gap_pauses(
-    std::vector<TransferHandle>& handles,
-    range::RangeLifecycle& lifecycle) noexcept {
-    const auto snapshot = lifecycle.snapshot();
-    if (snapshot.error) {
-        return snapshot.error;
-    }
-    // gap pause 的信号来自 Persistence 线程，它比网络层更早知道某个 range 前面
-    // 是否已经堆出了过大的洞。
-    for (auto& handle : handles) {
-        if (!handle.in_multi ||
-            !handle.lease.has_value()) {
-            continue;
-        }
-
-        const auto found = std::find_if(
-            snapshot.value.ranges.begin(),
-            snapshot.value.ranges.end(),
-            [&handle](
-                const range::RangeSnapshot& current) {
-                return current.id ==
-                    handle.lease->id.range;
-            });
-        if (found == snapshot.value.ranges.end()) {
-            return make_error_code(
-                DownloadErrc::internal_error);
-        }
-        const auto pause_for_gap = found->gap_blocked;
-        if (pause_for_gap && !handle.paused_by_gap) {
-            handle.session->telemetry_session_.record_pause(
-                telemetry::TelemetryPauseReason::gap, false);
-            handle.paused_by_gap = true;
-            curl_easy_pause(handle.easy, CURLPAUSE_RECV);
-        } else if (!pause_for_gap && handle.paused_by_gap) {
-            handle.paused_by_gap = false;
-            if (!handle.packet_producer->paused(
-                    handle.packet_lane) &&
-                !handle.paused_by_window_boundary) {
-                curl_easy_pause(handle.easy, CURLPAUSE_CONT);
-            }
-        }
-    }
-    return {};
-}
-
-[[nodiscard]] std::error_code reconcile_packet_flow(
-    std::vector<TransferHandle>& handles,
-    std::vector<flow::PacketLaneObservation>& observations,
-    std::vector<flow::PacketPauseAction>& actions) noexcept {
-    observations.clear();
-    for (auto& handle : handles) {
-        if (!handle.in_multi ||
-            !handle.lease.has_value()) {
-            continue;
-        }
-        const auto eligible = !handle.paused_by_window_boundary;
-        if (eligible) {
-            update_speed(handle);
-        }
-        observations.push_back({
-            handle.packet_lane.id(),
-            handle.speed_bytes_per_second,
-            eligible
-        });
-    }
-    if (observations.empty()) {
-        return {};
-    }
-    actions.resize(observations.size());
-    const auto result = handles.front().packet_producer->reconcile(
-        observations, actions);
-    if (result.error) {
-        return result.error;
-    }
-    for (std::size_t index = 0;
-         index < result.action_count;
-         ++index) {
-        const auto& action = actions[index];
-        const auto found = std::find_if(
-            handles.begin(),
-            handles.end(),
-            [&action](const TransferHandle& handle) {
-                return handle.packet_lane.id() == action.lane_id;
-            });
-        if (found == handles.end() ||
-            !found->in_multi ||
-            !found->lease.has_value()) {
-            return make_error_code(DownloadErrc::internal_error);
-        }
-        if (action.kind ==
-            flow::PacketPauseActionKind::pause_receive) {
-            curl_easy_pause(found->easy, CURLPAUSE_RECV);
-            continue;
-        }
-        if (!found->paused_by_gap &&
-            !found->paused_by_window_boundary &&
-            !found->packet_producer->paused(
-                found->packet_lane)) {
-            curl_easy_pause(found->easy, CURLPAUSE_CONT);
-        }
-    }
-    return {};
-}
-
-[[nodiscard]] std::error_code finalize_completed_request(
-    TransferHandle& transfer,
-    core::SessionState& session,
-    range::RangeLifecycle& lifecycle) noexcept {
-    if (!transfer.lease.has_value()) {
-        return {};
-    }
-
-    const auto fail_lease =
-        [&transfer, &lifecycle](
-            const std::error_code error) noexcept {
-            const auto applied = lifecycle.apply(
-                range::LeaseFailed{
-                    transfer.lease->id,
-                    transfer.next_offset,
-                    error
-                });
-            return applied.error ? applied.error : error;
-        };
-
-    // 这里处理的是“一个 HTTP window 请求结束了”，不是“整个下载任务结束了”。
-    // 所以它既负责校验这次请求，也负责决定后续应该继续调度还是宣告 range 完成。
-    update_speed(transfer);
-    if (const auto flush_error = drain_packet_lane(transfer); flush_error) {
-        return fail_lease(flush_error);
-    }
-
-    if (transfer.curl_result != CURLE_OK) {
-        return fail_lease(
-            make_error_code(DownloadErrc::http_transfer_failed));
-    }
-
-    if (!response_is_valid(session, transfer)) {
-        return fail_lease(
-            make_error_code(DownloadErrc::http_invalid_response));
-    }
-
-    if (transfer.next_offset <= transfer.request_end) {
-        return fail_lease(
-            make_error_code(DownloadErrc::http_transfer_failed));
-    }
-
-    transfer.paused_by_window_boundary = false;
-
-    const auto applied = lifecycle.apply(
-        range::LeaseSucceeded{
-            transfer.lease->id,
-            transfer.next_offset
-        });
+[[nodiscard]] std::error_code apply_range_effects(
+    const range::ApplyResult& applied,
+    range::RangeLifecycle& lifecycle,
+    flow::PacketProducer& producer) noexcept {
     if (applied.error) {
         return applied.error;
     }
@@ -733,69 +322,213 @@ void update_speed(TransferHandle& transfer) noexcept {
             std::get_if<range::PublishRangeCompleteEffect>(
                 &applied.effects.values[index]);
         if (completion == nullptr) {
-            return make_error_code(DownloadErrc::internal_error);
+            return make_error_code(
+                DownloadErrc::internal_error);
         }
-        const auto publish_error = publish_range_complete(
-            *transfer.packet_producer,
-            *completion);
-        if (publish_error) {
-            return publish_error;
+        const auto error =
+            publish_range_complete(
+                producer,
+                *completion);
+        if (error) {
+            const auto failed = lifecycle.apply(
+                range::EffectApplicationFailed{error});
+            return failed.error ? failed.error : error;
         }
     }
-
-    transfer.lease.reset();
-    transfer.pending_lease.reset();
-    transfer.range_header.clear();
-    transfer.paused_by_gap = false;
-    transfer.paused_by_window_boundary = false;
     return {};
 }
 
-void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
-    if (transfer.in_multi) {
-        curl_multi_remove_handle(multi, transfer.easy);
-        transfer.in_multi = false;
+[[nodiscard]] std::error_code apply_http_event(
+    const http::HttpTransferEvent& event,
+    range::RangeLifecycle& lifecycle,
+    flow::PacketProducer& producer,
+    std::vector<ActiveTransfer>& active) noexcept {
+    http::TransferToken token;
+    range::ApplyResult applied;
+    std::error_code transfer_error;
+    if (const auto* succeeded =
+            std::get_if<http::HttpLeaseSucceeded>(
+                &event)) {
+        token = succeeded->token;
+        applied = lifecycle.apply(
+            range::LeaseSucceeded{
+                succeeded->lease,
+                succeeded->received_through
+            });
+    } else {
+        const auto& failed =
+            std::get<http::HttpLeaseFailed>(event);
+        token = failed.token;
+        transfer_error = failed.failure.error
+            ? failed.failure.error
+            : make_error_code(
+                DownloadErrc::http_transfer_failed);
+        applied = lifecycle.apply(
+            range::LeaseFailed{
+                failed.lease,
+                failed.accepted_through,
+                transfer_error
+            });
     }
 
-    transfer.paused_by_window_boundary = false;
-    // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
-    // 不销毁底层 easy 对象本身。
-    transfer.lease.reset();
-    transfer.pending_lease.reset();
-    transfer.range_header.clear();
-    transfer.paused_by_gap = false;
-    transfer.paused_by_window_boundary = false;
+    const auto found = std::find_if(
+        active.begin(),
+        active.end(),
+        [&token](const ActiveTransfer& current) {
+            return current.token == token;
+        });
+    if (found == active.end()) {
+        return make_error_code(
+            DownloadErrc::internal_error);
+    }
+    active.erase(found);
+
+    const auto effect_error =
+        apply_range_effects(
+            applied,
+            lifecycle,
+            producer);
+    if (effect_error) {
+        return effect_error;
+    }
+    return transfer_error;
 }
 
-std::error_code stop_network_phase(core::SessionState& session,
-                                   CURLM* multi,
-                                   std::vector<TransferHandle>& handles) noexcept {
-    // 退出红线的第一步是先停网络生产，避免 Persistence 在 drain 队列时又收到
-    // 新数据，从而把收尾阶段拉回“边消费边生产”的竞态。
-    session.stop_requested.store(true, std::memory_order_release);
-    std::error_code first_error;
-    for (auto& handle : handles) {
-        if (handle.packet_producer == nullptr ||
-            handle.packet_lane.id() == 0) {
-            release_transfer(multi, handle);
+[[nodiscard]] std::error_code feed_gap_pauses(
+    http::HttpTransferSession& http_session,
+    range::RangeLifecycle& lifecycle,
+    const std::vector<ActiveTransfer>& active)
+        noexcept {
+    const auto snapshot = lifecycle.snapshot();
+    if (snapshot.error) {
+        return snapshot.error;
+    }
+    for (const auto& transfer : active) {
+        const auto found = std::find_if(
+            snapshot.value.ranges.begin(),
+            snapshot.value.ranges.end(),
+            [&transfer](
+                const range::RangeSnapshot& current) {
+                return current.id ==
+                    transfer.lease.id.range;
+            });
+        if (found == snapshot.value.ranges.end()) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        const auto error =
+            http_session.set_gap_paused(
+                transfer.token,
+                found->gap_blocked);
+        if (error) {
+            return error;
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] std::error_code drain_http_events(
+    http::HttpTransferSession& http_session,
+    range::RangeLifecycle& lifecycle,
+    flow::PacketProducer& producer,
+    std::vector<ActiveTransfer>& active)
+        noexcept {
+    while (true) {
+        const auto polled =
+            http_session.poll(
+                std::chrono::milliseconds(0));
+        if (polled.code ==
+            http::HttpPollCode::event) {
+            if (!polled.event.has_value()) {
+                return make_error_code(
+                    DownloadErrc::internal_error);
+            }
+            const auto error = apply_http_event(
+                *polled.event,
+                lifecycle,
+                producer,
+                active);
+            if (error) {
+                return error;
+            }
             continue;
         }
-        const auto flush_error = drain_packet_lane(handle);
-        if (flush_error && !first_error) {
-            first_error = flush_error;
+        if (polled.code ==
+                http::HttpPollCode::idle ||
+            polled.code ==
+                http::HttpPollCode::timed_out) {
+            return {};
         }
-        if (flush_error) {
-            const auto discard_error =
-                handle.packet_producer->discard(
-                    handle.packet_lane);
-            if (!first_error && discard_error) {
-                first_error = discard_error;
-            }
-        }
-
-        release_transfer(multi, handle);
+        return polled.error
+            ? polled.error
+            : make_error_code(
+                DownloadErrc::http_transfer_failed);
     }
+}
 
+[[nodiscard]] std::error_code stop_http_session(
+    http::HttpTransferSession& http_session,
+    range::RangeLifecycle& lifecycle,
+    flow::PacketProducer& producer,
+    std::vector<ActiveTransfer>& active,
+    const bool upstream_failed) noexcept {
+    const auto cancel_error =
+        http_session.cancel(
+            upstream_failed
+                ? http::HttpCancelRequest{
+                    http::HttpCancelKind::
+                        upstream_failed,
+                    producer.snapshot().error
+                }
+                : http::HttpCancelRequest{
+                    http::HttpCancelKind::
+                        task_cancelled,
+                    {}
+                });
+    std::error_code first_error =
+        cancel_error;
+    while (true) {
+        const auto polled =
+            http_session.poll(
+                std::chrono::milliseconds(0));
+        if (polled.code ==
+            http::HttpPollCode::event) {
+            if (!polled.event.has_value()) {
+                if (!first_error) {
+                    first_error = make_error_code(
+                        DownloadErrc::internal_error);
+                }
+                break;
+            }
+            const auto applied = apply_http_event(
+                *polled.event,
+                lifecycle,
+                producer,
+                active);
+            if (!first_error && applied) {
+                first_error = applied;
+            }
+            continue;
+        }
+        if (polled.code ==
+                http::HttpPollCode::idle ||
+            polled.code ==
+                http::HttpPollCode::failed) {
+            break;
+        }
+        if (!first_error) {
+            first_error = polled.error
+                ? polled.error
+                : make_error_code(
+                    DownloadErrc::internal_error);
+        }
+        break;
+    }
+    const auto close_error =
+        http_session.close();
+    if (!first_error && close_error) {
+        first_error = close_error;
+    }
     return first_error;
 }
 
@@ -814,20 +547,6 @@ std::error_code stop_persistence_phase(flow::PacketProducer& producer,
         failure = persistence.error();
     }
     return failure;
-}
-
-void cleanup_network_resources(CURLM* multi, std::vector<TransferHandle>& handles) noexcept {
-    // 到这里网络层已经停止生产，所以可以安全销毁 easy/multi 资源。
-    for (auto& handle : handles) {
-        if (handle.easy != nullptr) {
-            curl_easy_cleanup(handle.easy);
-            handle.easy = nullptr;
-        }
-    }
-
-    if (multi != nullptr) {
-        curl_multi_cleanup(multi);
-    }
 }
 
 [[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
@@ -1074,60 +793,66 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             return result;
         }
 
-        // multi handle 统一承载所有 easy handle 的事件驱动；后面的主循环通过
-        // curl_multi_perform + curl_multi_wait 实现非阻塞调度。
-        CURLM* multi = curl_multi_init();
-        if (multi == nullptr) {
-            const auto close_error = packet_flow->producer().close();
+        const auto connection_limit =
+            session.effective_policy.scheduling().
+                connection_limit;
+        auto opened_http_session =
+            http_transfer_port->open_session(
+                {
+                    session.url,
+                    session.total_size,
+                    connection_limit
+                },
+                packet_flow->producer(),
+                session.telemetry_session_);
+        if (opened_http_session.failure.error ||
+            opened_http_session.session == nullptr) {
+            const auto close_error =
+                packet_flow->producer().close();
             static_cast<void>(close_error);
             persistence.stop();
             persistence.join();
             recovery_checkpoint->
                 close_preserving_artifacts();
-            result.error = make_error_code(DownloadErrc::http_init_failed);
-            result.performance = build_performance_summary(session, Clock::now());
+            result.error =
+                opened_http_session.failure.error
+                ? opened_http_session.failure.error
+                : make_error_code(
+                    DownloadErrc::http_init_failed);
+            result.performance =
+                build_performance_summary(
+                    session,
+                    Clock::now());
             return result;
         }
-
-        curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-            static_cast<long>(
-                session.effective_policy.scheduling().connection_limit));
-        curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-            static_cast<long>(
-                session.effective_policy.scheduling().connection_limit));
-
-        std::vector<TransferHandle> handles(
-            session.effective_policy.scheduling().connection_limit);
-        std::vector<flow::PacketLaneObservation>
-            packet_observations;
-        std::vector<flow::PacketPauseAction> packet_actions;
-        packet_observations.reserve(handles.size());
-        packet_actions.reserve(handles.size());
+        auto http_session =
+            std::move(opened_http_session.session);
+        std::vector<PendingLease> pending_leases;
+        std::vector<ActiveTransfer> active_transfers;
+        pending_leases.reserve(connection_limit);
+        active_transfers.reserve(connection_limit);
         std::error_code failure;
-        for (auto& handle : handles) {
-            handle.session = &session;
-            handle.packet_producer = &packet_flow->producer();
-            handle.flow_control = session.effective_policy.flow_control();
-            if (const auto lane_error =
-                    packet_flow->producer().open_lane(
-                        handle.packet_lane);
-                lane_error) {
-                failure = lane_error;
-                break;
-            }
-            handle.easy = curl_easy_init();
-            if (handle.easy == nullptr) {
-                failure = make_error_code(DownloadErrc::http_init_failed);
-                break;
-            }
-        }
 
         auto emit_progress_at = Clock::now();
-        while (!failure && !session.stop_requested.load(std::memory_order_acquire)) {
+        while (!failure &&
+               !session.stop_requested.load(
+                   std::memory_order_acquire)) {
+            failure = drain_http_events(
+                *http_session,
+                *lifecycle,
+                packet_flow->producer(),
+                active_transfers);
+            if (failure) {
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
+
             if (const auto geometry_error =
                     drain_geometry_acks(
                         persistence,
-                        handles);
+                        pending_leases);
                 geometry_error) {
                 const auto applied = lifecycle->apply(
                     range::EffectApplicationFailed{
@@ -1152,9 +877,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 break;
             }
 
-            // 主循环开始时先看 Persistence 是否已经报错。写盘或 metadata 失败后，
-            // 网络层必须尽快停止继续生产数据。
-            if (const auto persistence_error = persistence.error(); persistence_error) {
+            if (const auto persistence_error =
+                    persistence.error();
+                persistence_error) {
                 const auto applied = lifecycle->apply(
                     range::PersistenceFailed{
                         std::nullopt,
@@ -1167,47 +892,90 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 break;
             }
 
-            for (auto& handle : handles) {
-                if (handle.lease.has_value() ||
-                    handle.in_multi ||
-                    failure) {
+            if (const auto gap_error =
+                    feed_gap_pauses(
+                        *http_session,
+                        *lifecycle,
+                        active_transfers);
+                gap_error) {
+                failure = gap_error;
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
+
+            for (std::size_t index = 0;
+                 index < pending_leases.size();) {
+                auto& pending = pending_leases[index];
+                const auto expected =
+                    std::span<const ExpectedGeometryAck>(
+                        pending.acks.data(),
+                        pending.ack_count);
+                if (!all_geometry_acks_received(expected)) {
+                    ++index;
                     continue;
                 }
-
-                if (handle.pending_lease.has_value()) {
-                    const auto expected =
-                        std::span<const ExpectedGeometryAck>(
-                            handle.pending_lease->acks.data(),
-                            handle.pending_lease->ack_count);
-                    if (!all_geometry_acks_received(expected)) {
-                        continue;
-                    }
-                    const auto lease =
-                        handle.pending_lease->lease;
-                    handle.pending_lease.reset();
-                    const auto arm_error = arm_transfer(
-                        handle,
-                        multi,
-                        session,
-                        lease);
-                    if (arm_error) {
-                        const auto applied = lifecycle->apply(
-                            range::LeaseFailed{
-                                lease.id,
-                                lease.bytes.begin,
-                                arm_error
-                            });
-                        failure = applied.error ?
-                            applied.error :
-                            arm_error;
-                        session.stop_requested.store(
-                            true,
-                            std::memory_order_release);
-                    }
+                const auto started =
+                    http_session->start(pending.lease);
+                if (started.code ==
+                    http::HttpStartCode::no_capacity) {
+                    ++index;
                     continue;
                 }
+                const auto lease = pending.lease;
+                pending_leases.erase(
+                    pending_leases.begin() +
+                    static_cast<std::ptrdiff_t>(index));
+                if (started.code !=
+                        http::HttpStartCode::started ||
+                    !started.token.has_value()) {
+                    const auto start_error =
+                        started.failure.error
+                        ? started.failure.error
+                        : make_error_code(
+                            DownloadErrc::
+                                http_transfer_failed);
+                    const auto applied = lifecycle->apply(
+                        range::LeaseFailed{
+                            lease.id,
+                            lease.bytes.begin,
+                            start_error
+                        });
+                    failure = applied.error
+                        ? applied.error
+                        : start_error;
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
+                    break;
+                }
+                active_transfers.push_back({
+                    *started.token,
+                    lease
+                });
+            }
+            if (failure) {
+                break;
+            }
 
-                const auto acquired = lifecycle->acquire();
+            while (active_transfers.size() +
+                       pending_leases.size() <
+                   connection_limit) {
+                const auto http_snapshot =
+                    http_session->snapshot();
+                if (http_snapshot.error ||
+                    http_snapshot.pending_events != 0 ||
+                    http_snapshot.available_slots <=
+                        pending_leases.size()) {
+                    if (http_snapshot.error) {
+                        failure = http_snapshot.error;
+                    }
+                    break;
+                }
+
+                const auto acquired =
+                    lifecycle->acquire();
                 if (acquired.error) {
                     failure = acquired.error;
                     session.stop_requested.store(
@@ -1216,11 +984,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     break;
                 }
                 if (!acquired.lease.has_value()) {
-                    continue;
+                    break;
                 }
+
                 const auto lease = *acquired.lease;
                 if (acquired.effects.size > 0) {
-                    PendingLease pending;
+                    PendingLease pending{};
                     pending.lease = lease;
                     pending.ack_count =
                         acquired.effects.size;
@@ -1250,100 +1019,85 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     if (failure) {
                         break;
                     }
-                    handle.pending_lease = pending;
+                    pending_leases.push_back(
+                        std::move(pending));
                     continue;
                 }
 
-                const auto arm_error = arm_transfer(
-                    handle,
-                    multi,
-                    session,
-                    lease);
-                if (arm_error) {
+                const auto started =
+                    http_session->start(lease);
+                if (started.code ==
+                    http::HttpStartCode::no_capacity) {
+                    PendingLease pending{};
+                    pending.lease = lease;
+                    pending_leases.push_back(
+                        std::move(pending));
+                    break;
+                }
+                if (started.code !=
+                        http::HttpStartCode::started ||
+                    !started.token.has_value()) {
+                    const auto start_error =
+                        started.failure.error
+                        ? started.failure.error
+                        : make_error_code(
+                            DownloadErrc::
+                                http_transfer_failed);
                     const auto applied = lifecycle->apply(
                         range::LeaseFailed{
                             lease.id,
                             lease.bytes.begin,
-                            arm_error
+                            start_error
                         });
-                    failure = applied.error ?
-                        applied.error :
-                        arm_error;
+                    failure = applied.error
+                        ? applied.error
+                        : start_error;
                     session.stop_requested.store(
                         true,
                         std::memory_order_release);
                     break;
                 }
+                active_transfers.push_back({
+                    *started.token,
+                    lease
+                });
             }
 
             if (failure) {
                 break;
             }
 
-            // gap pause 和 memory backpressure 都是在事件循环里集中执行，避免在
-            // write callback 里直接操作其他 handle，保持控制流简单。
-            if (const auto gap_error =
-                    apply_gap_pauses(
-                        handles,
-                        *lifecycle);
-                gap_error) {
-                failure = gap_error;
-                session.stop_requested.store(
-                    true,
-                    std::memory_order_release);
-                break;
-            }
-            if (const auto reconcile_error =
-                    reconcile_packet_flow(
-                        handles,
-                        packet_observations,
-                        packet_actions);
-                reconcile_error) {
-                failure = reconcile_error;
-                session.stop_requested.store(
-                    true,
-                    std::memory_order_release);
-                break;
-            }
-
-            int running_handles = 0;
-            const auto perform_status = curl_multi_perform(multi, &running_handles);
-            if (perform_status != CURLM_OK) {
-                failure = make_error_code(DownloadErrc::http_transfer_failed);
-                session.stop_requested.store(true, std::memory_order_release);
-                break;
-            }
-
-            int pending_messages = 0;
-            while (auto* message = curl_multi_info_read(multi, &pending_messages)) {
-                if (message->msg != CURLMSG_DONE) {
-                    continue;
+            if (!active_transfers.empty()) {
+                const auto polled =
+                    http_session->poll(
+                        std::chrono::milliseconds(100));
+                if (polled.code ==
+                    http::HttpPollCode::event) {
+                    if (!polled.event.has_value()) {
+                        failure = make_error_code(
+                            DownloadErrc::internal_error);
+                    } else {
+                        failure = apply_http_event(
+                            *polled.event,
+                            *lifecycle,
+                            packet_flow->producer(),
+                            active_transfers);
+                    }
+                } else if (polled.code !=
+                               http::HttpPollCode::
+                                   timed_out &&
+                           polled.code !=
+                               http::HttpPollCode::idle) {
+                    failure = polled.error
+                        ? polled.error
+                        : make_error_code(
+                            DownloadErrc::
+                                http_transfer_failed);
                 }
-
-                void* private_data = nullptr;
-                curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &private_data);
-                auto* transfer = static_cast<TransferHandle*>(private_data);
-                if (transfer == nullptr) {
-                    failure = make_error_code(DownloadErrc::internal_error);
-                    session.stop_requested.store(true, std::memory_order_release);
-                    break;
-                }
-
-                transfer->curl_result = message->data.result;
-                curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE,
-                    &transfer->response_code);
-                curl_multi_remove_handle(multi, message->easy_handle);
-                transfer->in_multi = false;
-
-                // 一个 window 请求完成后，不代表整个 range 完成。
-                // finalize_completed_request 会决定是把 range 放回待调度队列，
-                // 还是发出 range_complete 控制消息交给 Persistence 做最终收尾。
-                const auto finalize_error = finalize_completed_request(*transfer,
-                    session,
-                    *lifecycle);
-                if (finalize_error) {
-                    failure = finalize_error;
-                    session.stop_requested.store(true, std::memory_order_release);
+                if (failure) {
+                    session.stop_requested.store(
+                        true,
+                        std::memory_order_release);
                     break;
                 }
             }
@@ -1354,7 +1108,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                         invoke_progress(
                             session,
                             *lifecycle,
-                            handles);
+                            packet_flow->producer(),
+                            http_session->snapshot());
                     progress_error) {
                     failure = progress_error;
                     session.stop_requested.store(
@@ -1365,13 +1120,8 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 emit_progress_at = now + std::chrono::milliseconds(200);
             }
 
-            const auto has_active = std::any_of(handles.begin(), handles.end(),
-                [](const TransferHandle& handle) {
-                    return handle.in_multi ||
-                        handle.lease.has_value() ||
-                        handle.pending_lease.has_value();
-                });
-            if (!has_active) {
+            if (active_transfers.empty() &&
+                pending_leases.empty()) {
                 const auto lifecycle_snapshot =
                     lifecycle->snapshot();
                 if (lifecycle_snapshot.error) {
@@ -1385,14 +1135,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     break;
                 }
             }
-
-            int num_fds = 0;
-            const auto wait_status = curl_multi_wait(multi, nullptr, 0, 100, &num_fds);
-            if (wait_status != CURLM_OK) {
-                failure = make_error_code(DownloadErrc::http_transfer_failed);
-                session.stop_requested.store(true, std::memory_order_release);
-                break;
-            }
         }
 
         if (failure ||
@@ -1405,13 +1147,27 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             }
         }
 
-        // 收尾严格按“先停网络、再停持久化、最后 finalize 文件”的顺序执行，
-        // 这样 VDL、bitmap 和磁盘内容才能在退出时保持一致。
-        if (!failure) {
-            failure = stop_network_phase(session, multi, handles);
+        session.stop_requested.store(
+            true,
+            std::memory_order_release);
+        if (failure) {
+            const auto flow_snapshot =
+                packet_flow->producer().snapshot();
+            const auto stop_error =
+                stop_http_session(
+                    *http_session,
+                    *lifecycle,
+                    packet_flow->producer(),
+                    active_transfers,
+                    flow_snapshot.state ==
+                        flow::PacketFlowState::failed);
+            static_cast<void>(stop_error);
         } else {
-            const auto ignored = stop_network_phase(session, multi, handles);
-            static_cast<void>(ignored);
+            const auto close_error =
+                http_session->close();
+            if (close_error) {
+                failure = close_error;
+            }
         }
         failure = stop_persistence_phase(
             packet_flow->producer(), persistence, failure);
@@ -1456,12 +1212,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 invoke_progress(
                     session,
                     *lifecycle,
-                    handles);
+                    packet_flow->producer(),
+                    http_session->snapshot());
             !failure && progress_error) {
             failure = progress_error;
         }
 
-        cleanup_network_resources(multi, handles);
         if (!failure) {
             const auto completed_bytes =
                 bitmap.contiguous_finished_bytes(
