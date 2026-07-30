@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -559,6 +560,132 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     EXPECT_GT(summary.max_memory_bytes, 0U);
 
     const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+}
+
+TEST(
+    PersistenceThreadTest,
+    AcknowledgesRegisteredAndResizedGeometryInTicketOrder) {
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
+
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 4096));
+    const auto temp_root =
+        std::filesystem::temp_directory_path() /
+        "asyncdownload_geometry_ack_test";
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(
+        temp_root,
+        filesystem_error);
+    ASSERT_FALSE(filesystem_error);
+    session.paths.output_path = temp_root / "output.bin";
+    session.paths.temporary_path =
+        temp_root / "output.bin.part";
+    session.paths.metadata_path =
+        temp_root / "output.bin.config.json";
+    session.url = "http://127.0.0.1/test.bin";
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::core::AtomicBlockBitmap bitmap(1);
+    asyncdownload::storage::FileWriter writer;
+    ASSERT_FALSE(writer.open(
+        session.paths.temporary_path,
+        session.total_size,
+        false,
+        true));
+    asyncdownload::metadata::MetadataStore store(
+        session.paths.metadata_path);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread persistence(
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        writer,
+        store,
+        workers,
+        1);
+    asyncdownload::core::RangeContext range(0, 0, 4095);
+    persistence.register_range(&range);
+    persistence.start();
+
+    const auto registered = persistence.submit_range_geometry(
+        asyncdownload::persistence::RangeGeometryCommand{
+            asyncdownload::range::RegisterRangeEffect{
+                {0},
+                {0, 4096},
+                0
+            }
+        });
+    std::optional<
+        asyncdownload::persistence::RangeRegistrationAck>
+        registration_ack;
+    const auto observed_registration = wait_for_condition(
+        [&persistence, &registration_ack]() {
+            const auto polled =
+                persistence.poll_range_geometry_ack();
+            if (polled.error || !polled.ack.has_value()) {
+                return false;
+            }
+            registration_ack = *polled.ack;
+            return true;
+        },
+        std::chrono::milliseconds(1000));
+
+    range.end_offset.store(2047, std::memory_order_release);
+    const auto resized = persistence.submit_range_geometry(
+        asyncdownload::persistence::RangeGeometryCommand{
+            asyncdownload::range::ResizeRangeEffect{
+                {0},
+                2048,
+                1
+            }
+        });
+    std::optional<
+        asyncdownload::persistence::RangeRegistrationAck>
+        resize_ack;
+    const auto observed_resize = wait_for_condition(
+        [&persistence, &resize_ack]() {
+            const auto polled =
+                persistence.poll_range_geometry_ack();
+            if (polled.error || !polled.ack.has_value()) {
+                return false;
+            }
+            resize_ack = *polled.ack;
+            return true;
+        },
+        std::chrono::milliseconds(1000));
+
+    const auto close_error = packet_flow->producer().close();
+    persistence.stop();
+    persistence.join();
+    writer.close();
+
+    EXPECT_FALSE(close_error);
+    ASSERT_FALSE(registered.error);
+    ASSERT_FALSE(resized.error);
+    EXPECT_EQ(registered.ticket, 1U);
+    EXPECT_EQ(resized.ticket, 2U);
+    ASSERT_TRUE(observed_registration);
+    ASSERT_TRUE(registration_ack.has_value());
+    EXPECT_EQ(registration_ack->ticket, registered.ticket);
+    EXPECT_EQ(registration_ack->range, (asyncdownload::range::RangeId{0}));
+    EXPECT_EQ(registration_ack->geometry_revision, 0U);
+    EXPECT_FALSE(registration_ack->error);
+    ASSERT_TRUE(observed_resize);
+    ASSERT_TRUE(resize_ack.has_value());
+    EXPECT_EQ(resize_ack->ticket, resized.ticket);
+    EXPECT_EQ(resize_ack->range, (asyncdownload::range::RangeId{0}));
+    EXPECT_EQ(resize_ack->geometry_revision, 1U);
+    EXPECT_FALSE(resize_ack->error);
+    EXPECT_FALSE(persistence.error());
+    const auto removed = std::filesystem::remove_all(
+        temp_root,
+        filesystem_error);
     static_cast<void>(removed);
 }
 

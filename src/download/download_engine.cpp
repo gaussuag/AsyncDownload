@@ -19,6 +19,7 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -35,6 +36,19 @@ namespace asyncdownload::download {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+struct ExpectedGeometryAck {
+    persistence::RangeRegistrationTicket ticket = 0;
+    range::RangeId range{};
+    std::uint64_t geometry_revision = 0;
+    bool received = false;
+};
+
+struct PendingLease {
+    range::RangeLease lease{};
+    std::array<ExpectedGeometryAck, 2> acks{};
+    std::size_t ack_count = 0;
+};
+
 struct TransferHandle {
     // TransferHandle 代表一个可复用的 easy handle 槽位。
     // 它既保存 libcurl 句柄，也保存当前绑定到哪个 range/window，以及暂停原因、
@@ -46,6 +60,7 @@ struct TransferHandle {
     CURL* easy = nullptr;
     core::RangeContext* range = nullptr;
     std::optional<range::RangeLease> lease;
+    std::optional<PendingLease> pending_lease;
     std::string range_header;
     std::int64_t request_start = 0;
     std::int64_t request_end = -1;
@@ -345,6 +360,144 @@ void rebuild_bitmap_from_ranges(
         return std::make_error_code(std::errc::not_enough_memory);
     } catch (...) {
         return make_error_code(DownloadErrc::internal_error);
+    }
+}
+
+[[nodiscard]] std::error_code submit_geometry_effect(
+    const range::RangeEffect& effect,
+    persistence::PersistenceThread& persistence,
+    ExpectedGeometryAck& expected) noexcept {
+    persistence::RangeRegistrationSubmitResult submitted;
+    if (const auto* registration =
+            std::get_if<range::RegisterRangeEffect>(&effect)) {
+        submitted = persistence.submit_range_geometry(
+            persistence::RangeGeometryCommand{*registration});
+        expected.range = registration->range;
+        expected.geometry_revision =
+            registration->geometry_revision;
+    } else if (const auto* resize =
+                   std::get_if<range::ResizeRangeEffect>(&effect)) {
+        submitted = persistence.submit_range_geometry(
+            persistence::RangeGeometryCommand{*resize});
+        expected.range = resize->range;
+        expected.geometry_revision =
+            resize->geometry_revision;
+    } else {
+        return make_error_code(DownloadErrc::internal_error);
+    }
+    if (submitted.error || submitted.ticket == 0) {
+        return submitted.error ?
+            submitted.error :
+            make_error_code(DownloadErrc::internal_error);
+    }
+    expected.ticket = submitted.ticket;
+    return {};
+}
+
+[[nodiscard]] std::error_code apply_geometry_ack(
+    const persistence::RangeRegistrationAck& ack,
+    std::span<ExpectedGeometryAck> expected) noexcept {
+    const auto found = std::find_if(
+        expected.begin(),
+        expected.end(),
+        [&ack](const auto& candidate) {
+            return candidate.ticket == ack.ticket;
+        });
+    if (found == expected.end() ||
+        found->received ||
+        found->range != ack.range ||
+        found->geometry_revision != ack.geometry_revision ||
+        ack.error) {
+        return ack.error ?
+            ack.error :
+            make_error_code(DownloadErrc::internal_error);
+    }
+    found->received = true;
+    return {};
+}
+
+[[nodiscard]] bool all_geometry_acks_received(
+    const std::span<const ExpectedGeometryAck> expected) noexcept {
+    return std::all_of(
+        expected.begin(),
+        expected.end(),
+        [](const auto& ack) {
+            return ack.received;
+        });
+}
+
+[[nodiscard]] std::error_code wait_for_geometry_acks(
+    persistence::PersistenceThread& persistence,
+    std::vector<ExpectedGeometryAck>& expected) noexcept {
+    while (!all_geometry_acks_received(expected)) {
+        const auto polled =
+            persistence.poll_range_geometry_ack();
+        if (polled.error) {
+            return polled.error;
+        }
+        if (polled.ack.has_value()) {
+            if (const auto error = apply_geometry_ack(
+                    *polled.ack,
+                    expected);
+                error) {
+                return error;
+            }
+            continue;
+        }
+        if (const auto error = persistence.error(); error) {
+            return error;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(1));
+    }
+    return {};
+}
+
+[[nodiscard]] std::error_code drain_geometry_acks(
+    persistence::PersistenceThread& persistence,
+    std::vector<TransferHandle>& handles) noexcept {
+    while (true) {
+        const auto polled =
+            persistence.poll_range_geometry_ack();
+        if (polled.error) {
+            return polled.error;
+        }
+        if (!polled.ack.has_value()) {
+            return {};
+        }
+
+        bool matched = false;
+        for (auto& handle : handles) {
+            if (!handle.pending_lease.has_value()) {
+                continue;
+            }
+            auto expected = std::span<ExpectedGeometryAck>(
+                handle.pending_lease->acks.data(),
+                handle.pending_lease->ack_count);
+            const auto found = std::find_if(
+                expected.begin(),
+                expected.end(),
+                [&polled](const auto& candidate) {
+                    return candidate.ticket ==
+                        polled.ack->ticket;
+                });
+            if (found == expected.end()) {
+                continue;
+            }
+            matched = true;
+            if (const auto error =
+                    apply_geometry_ack(
+                        *polled.ack,
+                        expected);
+                error) {
+                return error;
+            }
+            break;
+        }
+        if (!matched) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
     }
 }
 
@@ -832,6 +985,7 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
 
     transfer.range = nullptr;
     transfer.lease.reset();
+    transfer.pending_lease.reset();
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
@@ -849,6 +1003,7 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
     // 不销毁底层 easy 对象本身。
     transfer.range = nullptr;
     transfer.lease.reset();
+    transfer.pending_lease.reset();
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
@@ -1184,11 +1339,55 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             bitmap,
             file_writer,
             metadata_store,
-            workers);
+            workers,
+            ranges.size());
         for (const auto& range : ranges) {
             persistence.register_range(range.get());
         }
         persistence.start();
+
+        std::vector<ExpectedGeometryAck> initial_geometry_acks;
+        initial_geometry_acks.reserve(
+            lifecycle_creation.effects.values.size());
+        std::error_code initial_geometry_error;
+        for (const auto& effect :
+             lifecycle_creation.effects.values) {
+            ExpectedGeometryAck expected;
+            initial_geometry_error =
+                submit_geometry_effect(
+                    effect,
+                    persistence,
+                    expected);
+            if (initial_geometry_error) {
+                break;
+            }
+            initial_geometry_acks.push_back(expected);
+        }
+        if (!initial_geometry_error) {
+            initial_geometry_error = wait_for_geometry_acks(
+                persistence,
+                initial_geometry_acks);
+        }
+        if (initial_geometry_error) {
+            const auto applied = lifecycle->apply(
+                range::EffectApplicationFailed{
+                    initial_geometry_error
+                });
+            const auto close_error =
+                packet_flow->producer().close();
+            static_cast<void>(close_error);
+            persistence.stop();
+            persistence.join();
+            file_writer.close();
+            result.error = applied.error ?
+                applied.error :
+                initial_geometry_error;
+            result.performance =
+                build_performance_summary(
+                    session,
+                    Clock::now());
+            return result;
+        }
 
         // multi handle 统一承载所有 easy handle 的事件驱动；后面的主循环通过
         // curl_multi_perform + curl_multi_wait 实现非阻塞调度。
@@ -1239,6 +1438,24 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         auto emit_progress_at = Clock::now();
         while (!failure && !session.stop_requested.load(std::memory_order_acquire)) {
+            if (const auto geometry_error =
+                    drain_geometry_acks(
+                        persistence,
+                        handles);
+                geometry_error) {
+                const auto applied = lifecycle->apply(
+                    range::EffectApplicationFailed{
+                        geometry_error
+                    });
+                failure = applied.error ?
+                    applied.error :
+                    geometry_error;
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
+
             // 主循环开始时先看 Persistence 是否已经报错。写盘或 metadata 失败后，
             // 网络层必须尽快停止继续生产数据。
             if (const auto persistence_error = persistence.error(); persistence_error) {
@@ -1249,6 +1466,59 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
             for (auto& handle : handles) {
                 if (handle.range != nullptr || handle.in_multi || failure) {
+                    continue;
+                }
+
+                if (handle.pending_lease.has_value()) {
+                    const auto expected =
+                        std::span<const ExpectedGeometryAck>(
+                            handle.pending_lease->acks.data(),
+                            handle.pending_lease->ack_count);
+                    if (!all_geometry_acks_received(expected)) {
+                        continue;
+                    }
+                    const auto lease =
+                        handle.pending_lease->lease;
+                    handle.pending_lease.reset();
+                    auto* projection = find_range_projection(
+                        ranges,
+                        lease.id.range);
+                    if (projection == nullptr) {
+                        const auto error =
+                            make_error_code(
+                                DownloadErrc::internal_error);
+                        const auto applied = lifecycle->apply(
+                            range::EffectApplicationFailed{
+                                error
+                            });
+                        failure = applied.error ?
+                            applied.error :
+                            error;
+                        session.stop_requested.store(
+                            true,
+                            std::memory_order_release);
+                        break;
+                    }
+                    const auto arm_error = arm_transfer(
+                        handle,
+                        multi,
+                        session,
+                        *projection,
+                        lease);
+                    if (arm_error) {
+                        const auto applied = lifecycle->apply(
+                            range::LeaseFailed{
+                                lease.id,
+                                lease.bytes.begin,
+                                arm_error
+                            });
+                        failure = applied.error ?
+                            applied.error :
+                            arm_error;
+                        session.stop_requested.store(
+                            true,
+                            std::memory_order_release);
+                    }
                     continue;
                 }
 
@@ -1282,9 +1552,45 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     break;
                 }
 
+                const auto lease = *acquired.lease;
+                if (acquired.effects.size > 0) {
+                    PendingLease pending;
+                    pending.lease = lease;
+                    pending.ack_count =
+                        acquired.effects.size;
+                    for (std::size_t index = 0;
+                         index < acquired.effects.size;
+                         ++index) {
+                        const auto submit_error =
+                            submit_geometry_effect(
+                                acquired.effects.values[index],
+                                persistence,
+                                pending.acks[index]);
+                        if (submit_error) {
+                            const auto applied =
+                                lifecycle->apply(
+                                    range::EffectApplicationFailed{
+                                        submit_error
+                                    });
+                            failure = applied.error ?
+                                applied.error :
+                                submit_error;
+                            session.stop_requested.store(
+                                true,
+                                std::memory_order_release);
+                            break;
+                        }
+                    }
+                    if (failure) {
+                        break;
+                    }
+                    handle.pending_lease = pending;
+                    continue;
+                }
+
                 auto* projection = find_range_projection(
                     ranges,
-                    acquired.lease->id.range);
+                    lease.id.range);
                 if (projection == nullptr) {
                     const auto error =
                         make_error_code(
@@ -1300,7 +1606,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                     break;
                 }
 
-                const auto lease = *acquired.lease;
                 const auto arm_error = arm_transfer(
                     handle,
                     multi,
@@ -1394,7 +1699,9 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
             const auto has_active = std::any_of(handles.begin(), handles.end(),
                 [](const TransferHandle& handle) {
-                    return handle.in_multi || handle.range != nullptr;
+                    return handle.in_multi ||
+                        handle.range != nullptr ||
+                        handle.pending_lease.has_value();
                 });
             if (!has_active) {
                 const auto lifecycle_snapshot =
@@ -1417,6 +1724,16 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 failure = make_error_code(DownloadErrc::http_transfer_failed);
                 session.stop_requested.store(true, std::memory_order_release);
                 break;
+            }
+        }
+
+        if (failure ||
+            session.stop_requested.load(
+                std::memory_order_acquire)) {
+            const auto cancelled =
+                lifecycle->apply(range::CancelRequested{});
+            if (!failure && cancelled.error) {
+                failure = cancelled.error;
             }
         }
 

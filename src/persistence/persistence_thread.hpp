@@ -5,19 +5,47 @@
 #include "download/download_policy.hpp"
 #include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
+#include "range/range_lifecycle.hpp"
 #include "storage/file_writer.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <deque>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace asyncdownload::persistence {
+
+using RangeRegistrationTicket = std::uint64_t;
+using RangeGeometryCommand = std::variant<
+    range::RegisterRangeEffect,
+    range::ResizeRangeEffect>;
+
+struct RangeRegistrationSubmitResult {
+    RangeRegistrationTicket ticket = 0;
+    std::error_code error;
+};
+
+struct RangeRegistrationAck {
+    RangeRegistrationTicket ticket = 0;
+    range::RangeId range{};
+    std::uint64_t geometry_revision = 0;
+    std::error_code error;
+};
+
+struct RangeRegistrationPollResult {
+    std::optional<RangeRegistrationAck> ack;
+    std::error_code error;
+};
 
 class PersistenceThread {
 public:
@@ -33,7 +61,8 @@ public:
                       core::AtomicBlockBitmap& bitmap,
                       storage::FileWriter& file_writer,
                       metadata::MetadataStore& metadata_store,
-                      BS::thread_pool<>& workers);
+                      BS::thread_pool<>& workers,
+                      std::size_t initial_range_count = 0);
     ~PersistenceThread();
 
     PersistenceThread(const PersistenceThread&) = delete;
@@ -41,6 +70,10 @@ public:
 
     // 注册一个可被该线程管理的 range。运行期 steal 出来的新 range 也会经过这里。
     void register_range(core::RangeContext* range);
+    [[nodiscard]] RangeRegistrationSubmitResult
+    submit_range_geometry(RangeGeometryCommand command) noexcept;
+    [[nodiscard]] RangeRegistrationPollResult
+    poll_range_geometry_ack() noexcept;
     // 启动后台持久化线程。
     void start();
     // 通过 enqueue shutdown 控制包请求线程收尾退出。
@@ -58,6 +91,7 @@ public:
 private:
     // 主循环：消费 packet、轮询 flush 结果、按阈值发起新的 flush。
     void process_loop();
+    void process_range_geometry() noexcept;
     // 按 packet.kind 分流到 data / range_complete / shutdown 三类处理路径。
     void handle_packet(flow::PacketLease packet);
     void handle_data_packet(flow::PacketLease packet);
@@ -107,6 +141,13 @@ private:
     std::vector<core::RangeContext*> ranges_;
     std::vector<std::unique_ptr<std::map<std::int64_t, flow::PacketLease>>>
         out_of_order_queues_;
+    const std::size_t geometry_capacity_;
+    std::mutex geometry_mutex_;
+    std::deque<std::pair<
+        RangeRegistrationTicket,
+        RangeGeometryCommand>> geometry_commands_;
+    std::deque<RangeRegistrationAck> geometry_acks_;
+    RangeRegistrationTicket next_geometry_ticket_ = 1;
     std::thread worker_thread_;
     std::future<std::error_code> pending_flush_;
     std::chrono::steady_clock::time_point last_flush_time_{std::chrono::steady_clock::now()};

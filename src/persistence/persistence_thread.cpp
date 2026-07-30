@@ -9,6 +9,8 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <type_traits>
 #include <utility>
 
 namespace asyncdownload::persistence {
@@ -23,14 +25,20 @@ PersistenceThread::PersistenceThread(core::SessionState& session,
                                      core::AtomicBlockBitmap& bitmap,
                                      storage::FileWriter& file_writer,
                                      metadata::MetadataStore& metadata_store,
-                                     BS::thread_pool<>& workers)
+                                     BS::thread_pool<>& workers,
+                                     const std::size_t initial_range_count)
     : session_(session),
       policy_(std::move(policy)),
       packet_consumer_(packet_consumer),
       bitmap_(bitmap),
       file_writer_(file_writer),
       metadata_store_(metadata_store),
-      workers_(workers) {}
+      workers_(workers),
+      geometry_capacity_(std::max(
+          initial_range_count,
+          2 * session.effective_policy
+                  .scheduling()
+                  .connection_limit)) {}
 
 PersistenceThread::~PersistenceThread() {
     stop();
@@ -50,6 +58,57 @@ void PersistenceThread::register_range(core::RangeContext* range) {
         out_of_order_queues_[range->range_id] =
             std::make_unique<
                 std::map<std::int64_t, flow::PacketLease>>();
+    }
+}
+
+RangeRegistrationSubmitResult
+PersistenceThread::submit_range_geometry(
+    RangeGeometryCommand command) noexcept {
+    try {
+        std::scoped_lock lock(geometry_mutex_);
+        if (geometry_commands_.size() >= geometry_capacity_ ||
+            next_geometry_ticket_ ==
+                std::numeric_limits<
+                    RangeRegistrationTicket>::max()) {
+            return {
+                0,
+                make_error_code(DownloadErrc::internal_error)
+            };
+        }
+        const auto ticket = next_geometry_ticket_;
+        geometry_commands_.emplace_back(
+            ticket,
+            std::move(command));
+        ++next_geometry_ticket_;
+        return {ticket, {}};
+    } catch (const std::bad_alloc&) {
+        return {
+            0,
+            std::make_error_code(std::errc::not_enough_memory)
+        };
+    } catch (...) {
+        return {
+            0,
+            make_error_code(DownloadErrc::internal_error)
+        };
+    }
+}
+
+RangeRegistrationPollResult
+PersistenceThread::poll_range_geometry_ack() noexcept {
+    try {
+        std::scoped_lock lock(geometry_mutex_);
+        if (geometry_acks_.empty()) {
+            return {};
+        }
+        auto ack = std::move(geometry_acks_.front());
+        geometry_acks_.pop_front();
+        return {std::move(ack), {}};
+    } catch (...) {
+        return {
+            {},
+            make_error_code(DownloadErrc::internal_error)
+        };
     }
 }
 
@@ -94,6 +153,10 @@ void PersistenceThread::process_loop() {
     // DataPacket 收敛成一条严格有序、按对齐规则落盘、并能周期性生成恢复元数据
     // 的持久化流水线。
     while (true) {
+        process_range_geometry();
+        if (error()) {
+            break;
+        }
         flow::PacketLease packet;
         const auto received = packet_consumer_.receive(
             packet, std::chrono::microseconds(100000));
@@ -117,6 +180,98 @@ void PersistenceThread::process_loop() {
     // 主循环退出并不代表最后一轮 flush 已经完成，所以这里还要等待挂起中的
     // flush/meta 任务结束，确保退出时磁盘和 metadata 是同一个版本。
     wait_pending_flush();
+}
+
+void PersistenceThread::process_range_geometry() noexcept {
+    while (true) {
+        std::optional<std::pair<
+            RangeRegistrationTicket,
+            RangeGeometryCommand>> pending;
+        try {
+            {
+                std::scoped_lock lock(geometry_mutex_);
+                if (geometry_commands_.empty()) {
+                    return;
+                }
+                pending.emplace(
+                    std::move(geometry_commands_.front()));
+                geometry_commands_.pop_front();
+            }
+
+            RangeRegistrationAck ack;
+            ack.ticket = pending->first;
+            std::visit(
+                [this, &ack](const auto& effect) {
+                    ack.range = effect.range;
+                    ack.geometry_revision =
+                        effect.geometry_revision;
+                    if (effect.range.value >
+                            std::numeric_limits<
+                                std::size_t>::max()) {
+                        ack.error = make_error_code(
+                            DownloadErrc::internal_error);
+                        return;
+                    }
+                    const auto* projection = lookup_range(
+                        static_cast<std::size_t>(
+                            effect.range.value));
+                    if (projection == nullptr) {
+                        ack.error = make_error_code(
+                            DownloadErrc::internal_error);
+                        return;
+                    }
+                    if constexpr (std::is_same_v<
+                                      std::decay_t<
+                                          decltype(effect)>,
+                                      range::RegisterRangeEffect>) {
+                        const auto end =
+                            projection->end_offset.load(
+                                std::memory_order_acquire);
+                        if (projection->start_offset !=
+                                effect.bytes.begin ||
+                            end ==
+                                std::numeric_limits<
+                                    std::int64_t>::max() ||
+                            end + 1 != effect.bytes.end) {
+                            ack.error = make_error_code(
+                                DownloadErrc::internal_error);
+                        }
+                    } else {
+                        const auto end =
+                            projection->end_offset.load(
+                                std::memory_order_acquire);
+                        if (end ==
+                                std::numeric_limits<
+                                    std::int64_t>::max() ||
+                            end + 1 != effect.new_end) {
+                            ack.error = make_error_code(
+                                DownloadErrc::internal_error);
+                        }
+                    }
+                },
+                pending->second);
+
+            {
+                std::scoped_lock lock(geometry_mutex_);
+                if (geometry_acks_.size() >=
+                    geometry_capacity_) {
+                    set_error(make_error_code(
+                        DownloadErrc::internal_error));
+                    return;
+                }
+                geometry_acks_.push_back(std::move(ack));
+            }
+        } catch (const std::bad_alloc&) {
+            set_error(
+                std::make_error_code(
+                    std::errc::not_enough_memory));
+            return;
+        } catch (...) {
+            set_error(make_error_code(
+                DownloadErrc::internal_error));
+            return;
+        }
+    }
 }
 
 void PersistenceThread::handle_packet(flow::PacketLease packet) {
