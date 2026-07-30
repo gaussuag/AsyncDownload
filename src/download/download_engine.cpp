@@ -349,7 +349,12 @@ void rebuild_bitmap_from_ranges(
                         registration->range.value),
                     registration->bytes.begin,
                     registration->bytes.end - 1);
-            persistence.register_range(projection.get());
+            if (const auto registration_error =
+                    persistence.register_range(
+                        projection.get());
+                registration_error) {
+                return registration_error;
+            }
             ranges.push_back(std::move(projection));
         }
         return {};
@@ -1338,8 +1343,31 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             metadata_store,
             workers,
             ranges.size());
+        std::error_code projection_error;
         for (const auto& range : ranges) {
-            persistence.register_range(range.get());
+            projection_error =
+                persistence.register_range(range.get());
+            if (projection_error) {
+                break;
+            }
+        }
+        if (projection_error) {
+            const auto applied = lifecycle->apply(
+                range::EffectApplicationFailed{
+                    projection_error
+                });
+            const auto close_error =
+                packet_flow->producer().close();
+            static_cast<void>(close_error);
+            file_writer.close();
+            result.error = applied.error ?
+                applied.error :
+                projection_error;
+            result.performance =
+                build_performance_summary(
+                    session,
+                    Clock::now());
+            return result;
         }
         persistence.start();
 

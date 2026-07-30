@@ -2,6 +2,7 @@
 
 #include "asyncdownload/error.hpp"
 #include "download/range_scheduler.hpp"
+#include "range/range_fault_adapter.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -266,6 +267,11 @@ RangeLifecycleCreation RangeLifecycle::create(
     }
 
     try {
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+        detail::fail_if_requested(
+            detail::range_fault_plan()
+                .fail_next_create_allocation);
+#endif
         auto implementation =
             std::make_unique<Implementation>(
                 total_size, scheduling);
@@ -787,6 +793,11 @@ SnapshotResult RangeLifecycle::snapshot() const noexcept {
         return result;
     }
     try {
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+        detail::fail_if_requested(
+            detail::range_fault_plan()
+                .fail_next_snapshot_allocation);
+#endif
         result.value.ranges.reserve(
             implementation.ranges.size());
         for (const auto& record : implementation.ranges) {

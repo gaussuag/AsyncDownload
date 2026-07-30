@@ -4,6 +4,7 @@
 #include "core/alignment.hpp"
 #include "core/constants.hpp"
 #include "core/crc32.hpp"
+#include "range/range_fault_adapter.hpp"
 
 #include <algorithm>
 #include <array>
@@ -45,30 +46,49 @@ PersistenceThread::~PersistenceThread() {
     join();
 }
 
-void PersistenceThread::register_range(core::RangeContext* range) {
+std::error_code PersistenceThread::register_range(
+    core::RangeContext* range) noexcept {
     // Orchestrator 可能在运行期追加被 steal 出来的新 range，所以这里不能假设
     // ranges_ 在启动时就固定不变。
-    std::scoped_lock lock(ranges_mutex_);
-    if (range->range_id >= ranges_.size()) {
-        ranges_.resize(range->range_id + 1);
+    if (range == nullptr) {
+        return make_error_code(DownloadErrc::internal_error);
     }
-    auto& state = ranges_[range->range_id];
-    if (!state) {
-        state = std::make_unique<RangeWriteState>();
-        state->id = {
-            static_cast<std::uint64_t>(range->range_id)
-        };
-        state->bytes = {
-            range->start_offset,
-            range->end_offset.load(
-                std::memory_order_acquire) + 1
-        };
-        state->observed_dispatch_through =
-            range->start_offset;
-        state->persisted_through =
-            range->persisted_offset;
+    try {
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+        range::detail::fail_if_requested(
+            range::detail::range_fault_plan()
+                .fail_next_write_state_allocation);
+#endif
+        std::scoped_lock lock(ranges_mutex_);
+        if (range->range_id >= ranges_.size()) {
+            ranges_.resize(range->range_id + 1);
+        }
+        auto& state = ranges_[range->range_id];
+        if (!state) {
+            auto created =
+                std::make_unique<RangeWriteState>();
+            created->id = {
+                static_cast<std::uint64_t>(range->range_id)
+            };
+            created->bytes = {
+                range->start_offset,
+                range->end_offset.load(
+                    std::memory_order_acquire) + 1
+            };
+            created->observed_dispatch_through =
+                range->start_offset;
+            created->persisted_through =
+                range->persisted_offset;
+            state = std::move(created);
+        }
+        state->legacy_projection = range;
+        return {};
+    } catch (const std::bad_alloc&) {
+        return std::make_error_code(
+            std::errc::not_enough_memory);
+    } catch (...) {
+        return make_error_code(DownloadErrc::internal_error);
     }
-    state->legacy_projection = range;
 }
 
 RangeRegistrationSubmitResult
@@ -85,6 +105,11 @@ PersistenceThread::submit_range_geometry(
                 make_error_code(DownloadErrc::internal_error)
             };
         }
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+        range::detail::fail_if_requested(
+            range::detail::range_fault_plan()
+                .fail_next_geometry_submit_allocation);
+#endif
         const auto ticket = next_geometry_ticket_;
         geometry_commands_.emplace_back(
             ticket,
@@ -392,27 +417,57 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
             data->payload.size() +
             sizeof(flow::DataPacket) +
             core::kMapNodeOverheadBytes;
-        if (const auto account_error =
-                packet.account_reorder_node();
-            account_error) {
-            packet.complete();
-            set_error(account_error);
-            return;
-        }
-        ++current_out_of_order_packets_;
-        current_out_of_order_bytes_ +=
-            static_cast<std::int64_t>(packet_bytes);
-        const auto offset = data->offset;
-        const auto [position, inserted] =
-            range->out_of_order.emplace(
-                offset,
-                std::move(packet));
-        static_cast<void>(position);
-        if (!inserted) {
-            --current_out_of_order_packets_;
-            current_out_of_order_bytes_ -=
+        bool reorder_accounted = false;
+        try {
+            if (const auto account_error =
+                    packet.account_reorder_node();
+                account_error) {
+                packet.complete();
+                set_error(account_error);
+                return;
+            }
+            reorder_accounted = true;
+            ++current_out_of_order_packets_;
+            current_out_of_order_bytes_ +=
                 static_cast<std::int64_t>(packet_bytes);
-            set_error(make_error_code(DownloadErrc::internal_error));
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+            range::detail::fail_if_requested(
+                range::detail::range_fault_plan()
+                    .fail_next_reorder_allocation);
+#endif
+            const auto offset = data->offset;
+            const auto [position, inserted] =
+                range->out_of_order.emplace(
+                    offset,
+                    std::move(packet));
+            static_cast<void>(position);
+            if (!inserted) {
+                --current_out_of_order_packets_;
+                current_out_of_order_bytes_ -=
+                    static_cast<std::int64_t>(packet_bytes);
+                set_error(make_error_code(
+                    DownloadErrc::internal_error));
+                return;
+            }
+        } catch (const std::bad_alloc&) {
+            if (reorder_accounted) {
+                --current_out_of_order_packets_;
+                current_out_of_order_bytes_ -=
+                    static_cast<std::int64_t>(packet_bytes);
+            }
+            packet.complete();
+            set_error(std::make_error_code(
+                std::errc::not_enough_memory));
+            return;
+        } catch (...) {
+            if (reorder_accounted) {
+                --current_out_of_order_packets_;
+                current_out_of_order_bytes_ -=
+                    static_cast<std::int64_t>(packet_bytes);
+            }
+            packet.complete();
+            set_error(make_error_code(
+                DownloadErrc::internal_error));
             return;
         }
         update_gap_flag(*range);

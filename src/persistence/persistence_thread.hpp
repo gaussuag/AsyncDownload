@@ -70,7 +70,8 @@ public:
     PersistenceThread& operator=(const PersistenceThread&) = delete;
 
     // 注册一个可被该线程管理的 range。运行期 steal 出来的新 range 也会经过这里。
-    void register_range(core::RangeContext* range);
+    [[nodiscard]] std::error_code
+    register_range(core::RangeContext* range) noexcept;
     [[nodiscard]] RangeRegistrationSubmitResult
     submit_range_geometry(RangeGeometryCommand command) noexcept;
     [[nodiscard]] RangeRegistrationPollResult

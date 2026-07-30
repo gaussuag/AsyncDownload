@@ -168,7 +168,7 @@ void persist_single_range_at_tail_capacity(
         workers);
 
     asyncdownload::core::RangeContext range(0, 0, total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket packet{};
@@ -266,7 +266,7 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket packet{};
@@ -325,7 +325,7 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket packet{};
@@ -387,7 +387,7 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket packet{};
@@ -451,7 +451,7 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket packet{};
@@ -514,7 +514,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
         session, policy, packet_flow->consumer(), bitmap, writer, store, workers);
 
     asyncdownload::core::RangeContext range(0, 0, session.total_size - 1);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     TestPacket tail_packet{};
@@ -610,7 +610,7 @@ TEST(
         workers,
         1);
     asyncdownload::core::RangeContext range(0, 0, 4095);
-    persistence.register_range(&range);
+    ASSERT_FALSE(persistence.register_range(&range));
     persistence.start();
 
     const auto registered = persistence.submit_range_geometry(
