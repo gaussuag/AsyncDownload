@@ -107,6 +107,9 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
         omit_content_length = (
             self.command == "HEAD"
             and self.server.omit_head_content_length
+        ) or (
+            self.command == "GET"
+            and self.server.omit_get_content_length
         )
 
         self.send_response(status)
@@ -135,7 +138,17 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", content_encoding)
         self.end_headers()
 
-        body_bytes = content_length if send_body else 0
+        body_bytes = max(
+            0,
+            content_length +
+            self.server.body_length_delta,
+        ) if send_body else 0
+        if (
+            self.server.close_after_bytes > 0
+            and body_bytes >
+                self.server.close_after_bytes
+        ):
+            body_bytes = self.server.close_after_bytes
         self.server.record_request(
             self.command,
             self.request_version,
@@ -153,7 +166,7 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
 
         with open(file_path, "rb") as stream:
             stream.seek(start)
-            remaining = content_length
+            remaining = body_bytes
             while remaining > 0:
                 chunk = stream.read(min(self.server.chunk_size, remaining))
                 if not chunk:
@@ -163,6 +176,8 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
                 if self.server.delay_ms > 0:
                     time.sleep(self.server.delay_ms / 1000.0)
+        if self.server.close_after_bytes > 0:
+            self.close_connection = True
 
 
 class RangeServer(ThreadingHTTPServer):
@@ -179,6 +194,7 @@ class RangeServer(ThreadingHTTPServer):
         ignore_range_requests,
         head_status,
         omit_head_content_length,
+        omit_get_content_length,
         content_range_start_delta,
         content_range_total_delta,
         content_range_value,
@@ -189,6 +205,8 @@ class RangeServer(ThreadingHTTPServer):
         get_status,
         force_content_encoding,
         force_get_content_encoding,
+        body_length_delta,
+        close_after_bytes,
         redirect_path,
     ):
         super().__init__(server_address, RangeRequestHandler)
@@ -200,6 +218,7 @@ class RangeServer(ThreadingHTTPServer):
         self.ignore_range_requests = ignore_range_requests
         self.head_status = head_status
         self.omit_head_content_length = omit_head_content_length
+        self.omit_get_content_length = omit_get_content_length
         self.content_range_start_delta = content_range_start_delta
         self.content_range_total_delta = content_range_total_delta
         self.content_range_value = content_range_value
@@ -210,6 +229,8 @@ class RangeServer(ThreadingHTTPServer):
         self.get_status = get_status
         self.force_content_encoding = force_content_encoding
         self.force_get_content_encoding = force_get_content_encoding
+        self.body_length_delta = body_length_delta
+        self.close_after_bytes = close_after_bytes
         self.redirect_path = redirect_path
         self.request_log_lock = threading.Lock()
         self.request_ordinal = 0
@@ -262,6 +283,7 @@ def main():
     parser.add_argument("--ignore-range-requests", action="store_true")
     parser.add_argument("--head-status", type=int, default=200)
     parser.add_argument("--omit-head-content-length", action="store_true")
+    parser.add_argument("--omit-get-content-length", action="store_true")
     parser.add_argument("--content-range-start-delta", type=int, default=0)
     parser.add_argument("--content-range-total-delta", type=int, default=0)
     parser.add_argument("--content-range-value", default="")
@@ -272,16 +294,19 @@ def main():
     parser.add_argument("--get-status", type=int, default=0)
     parser.add_argument("--force-content-encoding", default="")
     parser.add_argument("--force-get-content-encoding", default="")
+    parser.add_argument("--body-length-delta", type=int, default=0)
+    parser.add_argument("--close-after-bytes", type=int, default=0)
     parser.add_argument("--redirect-path", default="")
     args = parser.parse_args()
 
     server = RangeServer((args.host, args.port), os.path.abspath(args.file_path), args.chunk_size,
         args.delay_ms, args.request_log, args.disable_ranges, args.ignore_range_requests,
-        args.head_status, args.omit_head_content_length, args.content_range_start_delta,
-        args.content_range_total_delta, args.content_range_value, args.accept_ranges_value,
-        args.omit_content_range, args.duplicate_content_range, args.content_length_delta,
-        args.get_status, args.force_content_encoding, args.force_get_content_encoding,
-        args.redirect_path)
+        args.head_status, args.omit_head_content_length, args.omit_get_content_length,
+        args.content_range_start_delta, args.content_range_total_delta,
+        args.content_range_value, args.accept_ranges_value, args.omit_content_range,
+        args.duplicate_content_range, args.content_length_delta, args.get_status,
+        args.force_content_encoding, args.force_get_content_encoding,
+        args.body_length_delta, args.close_after_bytes, args.redirect_path)
     actual_port = server.server_address[1]
     print(actual_port, flush=True)
     try:

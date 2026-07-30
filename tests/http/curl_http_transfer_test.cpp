@@ -1,5 +1,6 @@
 #include "http/http_transfer.hpp"
 
+#include "asyncdownload/error.hpp"
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "flow/packet_flow.hpp"
 
@@ -77,7 +78,8 @@ std::filesystem::path test_workspace_root() {
 bool start_python_server(
     PythonServer& server,
     const std::filesystem::path& source,
-    const std::filesystem::path& request_log) {
+    const std::filesystem::path& request_log,
+    const std::wstring& extra_arguments = L"") {
     SECURITY_ATTRIBUTES attributes{};
     attributes.nLength = sizeof(attributes);
     attributes.bInheritHandle = TRUE;
@@ -111,7 +113,8 @@ bool start_python_server(
         quote_process_arg(script.wstring()) + L" " +
         quote_process_arg(source.wstring()) +
         L" --port 0 --request-log " +
-        quote_process_arg(request_log.wstring());
+        quote_process_arg(request_log.wstring()) +
+        extra_arguments;
     const auto started = CreateProcessW(
         nullptr,
         command.data(),
@@ -224,6 +227,33 @@ protected:
             {0, 1024},
             true
         };
+    }
+
+    asyncdownload::http::HttpPollResult
+    poll_until_event(
+        asyncdownload::http::HttpTransferSession& session,
+        const std::chrono::milliseconds timeout) {
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            timeout;
+        asyncdownload::http::HttpPollResult result{};
+        while (std::chrono::steady_clock::now() <
+               deadline) {
+            result = session.poll(
+                std::chrono::milliseconds(50));
+            if (result.code ==
+                asyncdownload::http::
+                    HttpPollCode::event ||
+                result.code ==
+                asyncdownload::http::
+                    HttpPollCode::failed ||
+                result.code ==
+                asyncdownload::http::
+                    HttpPollCode::closed) {
+                return result;
+            }
+        }
+        return result;
     }
 
     asyncdownload::telemetry::TelemetrySession
@@ -475,6 +505,306 @@ TEST_F(
         }
     }
     EXPECT_EQ(get_count, 2U);
+    const auto removed =
+        std::filesystem::remove_all(root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST_F(
+    CurlHttpTransferTest,
+    ClassifiesCleanShortBodyAsProtocolFailure) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This test currently uses Windows process control.";
+#else
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("asyncdownload_curl_short_" +
+         std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    ASSERT_FALSE(ec);
+    const auto source = root / "source.bin";
+    const auto request_log = root / "requests.log";
+    {
+        std::ofstream stream(
+            source,
+            std::ios::binary |
+                std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        const std::array<char, 5> bytes{
+            1,
+            2,
+            3,
+            4,
+            5
+        };
+        stream.write(
+            bytes.data(),
+            static_cast<std::streamsize>(
+                bytes.size()));
+    }
+
+    PythonServer server;
+    ASSERT_TRUE(start_python_server(
+        server,
+        source,
+        request_log,
+        L" --omit-get-content-length"
+        L" --body-length-delta -1"));
+    const auto server_port =
+        read_server_port(server);
+    ASSERT_FALSE(server_port.empty());
+    auto session = open_session(
+        "http://127.0.0.1:" + server_port +
+            "/source.bin",
+        5,
+        1);
+    const asyncdownload::range::RangeLease
+        requested{
+            {{1}, 1},
+            {0, 4},
+            true
+        };
+    ASSERT_EQ(
+        session->start(requested).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+
+    const auto result =
+        poll_until_event(
+            *session,
+            std::chrono::seconds(2));
+    ASSERT_EQ(
+        result.code,
+        asyncdownload::http::
+            HttpPollCode::event);
+    ASSERT_TRUE(result.event.has_value());
+    const auto* failure =
+        std::get_if<
+            asyncdownload::http::
+                HttpLeaseFailed>(
+            &*result.event);
+    ASSERT_NE(failure, nullptr);
+    EXPECT_EQ(
+        failure->failure.reason,
+        asyncdownload::http::
+            HttpFailureReason::body_too_short);
+    EXPECT_EQ(
+        failure->failure.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                http_invalid_response));
+    EXPECT_EQ(failure->accepted_through, 3);
+    EXPECT_TRUE(session->close());
+    server.stop();
+
+    const auto removed =
+        std::filesystem::remove_all(root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST_F(
+    CurlHttpTransferTest,
+    TerminatesLongBodyAsProtocolFailure) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This test currently uses Windows process control.";
+#else
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("asyncdownload_curl_long_" +
+         std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    ASSERT_FALSE(ec);
+    const auto source = root / "source.bin";
+    const auto request_log = root / "requests.log";
+    {
+        std::ofstream stream(
+            source,
+            std::ios::binary |
+                std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        const std::array<char, 5> bytes{
+            1,
+            2,
+            3,
+            4,
+            5
+        };
+        stream.write(
+            bytes.data(),
+            static_cast<std::streamsize>(
+                bytes.size()));
+    }
+
+    PythonServer server;
+    ASSERT_TRUE(start_python_server(
+        server,
+        source,
+        request_log,
+        L" --chunk-size 4"
+        L" --omit-get-content-length"
+        L" --body-length-delta 1"));
+    const auto server_port =
+        read_server_port(server);
+    ASSERT_FALSE(server_port.empty());
+    auto session = open_session(
+        "http://127.0.0.1:" + server_port +
+            "/source.bin",
+        5,
+        1);
+    const asyncdownload::range::RangeLease
+        requested{
+            {{1}, 1},
+            {0, 4},
+            true
+        };
+    ASSERT_EQ(
+        session->start(requested).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+
+    const auto result =
+        poll_until_event(
+            *session,
+            std::chrono::seconds(1));
+    EXPECT_EQ(
+        result.code,
+        asyncdownload::http::
+            HttpPollCode::event);
+    if (result.code ==
+            asyncdownload::http::
+                HttpPollCode::event &&
+        result.event.has_value()) {
+        const auto* failure =
+            std::get_if<
+                asyncdownload::http::
+                    HttpLeaseFailed>(
+                &*result.event);
+        ASSERT_NE(failure, nullptr);
+        EXPECT_EQ(
+            failure->failure.reason,
+            asyncdownload::http::
+                HttpFailureReason::body_too_long);
+        EXPECT_EQ(
+            failure->failure.error,
+            asyncdownload::make_error_code(
+                asyncdownload::DownloadErrc::
+                    http_invalid_response));
+        EXPECT_EQ(failure->accepted_through, 4);
+    } else {
+        static_cast<void>(
+            session->cancel({
+                asyncdownload::http::
+                    HttpCancelKind::task_cancelled,
+                {}
+            }));
+        static_cast<void>(
+            session->poll(
+                std::chrono::milliseconds(0)));
+    }
+    EXPECT_TRUE(session->close());
+    server.stop();
+
+    const auto removed =
+        std::filesystem::remove_all(root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST_F(
+    CurlHttpTransferTest,
+    PreservesTransportFailureForTruncatedConnection) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This test currently uses Windows process control.";
+#else
+    const auto root =
+        std::filesystem::temp_directory_path() /
+        ("asyncdownload_curl_transport_" +
+         std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+    ASSERT_FALSE(ec);
+    const auto source = root / "source.bin";
+    const auto request_log = root / "requests.log";
+    {
+        std::ofstream stream(
+            source,
+            std::ios::binary |
+                std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        const std::array<char, 5> bytes{
+            1,
+            2,
+            3,
+            4,
+            5
+        };
+        stream.write(
+            bytes.data(),
+            static_cast<std::streamsize>(
+                bytes.size()));
+    }
+
+    PythonServer server;
+    ASSERT_TRUE(start_python_server(
+        server,
+        source,
+        request_log,
+        L" --chunk-size 2"
+        L" --close-after-bytes 2"));
+    const auto server_port =
+        read_server_port(server);
+    ASSERT_FALSE(server_port.empty());
+    auto session = open_session(
+        "http://127.0.0.1:" + server_port +
+            "/source.bin",
+        5,
+        1);
+    const asyncdownload::range::RangeLease
+        requested{
+            {{1}, 1},
+            {0, 4},
+            true
+        };
+    ASSERT_EQ(
+        session->start(requested).code,
+        asyncdownload::http::
+            HttpStartCode::started);
+
+    const auto result =
+        poll_until_event(
+            *session,
+            std::chrono::seconds(2));
+    ASSERT_EQ(
+        result.code,
+        asyncdownload::http::
+            HttpPollCode::event);
+    ASSERT_TRUE(result.event.has_value());
+    const auto* failure =
+        std::get_if<
+            asyncdownload::http::
+                HttpLeaseFailed>(
+            &*result.event);
+    ASSERT_NE(failure, nullptr);
+    EXPECT_EQ(
+        failure->failure.reason,
+        asyncdownload::http::
+            HttpFailureReason::transport_failed);
+    EXPECT_EQ(
+        failure->failure.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                http_transfer_failed));
+    EXPECT_EQ(failure->accepted_through, 2);
+    EXPECT_TRUE(session->close());
+    server.stop();
+
     const auto removed =
         std::filesystem::remove_all(root, ec);
     static_cast<void>(removed);

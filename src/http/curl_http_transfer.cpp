@@ -929,9 +929,14 @@ private:
         if (remaining < 0 ||
             bytes > static_cast<std::uint64_t>(
                         remaining)) {
-            slot.curl_receive_paused = true;
+            slot.callback_failure =
+                make_failure(
+                    HttpFailureReason::
+                        body_too_long,
+                    DownloadErrc::
+                        http_invalid_response);
             finish_callback();
-            return CURL_WRITEFUNC_PAUSE;
+            return CURL_WRITEFUNC_ERROR;
         }
         const flow::DataChunk chunk{
             slot.lease->id,
@@ -1237,7 +1242,7 @@ private:
             failure = make_failure(
                 HttpFailureReason::body_too_short,
                 DownloadErrc::
-                    http_transfer_failed);
+                    http_invalid_response);
         }
 
         if (failure.error) {
