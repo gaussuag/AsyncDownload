@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <future>
@@ -251,6 +252,51 @@ TEST_F(PacketFlowFaultTest, ConsumerFailWaitsForAndDrainsActiveProducer) {
         asyncdownload::flow::PacketFlowState::failed);
     EXPECT_EQ(snapshot.queued_packets, 0U);
     EXPECT_EQ(snapshot.accounted_bytes, 0U);
+}
+
+TEST_F(PacketFlowFaultTest, CloseFailRaceIsBoundedForOneHundredRounds) {
+    for (std::size_t round = 0; round < 100; ++round) {
+        std::barrier start(2);
+        std::promise<asyncdownload::flow::PacketFlow*> ready;
+        std::promise<void> consumer_done;
+        asyncdownload::telemetry::TelemetrySession telemetry;
+        auto producer = std::async(std::launch::async, [&]() {
+            std::unique_ptr<asyncdownload::flow::PacketFlow> flow;
+            const auto created =
+                asyncdownload::flow::PacketFlow::create(
+                    fault_policy(), telemetry, flow);
+            if (created) {
+                ready.set_value(nullptr);
+                return std::pair{
+                    created,
+                    asyncdownload::flow::PacketFlowSnapshot{}
+                };
+            }
+            ready.set_value(flow.get());
+            start.arrive_and_wait();
+            const auto closed = flow->producer().close();
+            consumer_done.get_future().wait();
+            return std::pair{
+                closed,
+                flow->producer().snapshot()
+            };
+        });
+        auto* flow = ready.get_future().get();
+        ASSERT_NE(flow, nullptr);
+        start.arrive_and_wait();
+        const auto failed = flow->consumer().fail(
+            std::make_error_code(std::errc::io_error));
+        consumer_done.set_value();
+        const auto [close_error, snapshot] = producer.get();
+        static_cast<void>(close_error);
+
+        EXPECT_FALSE(failed);
+        EXPECT_EQ(
+            snapshot.state,
+            asyncdownload::flow::PacketFlowState::failed);
+        EXPECT_EQ(snapshot.queued_packets, 0U);
+        EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    }
 }
 
 }

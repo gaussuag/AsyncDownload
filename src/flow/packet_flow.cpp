@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -527,6 +528,12 @@ std::error_code PacketProducer::open_lane(ProducerLane& lane) noexcept {
     });
 
     try {
+        if (implementation.lanes.size() >=
+            std::numeric_limits<PacketLaneId>::max()) {
+            implementation.fail(
+                make_error_code(DownloadErrc::internal_error));
+            return implementation.first_error();
+        }
         auto state = std::make_unique<LaneState>();
         state->id = static_cast<PacketLaneId>(
             implementation.lanes.size() + 1);
@@ -536,9 +543,9 @@ std::error_code PacketProducer::open_lane(ProducerLane& lane) noexcept {
             implementation.lanes.size() + 1);
         implementation.seen_scratch.resize(
             implementation.lanes.size() + 2, 0);
-        lane.owner_ = &owner_;
-        lane.id_ = state->id;
         implementation.lanes.push_back(std::move(state));
+        lane.owner_ = &owner_;
+        lane.id_ = implementation.lanes.back()->id;
         return {};
     } catch (const std::bad_alloc&) {
         implementation.fail(
@@ -554,6 +561,7 @@ PacketAdmission PacketProducer::accept(
     ProducerLane& lane,
     const DataChunk chunk) noexcept {
     auto& implementation = *owner_.implementation_;
+    assert(implementation.producer_thread_matches());
     auto* lane_state = implementation.find_lane(lane);
     if (lane_state == nullptr) {
         return {
@@ -738,6 +746,7 @@ PacketAdmission PacketProducer::accept(
 
 PacketAdmission PacketProducer::flush(ProducerLane& lane) noexcept {
     auto& implementation = *owner_.implementation_;
+    assert(implementation.producer_thread_matches());
     auto* lane_state = implementation.find_lane(lane);
     if (lane_state == nullptr) {
         return {
