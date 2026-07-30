@@ -143,3 +143,134 @@ TEST(RangeSchedulerTest, FinalShortWindowEndsAtObjectBoundary) {
     EXPECT_EQ(window.first, 9000);
     EXPECT_EQ(window.second, 9999);
 }
+
+TEST(RangeSchedulerTest, StealsAtExactlyTwoBlockBoundary) {
+    const auto policy = range_policy();
+    asyncdownload::download::RangeScheduler scheduler(
+        policy,
+        2LL * policy.block_bytes);
+    std::vector<std::unique_ptr<asyncdownload::core::RangeContext>> ranges;
+    ranges.push_back(std::make_unique<asyncdownload::core::RangeContext>(
+        0,
+        0,
+        2LL * policy.block_bytes - 1));
+
+    auto stolen = scheduler.steal_largest_range(ranges);
+
+    ASSERT_NE(stolen, nullptr);
+    EXPECT_EQ(stolen->start_offset, policy.block_bytes);
+    EXPECT_EQ(
+        ranges.front()->end_offset.load(std::memory_order_acquire),
+        policy.block_bytes - 1);
+}
+
+TEST(RangeSchedulerTest, ChangesStealThresholdAtSixteenConnections) {
+    auto fifteen_policy = range_policy();
+    fifteen_policy.connection_limit = 15;
+    fifteen_policy.transfer_window_bytes =
+        4 * fifteen_policy.block_bytes;
+    auto sixteen_policy = fifteen_policy;
+    sixteen_policy.connection_limit = 16;
+    const auto total_size = 4LL * fifteen_policy.block_bytes;
+    asyncdownload::download::RangeScheduler fifteen(
+        fifteen_policy, total_size);
+    asyncdownload::download::RangeScheduler sixteen(
+        sixteen_policy, total_size);
+    std::vector<std::unique_ptr<asyncdownload::core::RangeContext>>
+        fifteen_ranges;
+    std::vector<std::unique_ptr<asyncdownload::core::RangeContext>>
+        sixteen_ranges;
+    fifteen_ranges.push_back(
+        std::make_unique<asyncdownload::core::RangeContext>(
+            0, 0, total_size - 1));
+    sixteen_ranges.push_back(
+        std::make_unique<asyncdownload::core::RangeContext>(
+            0, 0, total_size - 1));
+
+    const auto fifteen_stolen =
+        fifteen.steal_largest_range(fifteen_ranges);
+    const auto sixteen_stolen =
+        sixteen.steal_largest_range(sixteen_ranges);
+
+    EXPECT_NE(fifteen_stolen, nullptr);
+    EXPECT_EQ(sixteen_stolen, nullptr);
+}
+
+TEST(RangeSchedulerTest, BreaksLargestCandidateTieByInputOrder) {
+    const auto policy = range_policy();
+    const auto extent = 4LL * policy.block_bytes;
+    asyncdownload::download::RangeScheduler scheduler(
+        policy, 2 * extent);
+    std::vector<std::unique_ptr<asyncdownload::core::RangeContext>> ranges;
+    ranges.push_back(std::make_unique<asyncdownload::core::RangeContext>(
+        7, 0, extent - 1));
+    ranges.push_back(std::make_unique<asyncdownload::core::RangeContext>(
+        3, extent, 2 * extent - 1));
+    const auto first_end =
+        ranges[0]->end_offset.load(std::memory_order_acquire);
+    const auto second_end =
+        ranges[1]->end_offset.load(std::memory_order_acquire);
+
+    const auto stolen = scheduler.steal_largest_range(ranges);
+
+    ASSERT_NE(stolen, nullptr);
+    EXPECT_LT(
+        ranges[0]->end_offset.load(std::memory_order_acquire),
+        first_end);
+    EXPECT_EQ(
+        ranges[1]->end_offset.load(std::memory_order_acquire),
+        second_end);
+}
+
+TEST(RangeSchedulerTest, NeverCutsAnAlreadyDispatchedWindow) {
+    const auto policy = range_policy();
+    const auto total_size = 16LL * policy.block_bytes;
+    asyncdownload::download::RangeScheduler scheduler(
+        policy, total_size);
+    std::vector<std::unique_ptr<asyncdownload::core::RangeContext>> ranges;
+    ranges.push_back(std::make_unique<asyncdownload::core::RangeContext>(
+        0, 0, total_size - 1));
+    const auto dispatched_through = 4LL * policy.block_bytes;
+    ranges.front()->current_offset.store(
+        dispatched_through, std::memory_order_release);
+
+    const auto stolen = scheduler.steal_largest_range(ranges);
+
+    ASSERT_NE(stolen, nullptr);
+    EXPECT_GT(stolen->start_offset, dispatched_through);
+}
+
+TEST(RangeSchedulerTest, CoversFileShorterThanOneBlock) {
+    const auto policy = range_policy();
+    asyncdownload::core::AtomicBlockBitmap bitmap(1);
+    asyncdownload::download::RangeScheduler scheduler(policy, 123);
+
+    const auto ranges = scheduler.build_initial_ranges(bitmap);
+
+    ASSERT_EQ(ranges.size(), 1U);
+    EXPECT_EQ(ranges.front()->start_offset, 0);
+    EXPECT_EQ(
+        ranges.front()->end_offset.load(std::memory_order_acquire),
+        122);
+}
+
+TEST(RangeSchedulerTest,
+     DISABLED_NonRangeCollapsesPartialResumeToOneFullObjectRange) {
+    auto policy = range_policy();
+    policy.connection_limit = 1;
+    policy.issue_range_requests = false;
+    policy.allow_work_stealing = false;
+    const auto total_size = 4LL * policy.block_bytes;
+    asyncdownload::core::AtomicBlockBitmap bitmap(4);
+    bitmap.store(1, asyncdownload::core::BlockState::finished);
+    asyncdownload::download::RangeScheduler scheduler(
+        policy, total_size);
+
+    const auto ranges = scheduler.build_initial_ranges(bitmap);
+
+    ASSERT_EQ(ranges.size(), 1U);
+    EXPECT_EQ(ranges.front()->start_offset, 0);
+    EXPECT_EQ(
+        ranges.front()->end_offset.load(std::memory_order_acquire),
+        total_size - 1);
+}

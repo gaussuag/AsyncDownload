@@ -176,6 +176,8 @@ void persist_single_range_at_tail_capacity(
     packet.payload.assign(static_cast<std::size_t>(total_size), 0x5A);
     enqueue_data_packet(
         packet_flow->producer(), packet_lane, session, packet);
+    EXPECT_FALSE(range.marked_finished.load(
+        std::memory_order_acquire));
     enqueue_range_complete(packet_flow->producer(), session, 0);
 
     ASSERT_TRUE(wait_for_condition([&range]() {
