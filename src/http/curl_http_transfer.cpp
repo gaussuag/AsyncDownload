@@ -175,14 +175,52 @@ HttpProbeResult fallback_probe(
             response_code);
     }
 
-    const auto total =
-        response.content_range().has_value()
-        ? response.content_range()->total
-        : response_length > 0
-            ? static_cast<std::int64_t>(
-                response_length)
-            : 0;
-    if (total <= 0) {
+    std::int64_t total = 0;
+    bool accept_ranges = false;
+    if (response_code == 206) {
+        if (response.content_range_invalid() ||
+            !response.content_range().has_value() ||
+            response.content_range()->first != 0 ||
+            response.content_range()->last != 0 ||
+            response.content_range()->total <= 0 ||
+            response.content_length_invalid() ||
+            (response.content_length().has_value() &&
+             *response.content_length() != 1)) {
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        content_range_mismatch,
+                    DownloadErrc::http_probe_failed),
+                response_code);
+        }
+        total = response.content_range()->total;
+        accept_ranges = true;
+    } else if (response_code == 200) {
+        if (response.content_range().has_value() ||
+            response.content_range_invalid() ||
+            response.content_length_invalid() ||
+            !response.content_length().has_value() ||
+            *response.content_length() <= 0) {
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        content_length_malformed,
+                    DownloadErrc::http_probe_failed),
+                response_code);
+        }
+        total = *response.content_length();
+    } else {
+        return failed_probe(
+            make_failure(
+                HttpFailureReason::
+                    response_status_invalid,
+                DownloadErrc::http_probe_failed),
+            response_code);
+    }
+    if (total <= 0 ||
+        (response_length > 0 &&
+         response_code == 206 &&
+         response_length != 1)) {
         return failed_probe(
             make_failure(
                 HttpFailureReason::
@@ -194,8 +232,7 @@ HttpProbeResult fallback_probe(
     return {
         HttpObjectFacts{
             total,
-            response.accept_ranges() ||
-                response.content_range().has_value(),
+            accept_ranges,
             response.etag(),
             response.last_modified()
         },
@@ -268,8 +305,11 @@ public:
                     DownloadErrc::http_probe_failed),
                 response_code);
         }
-        if (response_code >= 400 ||
-            response_length <= 0) {
+        if (response_code != 200 ||
+            response_length <= 0 ||
+            response.content_length_invalid() ||
+            !response.content_length().has_value() ||
+            *response.content_length() <= 0) {
             return fallback_probe(request);
         }
 

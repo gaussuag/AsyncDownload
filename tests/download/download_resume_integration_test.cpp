@@ -1653,6 +1653,481 @@ TEST(HttpTransferCharacterizationTest, ReplaysPausedWritesWithoutDuplicateOutput
 #endif
 }
 
+TEST(HttpTransferContractTest, FallsBackFromUnsolicitedHead206AndIgnoresPartialLength) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_head_206");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --head-status 206";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    ASSERT_GE(requests.size(), 3U);
+    EXPECT_EQ(requests[0].method, "HEAD");
+    EXPECT_EQ(requests[0].response_status, 206);
+    EXPECT_EQ(requests[1].method, "GET");
+    EXPECT_EQ(requests[1].range_header, "bytes=0-0");
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, RejectsMalformedFallbackContentRange) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_malformed_probe_range");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --head-status 405" +
+        L" --content-range-value malformed";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::http_probe_failed));
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, RejectsMismatchedFallbackTotal) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_probe_total_mismatch");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --head-status 405" +
+        L" --content-range-total-delta -1048576";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::http_probe_failed));
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, AcceptRangesRequiresBytesToken) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_accept_ranges_token");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 4 * 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --accept-ranges-value notbytes";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+    request.options.max_connections = 4;
+    request.options.scheduler_window_bytes = 1024 * 1024;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    const auto get_count = std::count_if(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        });
+    EXPECT_EQ(get_count, 1);
+    EXPECT_TRUE(std::all_of(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method != "GET" ||
+                logged.range_header.empty();
+        }));
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, FallsBackFromNon200HeadStatus) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_head_status");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --head-status 204";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    ASSERT_GE(requests.size(), 3U);
+    EXPECT_EQ(requests[0].response_status, 204);
+    EXPECT_EQ(requests[1].method, "GET");
+    EXPECT_EQ(requests[1].range_header, "bytes=0-0");
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, FallsBackWhenHeadLengthIsMissing) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_head_length");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --omit-head-content-length";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    ASSERT_GE(requests.size(), 3U);
+    EXPECT_EQ(requests[0].method, "HEAD");
+    EXPECT_EQ(requests[1].method, "GET");
+    EXPECT_EQ(requests[1].range_header, "bytes=0-0");
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, UsesOnlyFinalRedirectHeaderBlock) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_redirect_headers");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --accept-ranges-value none" +
+        L" --redirect-path /redirect";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/redirect";
+    request.output_path = output_file;
+    request.options.max_connections = 4;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    const auto get_count = std::count_if(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        });
+    EXPECT_EQ(get_count, 2);
+    EXPECT_TRUE(std::all_of(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method != "GET" ||
+                logged.range_header.empty();
+        }));
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(HttpTransferContractTest, RejectsZeroByteObjectByCurrentPolicy) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_http_zero_object");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    write_text_file(source_file, "");
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::http_probe_failed));
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
 TEST(DownloadIntegrationTest, DowngradesNonRangeServerToSingleFullRequest) {
 #ifndef _WIN32
     GTEST_SKIP() << "This integration test currently uses Windows process control.";

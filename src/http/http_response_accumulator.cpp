@@ -129,6 +129,24 @@ parse_content_range(
     };
 }
 
+bool has_token(
+    std::string_view value,
+    const std::string_view expected) noexcept {
+    while (!value.empty()) {
+        const auto comma = value.find(',');
+        const auto token = trim_ows(
+            value.substr(0, comma));
+        if (ascii_equal(token, expected)) {
+            return true;
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        value.remove_prefix(comma + 1);
+    }
+    return false;
+}
+
 }
 
 bool HttpResponseAccumulator::append(
@@ -160,18 +178,8 @@ bool HttpResponseAccumulator::append(
         const auto value = trim_ows(
             line.substr(separator + 1));
         if (ascii_equal(name, "accept-ranges")) {
-            std::string lowered(value);
-            std::transform(
-                lowered.begin(),
-                lowered.end(),
-                lowered.begin(),
-                [](const unsigned char character) {
-                    return static_cast<char>(
-                        std::tolower(character));
-                });
             accept_ranges_ = accept_ranges_ ||
-                lowered.find("bytes") !=
-                    std::string::npos;
+                has_token(value, "bytes");
         } else if (ascii_equal(
                        name,
                        "content-length")) {
