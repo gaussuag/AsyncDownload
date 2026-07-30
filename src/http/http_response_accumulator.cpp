@@ -147,6 +147,27 @@ bool has_token(
     return false;
 }
 
+bool contains_only_identity(
+    std::string_view value) noexcept {
+    if (trim_ows(value).empty()) {
+        return true;
+    }
+    while (!value.empty()) {
+        const auto comma = value.find(',');
+        const auto token = trim_ows(
+            value.substr(0, comma));
+        if (token.empty() ||
+            !ascii_equal(token, "identity")) {
+            return false;
+        }
+        if (comma == std::string_view::npos) {
+            return true;
+        }
+        value.remove_prefix(comma + 1);
+    }
+    return false;
+}
+
 }
 
 bool HttpResponseAccumulator::append(
@@ -298,6 +319,12 @@ HttpResponseAccumulator::content_encoding()
 bool HttpResponseAccumulator::content_encoding_invalid()
     const noexcept {
     return content_encoding_invalid_;
+}
+
+bool HttpResponseAccumulator::content_encoding_is_identity()
+    const noexcept {
+    return !content_encoding_invalid_ &&
+        contains_only_identity(content_encoding_);
 }
 
 const std::string& HttpResponseAccumulator::etag()

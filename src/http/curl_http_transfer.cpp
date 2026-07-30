@@ -76,7 +76,8 @@ std::size_t capture_probe_header(
 void configure_probe_common(
     CURL* easy,
     const std::string& url,
-    HttpResponseAccumulator& response) noexcept {
+    HttpResponseAccumulator& response,
+    curl_slist* identity_headers) noexcept {
     static_cast<void>(
         curl_easy_setopt(
             easy,
@@ -117,6 +118,21 @@ void configure_probe_common(
             easy,
             CURLOPT_HEADERDATA,
             &response));
+    static_cast<void>(
+        curl_easy_setopt(
+            easy,
+            CURLOPT_ACCEPT_ENCODING,
+            static_cast<const char*>(nullptr)));
+    static_cast<void>(
+        curl_easy_setopt(
+            easy,
+            CURLOPT_HTTP_CONTENT_DECODING,
+            0L));
+    static_cast<void>(
+        curl_easy_setopt(
+            easy,
+            CURLOPT_HTTPHEADER,
+            identity_headers));
 }
 
 HttpProbeResult failed_probe(
@@ -130,7 +146,8 @@ HttpProbeResult failed_probe(
 }
 
 HttpProbeResult fallback_probe(
-    const HttpProbeRequest& request) noexcept {
+    const HttpProbeRequest& request,
+    curl_slist* identity_headers) noexcept {
     CURL* easy = curl_easy_init();
     if (easy == nullptr) {
         return failed_probe(
@@ -143,7 +160,8 @@ HttpProbeResult fallback_probe(
     configure_probe_common(
         easy,
         request.url,
-        response);
+        response,
+        identity_headers);
     static_cast<void>(
         curl_easy_setopt(
             easy,
@@ -180,6 +198,14 @@ HttpProbeResult fallback_probe(
                         header_callback_failed
                     : HttpFailureReason::
                         transport_failed,
+                DownloadErrc::http_probe_failed),
+            response_code);
+    }
+    if (!response.content_encoding_is_identity()) {
+        return failed_probe(
+            make_failure(
+                HttpFailureReason::
+                    content_encoding_invalid,
                 DownloadErrc::http_probe_failed),
             response_code);
     }
@@ -307,6 +333,20 @@ public:
                         HttpFailureReason::
                             multi_init_failed,
                         DownloadErrc::http_init_failed)
+                };
+            }
+            session->identity_headers_ =
+                curl_slist_append(
+                    nullptr,
+                    "Accept-Encoding: identity");
+            if (session->identity_headers_ == nullptr) {
+                return {
+                    nullptr,
+                    make_failure(
+                        HttpFailureReason::
+                            allocation_failed,
+                        DownloadErrc::
+                            http_init_failed)
                 };
             }
             if (curl_multi_setopt(
@@ -979,7 +1019,15 @@ private:
             !set(CURLOPT_HEADERDATA, &slot) ||
             !set(CURLOPT_PRIVATE, &slot) ||
             !set(CURLOPT_TCP_KEEPALIVE, 1L) ||
-            !set(CURLOPT_ACCEPT_ENCODING, "") ||
+            !set(
+                CURLOPT_ACCEPT_ENCODING,
+                static_cast<const char*>(nullptr)) ||
+            !set(
+                CURLOPT_HTTP_CONTENT_DECODING,
+                0L) ||
+            !set(
+                CURLOPT_HTTPHEADER,
+                identity_headers_) ||
             !set(CURLOPT_FRESH_CONNECT, 1L) ||
             !set(CURLOPT_FORBID_REUSE, 1L) ||
             !set(CURLOPT_PIPEWAIT, 0L)) {
@@ -1259,6 +1307,13 @@ private:
                 DownloadErrc::
                     http_invalid_response);
         }
+        if (!response.content_encoding_is_identity()) {
+            return make_failure(
+                HttpFailureReason::
+                    content_encoding_invalid,
+                DownloadErrc::
+                    http_invalid_response);
+        }
         const auto requires_content_range =
             status == 206;
         if (requires_content_range &&
@@ -1455,6 +1510,11 @@ private:
                 curl_multi_cleanup(multi_));
             multi_ = nullptr;
         }
+        if (identity_headers_ != nullptr) {
+            curl_slist_free_all(
+                identity_headers_);
+            identity_headers_ = nullptr;
+        }
     }
 
     HttpSessionConfig config_;
@@ -1462,6 +1522,7 @@ private:
     telemetry::TelemetrySession& telemetry_;
     std::thread::id owner_thread_;
     CURLM* multi_ = nullptr;
+    curl_slist* identity_headers_ = nullptr;
     std::vector<std::unique_ptr<Slot>> slots_;
     std::vector<flow::PacketLaneObservation>
         observations_;
@@ -1480,11 +1541,28 @@ public:
                 make_failure(
                     HttpFailureReason::
                         protocol_order_invalid,
-                    DownloadErrc::http_probe_failed));
+                DownloadErrc::http_probe_failed));
         }
 
+        curl_slist* identity_headers =
+            curl_slist_append(
+                nullptr,
+                "Accept-Encoding: identity");
+        if (identity_headers == nullptr) {
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        allocation_failed,
+                    DownloadErrc::http_probe_failed));
+        }
+        const auto free_identity_headers =
+            [&identity_headers]() noexcept {
+                curl_slist_free_all(
+                    identity_headers);
+            };
         CURL* easy = curl_easy_init();
         if (easy == nullptr) {
+            free_identity_headers();
             return failed_probe(
                 make_failure(
                     HttpFailureReason::easy_init_failed,
@@ -1495,7 +1573,8 @@ public:
         configure_probe_common(
             easy,
             request.url,
-            response);
+            response,
+            identity_headers);
         static_cast<void>(
             curl_easy_setopt(
                 easy,
@@ -1524,13 +1603,28 @@ public:
         curl_easy_cleanup(easy);
 
         if (curl_result != CURLE_OK) {
-            return fallback_probe(request);
+            const auto result =
+                fallback_probe(
+                    request,
+                    identity_headers);
+            free_identity_headers();
+            return result;
         }
         if (response.parser_failed()) {
+            free_identity_headers();
             return failed_probe(
                 make_failure(
                     HttpFailureReason::
                         header_callback_failed,
+                    DownloadErrc::http_probe_failed),
+                response_code);
+        }
+        if (!response.content_encoding_is_identity()) {
+            free_identity_headers();
+            return failed_probe(
+                make_failure(
+                    HttpFailureReason::
+                        content_encoding_invalid,
                     DownloadErrc::http_probe_failed),
                 response_code);
         }
@@ -1539,9 +1633,15 @@ public:
             response.content_length_invalid() ||
             !response.content_length().has_value() ||
             *response.content_length() <= 0) {
-            return fallback_probe(request);
+            const auto result =
+                fallback_probe(
+                    request,
+                    identity_headers);
+            free_identity_headers();
+            return result;
         }
 
+        free_identity_headers();
         return {
             HttpObjectFacts{
                 static_cast<std::int64_t>(

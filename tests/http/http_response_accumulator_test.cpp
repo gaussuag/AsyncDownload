@@ -112,4 +112,35 @@ TEST(HttpResponseAccumulatorTest, IgnoresTrailersAfterBodyStarts) {
     EXPECT_EQ(response.etag(), "\"header\"");
 }
 
+TEST(HttpResponseAccumulatorTest, AcceptsOnlyIdentityContentEncodingTokens) {
+    asyncdownload::http::HttpResponseAccumulator absent;
+    append_line(absent, "HTTP/1.1 200 OK\r\n");
+    EXPECT_TRUE(
+        absent.content_encoding_is_identity());
+
+    asyncdownload::http::HttpResponseAccumulator identity;
+    append_line(identity, "HTTP/1.1 200 OK\r\n");
+    append_line(
+        identity,
+        "Content-Encoding: identity, IDENTITY\r\n");
+    EXPECT_TRUE(
+        identity.content_encoding_is_identity());
+
+    asyncdownload::http::HttpResponseAccumulator gzip;
+    append_line(gzip, "HTTP/1.1 200 OK\r\n");
+    append_line(
+        gzip,
+        "Content-Encoding: gzip\r\n");
+    EXPECT_FALSE(
+        gzip.content_encoding_is_identity());
+
+    asyncdownload::http::HttpResponseAccumulator mixed;
+    append_line(mixed, "HTTP/1.1 200 OK\r\n");
+    append_line(
+        mixed,
+        "Content-Encoding: identity, gzip\r\n");
+    EXPECT_FALSE(
+        mixed.content_encoding_is_identity());
+}
+
 }

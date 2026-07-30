@@ -36,6 +36,7 @@ public:
     [[nodiscard]] bool content_length_invalid() const noexcept;
     [[nodiscard]] const std::string& content_encoding() const noexcept;
     [[nodiscard]] bool content_encoding_invalid() const noexcept;
+    [[nodiscard]] bool content_encoding_is_identity() const noexcept;
     [[nodiscard]] const std::string& etag() const noexcept;
     [[nodiscard]] const std::string& last_modified() const noexcept;
 

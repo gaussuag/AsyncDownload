@@ -92,8 +92,17 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
         )
         if self.command == "GET" and self.server.get_status:
             status = HTTPStatus(self.server.get_status)
-        if self.server.force_content_encoding:
-            content_encoding = self.server.force_content_encoding
+        if (
+            self.server.force_content_encoding
+            or (
+                self.command == "GET"
+                and self.server.force_get_content_encoding
+            )
+        ):
+            content_encoding = (
+                self.server.force_content_encoding
+                or self.server.force_get_content_encoding
+            )
 
         omit_content_length = (
             self.command == "HEAD"
@@ -179,6 +188,7 @@ class RangeServer(ThreadingHTTPServer):
         content_length_delta,
         get_status,
         force_content_encoding,
+        force_get_content_encoding,
         redirect_path,
     ):
         super().__init__(server_address, RangeRequestHandler)
@@ -199,6 +209,7 @@ class RangeServer(ThreadingHTTPServer):
         self.content_length_delta = content_length_delta
         self.get_status = get_status
         self.force_content_encoding = force_content_encoding
+        self.force_get_content_encoding = force_get_content_encoding
         self.redirect_path = redirect_path
         self.request_log_lock = threading.Lock()
         self.request_ordinal = 0
@@ -260,6 +271,7 @@ def main():
     parser.add_argument("--content-length-delta", type=int, default=0)
     parser.add_argument("--get-status", type=int, default=0)
     parser.add_argument("--force-content-encoding", default="")
+    parser.add_argument("--force-get-content-encoding", default="")
     parser.add_argument("--redirect-path", default="")
     args = parser.parse_args()
 
@@ -268,7 +280,8 @@ def main():
         args.head_status, args.omit_head_content_length, args.content_range_start_delta,
         args.content_range_total_delta, args.content_range_value, args.accept_ranges_value,
         args.omit_content_range, args.duplicate_content_range, args.content_length_delta,
-        args.get_status, args.force_content_encoding, args.redirect_path)
+        args.get_status, args.force_content_encoding, args.force_get_content_encoding,
+        args.redirect_path)
     actual_port = server.server_address[1]
     print(actual_port, flush=True)
     try:
