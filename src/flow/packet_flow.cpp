@@ -183,6 +183,30 @@ public:
                     first_error() : std::error_code{}
             };
         }
+        if (next_sequence ==
+            std::numeric_limits<PacketSequence>::max()) {
+            fail(make_error_code(DownloadErrc::internal_error));
+            return {
+                PacketAdmissionCode::failed,
+                0,
+                0,
+                lane.pause_mask,
+                first_error()
+            };
+        }
+        const auto published = published_data_bytes.load(
+            std::memory_order_acquire);
+        if (lane.payload.size() >
+            std::numeric_limits<std::uint64_t>::max() - published) {
+            fail(make_error_code(DownloadErrc::internal_error));
+            return {
+                PacketAdmissionCode::failed,
+                0,
+                0,
+                lane.pause_mask,
+                first_error()
+            };
+        }
 
         detail::PacketEnvelope envelope{};
         envelope.kind = detail::PacketEnvelopeKind::data;
@@ -208,9 +232,9 @@ public:
 
         queued_packets.fetch_add(1, std::memory_order_relaxed);
         ++next_sequence;
-        published_data_bytes.fetch_add(
-            static_cast<std::uint64_t>(published_bytes),
-            std::memory_order_relaxed);
+        published_data_bytes.store(
+            published + static_cast<std::uint64_t>(published_bytes),
+            std::memory_order_release);
         telemetry.record_download_delta(
             static_cast<std::uint64_t>(published_bytes));
         lane.lease = {};
@@ -332,7 +356,12 @@ std::error_code PacketLease::account_reorder_node() noexcept {
         kind_ != PacketKind::data ||
         owner_ == nullptr ||
         reorder_node_accounted_) {
-        return make_error_code(DownloadErrc::internal_error);
+        const auto error =
+            make_error_code(DownloadErrc::internal_error);
+        if (owner_ != nullptr) {
+            owner_->implementation_->fail(error);
+        }
+        return error;
     }
 
     owner_->implementation_->add_accounting(
@@ -427,12 +456,15 @@ PacketAdmission PacketProducer::accept(
         chunk.offset < chunk.lease_span.begin ||
         !checked_add(chunk.offset, chunk.bytes.size(), chunk_end) ||
         chunk_end > chunk.lease_span.end) {
+        const auto error =
+            std::make_error_code(std::errc::invalid_argument);
+        implementation.fail(error);
         return {
             PacketAdmissionCode::failed,
             0,
             0,
             lane_state->pause_mask,
-            std::make_error_code(std::errc::invalid_argument)
+            error
         };
     }
 
@@ -445,12 +477,15 @@ PacketAdmission PacketProducer::accept(
                 lane_state->payload.size(),
                 expected_offset) ||
             expected_offset != chunk.offset) {
+            const auto error =
+                std::make_error_code(std::errc::invalid_argument);
+            implementation.fail(error);
             return {
                 PacketAdmissionCode::failed,
                 0,
                 0,
                 lane_state->pause_mask,
-                std::make_error_code(std::errc::invalid_argument)
+                error
             };
         }
     }
@@ -460,12 +495,15 @@ PacketAdmission PacketProducer::accept(
             lane_state->payload.size(),
             chunk.bytes.size(),
             projected_payload)) {
+        const auto error =
+            std::make_error_code(std::errc::invalid_argument);
+        implementation.fail(error);
         return {
             PacketAdmissionCode::failed,
             0,
             0,
             lane_state->pause_mask,
-            std::make_error_code(std::errc::invalid_argument)
+            error
         };
     }
 
@@ -498,12 +536,6 @@ PacketAdmission PacketProducer::accept(
         };
     }
 
-    if (lane_state->payload.empty()) {
-        lane_state->lease = chunk.lease;
-        lane_state->lease_span = chunk.lease_span;
-        lane_state->offset = chunk.offset;
-    }
-
     implementation.add_accounting(delta);
     try {
         lane_state->payload.insert(
@@ -531,6 +563,11 @@ PacketAdmission PacketProducer::accept(
             lane_state->pause_mask,
             implementation.first_error()
         };
+    }
+    if (lane_state->payload.size() == chunk.bytes.size()) {
+        lane_state->lease = chunk.lease;
+        lane_state->lease_span = chunk.lease_span;
+        lane_state->offset = chunk.offset;
     }
     lane_state->accounted_bytes = projected_accounted;
 
@@ -612,9 +649,12 @@ PacketPublishResult PacketProducer::publish(
         };
     }
     if (packet.expected_end <= 0) {
+        const auto error =
+            std::make_error_code(std::errc::invalid_argument);
+        implementation.fail(error);
         return {
             PacketPublishCode::failed,
-            std::make_error_code(std::errc::invalid_argument)
+            error
         };
     }
     for (const auto& lane : implementation.lanes) {
@@ -622,14 +662,26 @@ PacketPublishResult PacketProducer::publish(
             lane->active &&
             !lane->payload.empty() &&
             lane->lease.range == packet.completion.range) {
+            const auto error =
+                make_error_code(DownloadErrc::internal_error);
+            implementation.fail(error);
             return {
                 PacketPublishCode::failed,
-                make_error_code(DownloadErrc::internal_error)
+                error
             };
         }
     }
 
     detail::PacketEnvelope envelope{};
+    if (implementation.next_sequence ==
+        std::numeric_limits<PacketSequence>::max()) {
+        implementation.fail(
+            make_error_code(DownloadErrc::internal_error));
+        return {
+            PacketPublishCode::failed,
+            implementation.first_error()
+        };
+    }
     envelope.kind = detail::PacketEnvelopeKind::control;
     envelope.sequence = implementation.next_sequence;
     envelope.control = packet;
@@ -790,6 +842,12 @@ std::error_code PacketProducer::close() noexcept {
     }
 
     detail::PacketEnvelope envelope{};
+    if (implementation.next_sequence ==
+        std::numeric_limits<PacketSequence>::max()) {
+        implementation.fail(
+            make_error_code(DownloadErrc::internal_error));
+        return implementation.first_error();
+    }
     envelope.kind = detail::PacketEnvelopeKind::close;
     envelope.sequence = implementation.next_sequence;
     if (!implementation.queue.publish(envelope)) {

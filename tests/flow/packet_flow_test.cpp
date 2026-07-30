@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -120,12 +121,104 @@ TEST(PacketFlowTest, RejectsNonContiguousChunkWithoutMutatingDraft) {
     EXPECT_EQ(
         flow->producer().snapshot().accounted_bytes,
         before.accounted_bytes);
-    ASSERT_FALSE(flow->producer().discard(lane));
-    ASSERT_FALSE(flow->producer().close());
-    asyncdownload::flow::PacketLease packet;
     EXPECT_EQ(
-        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
-        asyncdownload::flow::PacketReceiveCode::closed);
+        flow->producer().snapshot().state,
+        asyncdownload::flow::PacketFlowState::failed);
+    ASSERT_FALSE(flow->producer().discard(lane));
+}
+
+TEST(PacketFlowTest, RejectsChunkOutsideLeaseSpanWithoutMutation) {
+    asyncdownload::core::global_memory_accounting().reset();
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+
+    const auto rejected = flow->producer().accept(
+        lane,
+        {{{4}, 1}, {10, 20}, 18, bytes});
+
+    EXPECT_EQ(rejected.code, asyncdownload::flow::PacketAdmissionCode::failed);
+    EXPECT_EQ(rejected.error,
+        std::make_error_code(std::errc::invalid_argument));
+    const auto snapshot = flow->producer().snapshot();
+    EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::failed);
+    EXPECT_EQ(snapshot.queued_packets, 0U);
+    EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    EXPECT_EQ(snapshot.error, rejected.error);
+    ASSERT_FALSE(flow->producer().discard(lane));
+}
+
+TEST(PacketFlowTest, RejectsOffsetSizeOverflowWithoutMutation) {
+    asyncdownload::core::global_memory_accounting().reset();
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 2> bytes{1, 2};
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+
+    const auto rejected = flow->producer().accept(
+        lane,
+        {{{4}, 1}, {0, maximum}, maximum, bytes});
+
+    EXPECT_EQ(rejected.code, asyncdownload::flow::PacketAdmissionCode::failed);
+    EXPECT_EQ(rejected.error,
+        std::make_error_code(std::errc::invalid_argument));
+    const auto snapshot = flow->producer().snapshot();
+    EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::failed);
+    EXPECT_EQ(snapshot.queued_packets, 0U);
+    EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    ASSERT_FALSE(flow->producer().discard(lane));
+}
+
+TEST(PacketFlowTest, RejectsChunkLargerThanAggregationTargetWithoutMutation) {
+    asyncdownload::core::global_memory_accounting().reset();
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    std::vector<std::uint8_t> bytes(64 * 1024 + 1, 7);
+
+    const auto rejected = flow->producer().accept(
+        lane,
+        {
+            {{4}, 1},
+            {0, static_cast<std::int64_t>(bytes.size())},
+            0,
+            bytes
+        });
+
+    EXPECT_EQ(rejected.code, asyncdownload::flow::PacketAdmissionCode::failed);
+    EXPECT_EQ(rejected.error,
+        std::make_error_code(std::errc::invalid_argument));
+    const auto snapshot = flow->producer().snapshot();
+    EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::failed);
+    EXPECT_EQ(snapshot.queued_packets, 0U);
+    EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    ASSERT_FALSE(flow->producer().discard(lane));
+}
+
+TEST(PacketFlowTest, RejectsNonPositiveCompletionExpectedEnd) {
+    asyncdownload::core::global_memory_accounting().reset();
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto flow = make_flow(telemetry);
+
+    const auto rejected = flow->producer().publish({
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{1}, 2},
+        0
+    });
+
+    EXPECT_EQ(rejected.code, asyncdownload::flow::PacketPublishCode::failed);
+    EXPECT_EQ(rejected.error,
+        std::make_error_code(std::errc::invalid_argument));
+    const auto snapshot = flow->producer().snapshot();
+    EXPECT_EQ(snapshot.state, asyncdownload::flow::PacketFlowState::failed);
+    EXPECT_EQ(snapshot.queued_packets, 0U);
+    EXPECT_EQ(snapshot.accounted_bytes, 0U);
+    EXPECT_EQ(snapshot.error, rejected.error);
 }
 
 TEST(PacketFlowTest, PublishesAtCurrentSixtyFourKibAggregationShape) {
@@ -190,10 +283,9 @@ TEST(PacketFlowTest, ReorderNodeAddsExactlyFortyEightBytesOnce) {
     EXPECT_TRUE(moved.has_value());
     moved.complete();
     EXPECT_EQ(flow->producer().snapshot().accounted_bytes, 0U);
-    ASSERT_FALSE(flow->producer().close());
     EXPECT_EQ(
-        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
-        asyncdownload::flow::PacketReceiveCode::closed);
+        flow->producer().snapshot().state,
+        asyncdownload::flow::PacketFlowState::failed);
 }
 
 TEST(PacketFlowTest, PublishesRangeCompleteAfterAllRangeData) {
