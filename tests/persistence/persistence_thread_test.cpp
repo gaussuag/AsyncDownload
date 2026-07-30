@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,8 @@ namespace {
 
 struct TestPacket {
     std::size_t range_id = 0;
+    std::uint64_t generation = 1;
+    asyncdownload::range::ByteSpan lease_span{};
     std::int64_t offset = 0;
     std::vector<std::uint8_t> payload;
 };
@@ -40,9 +43,15 @@ void enqueue_data_packet(
                 {
                     static_cast<std::uint64_t>(packet.range_id)
                 },
-                1
+                packet.generation
             },
-            {0, session.total_size},
+            packet.lease_span.begin <
+                    packet.lease_span.end ?
+                packet.lease_span :
+                asyncdownload::range::ByteSpan{
+                    0,
+                    session.total_size
+                },
             packet.offset,
             packet.payload
         });
@@ -213,6 +222,114 @@ void persist_single_range_at_tail_capacity(
     static_cast<void>(removed);
 }
 
+struct PersistenceScenarioResult {
+    std::error_code error;
+    asyncdownload::flow::PacketFlowSnapshot flow;
+    std::int64_t persisted_through = 0;
+    bool marked_finished = false;
+};
+
+PersistenceScenarioResult run_persistence_scenario(
+    const std::vector<TestPacket>& packets,
+    const std::vector<
+        asyncdownload::flow::ControlPacket>& controls = {}) {
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto temp_root =
+        std::filesystem::temp_directory_path() /
+        ("asyncdownload_persistence_scenario_" +
+         std::to_string(sequence.fetch_add(
+             1,
+             std::memory_order_relaxed)));
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(
+        temp_root,
+        filesystem_error);
+    EXPECT_FALSE(filesystem_error);
+
+    asyncdownload::download::PersistencePolicy policy{};
+    policy.block_bytes = 4096;
+    policy.io_alignment_bytes = 4096;
+    policy.max_gap_bytes = 4096;
+    policy.flush_threshold_bytes = 4096;
+    policy.flush_interval = std::chrono::milliseconds(10);
+    asyncdownload::core::SessionState session(
+        make_effective_policy(policy, 4096));
+    session.paths.output_path = temp_root / "output.bin";
+    session.paths.temporary_path =
+        temp_root / "output.bin.part";
+    session.paths.metadata_path =
+        temp_root / "output.bin.config.json";
+    session.url = "http://127.0.0.1/test.bin";
+    auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane lane;
+    EXPECT_FALSE(
+        packet_flow->producer().open_lane(lane));
+    asyncdownload::core::AtomicBlockBitmap bitmap(1);
+    asyncdownload::storage::FileWriter writer;
+    EXPECT_FALSE(writer.open(
+        session.paths.temporary_path,
+        session.total_size,
+        false,
+        true));
+    asyncdownload::metadata::MetadataStore store(
+        session.paths.metadata_path);
+    BS::thread_pool<> workers(1);
+    asyncdownload::persistence::PersistenceThread persistence(
+        session,
+        policy,
+        packet_flow->consumer(),
+        bitmap,
+        writer,
+        store,
+        workers,
+        1);
+    asyncdownload::core::RangeContext range(0, 0, 4095);
+    EXPECT_FALSE(persistence.register_range(&range));
+    persistence.start();
+
+    for (const auto& packet : packets) {
+        enqueue_data_packet(
+            packet_flow->producer(),
+            lane,
+            session,
+            packet);
+        if (persistence.error()) {
+            break;
+        }
+    }
+    for (const auto& control : controls) {
+        const auto published =
+            packet_flow->producer().publish(control);
+        EXPECT_EQ(
+            published.code,
+            asyncdownload::flow::
+                PacketPublishCode::published);
+        if (published.code !=
+            asyncdownload::flow::
+                PacketPublishCode::published) {
+            break;
+        }
+    }
+    const auto close_error =
+        packet_flow->producer().close();
+    static_cast<void>(close_error);
+    persistence.stop();
+    persistence.join();
+    PersistenceScenarioResult result{
+        persistence.error(),
+        packet_flow->producer().snapshot(),
+        range.persisted_offset,
+        range.marked_finished.load(
+            std::memory_order_acquire)
+    };
+    writer.close();
+    const auto removed = std::filesystem::remove_all(
+        temp_root,
+        filesystem_error);
+    static_cast<void>(removed);
+    return result;
+}
+
 TEST(PersistenceThreadTest, AcceptsValidatedAlignmentAtTailCapacity) {
     const auto temp_root =
         std::filesystem::temp_directory_path() /
@@ -220,6 +337,201 @@ TEST(PersistenceThreadTest, AcceptsValidatedAlignmentAtTailCapacity) {
     persist_single_range_at_tail_capacity(
         temp_root,
         asyncdownload::core::TAIL_BUFFER_CAPACITY_BYTES);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsFirstLeaseGenerationOtherThanOne) {
+    TestPacket packet{};
+    packet.generation = 2;
+    packet.offset = 0;
+    packet.payload.assign(512, 0x31);
+
+    const auto result =
+        run_persistence_scenario({packet});
+
+    EXPECT_TRUE(result.error);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsSpanChangeWithinLeaseGeneration) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 2048};
+    first.offset = 0;
+    first.payload.assign(512, 0x32);
+    TestPacket second{};
+    second.generation = 1;
+    second.lease_span = {0, 4096};
+    second.offset = 512;
+    second.payload.assign(512, 0x33);
+
+    const auto result =
+        run_persistence_scenario({first, second});
+
+    EXPECT_TRUE(result.error);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsLeaseGenerationJump) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 512};
+    first.offset = 0;
+    first.payload.assign(512, 0x34);
+    TestPacket jumped{};
+    jumped.generation = 3;
+    jumped.lease_span = {512, 1024};
+    jumped.offset = 512;
+    jumped.payload.assign(512, 0x35);
+
+    const auto result =
+        run_persistence_scenario({first, jumped});
+
+    EXPECT_TRUE(result.error);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsOverlapBetweenConsecutiveLeaseSpans) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 512};
+    first.offset = 0;
+    first.payload.assign(512, 0x36);
+    TestPacket overlapping{};
+    overlapping.generation = 2;
+    overlapping.lease_span = {256, 768};
+    overlapping.offset = 512;
+    overlapping.payload.assign(256, 0x37);
+
+    const auto result =
+        run_persistence_scenario({first, overlapping});
+
+    EXPECT_TRUE(result.error);
+}
+
+TEST(
+    PersistenceThreadTest,
+    DiscardsFullyPersistedDuplicateData) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 512};
+    packet.offset = 0;
+    packet.payload.assign(512, 0x38);
+
+    const auto result =
+        run_persistence_scenario({packet, packet});
+
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    DiscardsExactDuplicateBufferedData) {
+    TestPacket buffered{};
+    buffered.generation = 1;
+    buffered.lease_span = {0, 4096};
+    buffered.offset = 2048;
+    buffered.payload.assign(512, 0x39);
+    TestPacket head{};
+    head.generation = 1;
+    head.lease_span = {0, 4096};
+    head.offset = 0;
+    head.payload.assign(2048, 0x3A);
+
+    const auto result =
+        run_persistence_scenario({buffered, buffered, head});
+
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsPartiallyPersistedOverlap) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 4096};
+    first.offset = 0;
+    first.payload.assign(1024, 0x3B);
+    TestPacket overlapping{};
+    overlapping.generation = 1;
+    overlapping.lease_span = {0, 4096};
+    overlapping.offset = 512;
+    overlapping.payload.assign(1024, 0x3C);
+
+    const auto result =
+        run_persistence_scenario({first, overlapping});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    DiscardsStaleGenerationAlreadyPersisted) {
+    TestPacket first{};
+    first.generation = 1;
+    first.lease_span = {0, 512};
+    first.offset = 0;
+    first.payload.assign(512, 0x3D);
+    TestPacket second{};
+    second.generation = 2;
+    second.lease_span = {512, 1024};
+    second.offset = 512;
+    second.payload.assign(512, 0x3E);
+
+    const auto result =
+        run_persistence_scenario({first, second, first});
+
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsLeaseOutsideRegisteredGeometry) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {4096, 4608};
+    packet.offset = 4096;
+    packet.payload.assign(512, 0x3F);
+
+    const auto result =
+        run_persistence_scenario({packet});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_EQ(result.flow.queued_packets, 0U);
+    EXPECT_EQ(result.flow.accounted_bytes, 0U);
+}
+
+TEST(
+    PersistenceThreadTest,
+    RejectsCompletionGenerationMismatch) {
+    TestPacket packet{};
+    packet.generation = 1;
+    packet.lease_span = {0, 4096};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x40);
+    const asyncdownload::flow::ControlPacket completion{
+        asyncdownload::flow::ControlPacketKind::range_complete,
+        {{0}, 2},
+        4096
+    };
+
+    const auto result =
+        run_persistence_scenario({packet}, {completion});
+
+    EXPECT_TRUE(result.error);
+    EXPECT_FALSE(result.marked_finished);
 }
 
 TEST(PersistenceThreadTest, FlushesFinalTailWithoutWritingPastObjectEnd) {

@@ -371,11 +371,97 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
         set_error(make_error_code(DownloadErrc::internal_error));
         return;
     }
+    if (data->payload.empty() ||
+        data->payload.size() >
+            static_cast<std::size_t>(
+                std::numeric_limits<
+                    std::int64_t>::max()) ||
+        data->offset < 0 ||
+        data->offset >
+            std::numeric_limits<std::int64_t>::max() -
+                static_cast<std::int64_t>(
+                    data->payload.size())) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    const auto packet_end = data->offset +
+        static_cast<std::int64_t>(data->payload.size());
+    if (data->lease_span.begin <
+            range->bytes.begin ||
+        data->lease_span.begin >=
+            data->lease_span.end ||
+        data->lease_span.end > range->bytes.end ||
+        data->offset < data->lease_span.begin ||
+        packet_end > data->lease_span.end ||
+        packet_end > range->bytes.end) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (packet_end <= range->persisted_through) {
+        packet.complete();
+        return;
+    }
+    if (data->offset < range->persisted_through) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (range->last_observed_lease_generation == 0 &&
+        data->lease.generation != 1) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (range->last_observed_lease_generation ==
+            data->lease.generation &&
+        range->last_observed_lease_span.has_value() &&
+        *range->last_observed_lease_span !=
+            data->lease_span) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (data->lease.generation >
+            range->last_observed_lease_generation &&
+        data->lease.generation !=
+            range->last_observed_lease_generation + 1) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (data->lease.generation <
+        range->last_observed_lease_generation) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    if (data->lease.generation ==
+            range->last_observed_lease_generation + 1 &&
+        range->last_observed_lease_span.has_value() &&
+        data->lease_span.begin <
+            range->last_observed_lease_span->end) {
+        packet.complete();
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
     range->observed_activity = true;
-    range->last_observed_lease_generation =
-        data->lease.generation;
-    range->last_observed_lease_span =
-        data->lease_span;
+    if (data->lease.generation >
+        range->last_observed_lease_generation) {
+        range->last_observed_lease_generation =
+            data->lease.generation;
+        range->last_observed_lease_span =
+            data->lease_span;
+    }
     range->observed_dispatch_through = std::max(
         range->observed_dispatch_through,
         data->lease_span.end);
@@ -417,6 +503,23 @@ void PersistenceThread::handle_data_packet(flow::PacketLease packet) {
             data->payload.size() +
             sizeof(flow::DataPacket) +
             core::kMapNodeOverheadBytes;
+        const auto existing =
+            range->out_of_order.find(data->offset);
+        if (existing != range->out_of_order.end()) {
+            const auto* existing_data =
+                existing->second.data();
+            if (existing_data != nullptr &&
+                existing_data->lease == data->lease &&
+                existing_data->payload.size() ==
+                    data->payload.size()) {
+                packet.complete();
+                return;
+            }
+            packet.complete();
+            set_error(make_error_code(
+                DownloadErrc::internal_error));
+            return;
+        }
         bool reorder_accounted = false;
         try {
             if (const auto account_error =
@@ -483,6 +586,12 @@ void PersistenceThread::handle_range_complete(
     auto* range = lookup_range(range_id);
     if (range == nullptr) {
         set_error(make_error_code(DownloadErrc::internal_error));
+        return;
+    }
+    if (control.completion.generation !=
+        range->last_observed_lease_generation) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
         return;
     }
     range->observed_activity = true;
