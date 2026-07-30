@@ -203,6 +203,137 @@ TEST(PacketFlowTest, ConcurrentDownloadInstancesDoNotShareAccounting) {
     EXPECT_EQ(second->producer().snapshot().accounted_bytes, 0U);
 }
 
+TEST(PacketFlowTest, QueuePauseCountsOnlyOnEpisodeEntry) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    telemetry.record_task_started();
+    auto flow = make_flow(telemetry, 1);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> bytes{1, 2, 3, 4};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{1}, 1}, {0, 8}, 0, bytes}).accepted());
+    ASSERT_TRUE(flow->producer().flush(lane).accepted());
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{1}, 1}, {0, 8}, 4, bytes}).accepted());
+
+    const auto first = flow->producer().flush(lane);
+    const auto repeated = flow->producer().flush(lane);
+
+    EXPECT_EQ(
+        first.code,
+        asyncdownload::flow::PacketAdmissionCode::packet_budget_exhausted);
+    EXPECT_EQ(
+        repeated.code,
+        asyncdownload::flow::PacketAdmissionCode::packet_budget_exhausted);
+    auto summary = telemetry.final_summary();
+    EXPECT_EQ(summary.total_pause_count, 1U);
+    EXPECT_EQ(summary.queue_full_pause_count, 1U);
+
+    asyncdownload::flow::PacketLease packet;
+    ASSERT_EQ(
+        flow->consumer().receive(packet, std::chrono::milliseconds(1)).code,
+        asyncdownload::flow::PacketReceiveCode::packet);
+    packet.complete();
+    const std::array<asyncdownload::flow::PacketLaneObservation, 1>
+        observations{{{lane.id(), 1.0, true}}};
+    std::array<asyncdownload::flow::PacketPauseAction, 1> actions{};
+    const auto reconciled =
+        flow->producer().reconcile(observations, actions);
+    ASSERT_FALSE(reconciled.error);
+    ASSERT_EQ(reconciled.action_count, 1U);
+    EXPECT_EQ(
+        actions[0].kind,
+        asyncdownload::flow::PacketPauseActionKind::resume_candidate);
+    EXPECT_FALSE(flow->producer().paused(lane));
+    ASSERT_TRUE(flow->producer().flush(lane).accepted());
+    ASSERT_FALSE(flow->producer().close());
+    while (flow->consumer().receive(
+               packet,
+               std::chrono::milliseconds(1)).code ==
+           asyncdownload::flow::PacketReceiveCode::packet) {
+        packet.complete();
+    }
+}
+
+TEST(PacketFlowTest, MemoryPauseCountsOnlyOnEpisodeEntry) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    telemetry.record_task_started();
+    auto policy = test_policy();
+    policy.memory_high_bytes = 128;
+    policy.memory_low_bytes = 64;
+    std::unique_ptr<asyncdownload::flow::PacketFlow> flow;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        policy, telemetry, flow));
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 40> first{};
+    const std::array<std::uint8_t, 20> second{};
+    ASSERT_TRUE(flow->producer().accept(
+        lane, {{{2}, 1}, {0, 60}, 0, first}).accepted());
+
+    const auto paused = flow->producer().accept(
+        lane, {{{2}, 1}, {0, 60}, 40, second});
+    const auto repeated = flow->producer().accept(
+        lane, {{{2}, 1}, {0, 60}, 40, second});
+
+    EXPECT_EQ(
+        paused.code,
+        asyncdownload::flow::PacketAdmissionCode::memory_budget_exhausted);
+    EXPECT_EQ(
+        repeated.code,
+        asyncdownload::flow::PacketAdmissionCode::memory_budget_exhausted);
+    const auto summary = telemetry.final_summary();
+    EXPECT_EQ(summary.total_pause_count, 1U);
+    EXPECT_EQ(summary.queue_full_pause_count, 0U);
+    ASSERT_FALSE(flow->producer().discard(lane));
+}
+
+TEST(PacketFlowTest, SelectsFastestTwentyPercentWithLaneIdTieBreaker) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    auto policy = test_policy();
+    policy.memory_high_bytes = 128;
+    policy.memory_low_bytes = 64;
+    std::unique_ptr<asyncdownload::flow::PacketFlow> flow;
+    ASSERT_FALSE(asyncdownload::flow::PacketFlow::create(
+        policy, telemetry, flow));
+    std::array<asyncdownload::flow::ProducerLane, 5> lanes;
+    for (auto& lane : lanes) {
+        ASSERT_FALSE(flow->producer().open_lane(lane));
+    }
+    std::vector<std::uint8_t> bytes(129, 1);
+    ASSERT_TRUE(flow->producer().accept(
+        lanes[0],
+        {
+            {{4}, 1},
+            {0, static_cast<std::int64_t>(bytes.size())},
+            0,
+            bytes
+        }).accepted());
+    std::array<asyncdownload::flow::PacketLaneObservation, 5>
+        observations{};
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        observations[index] = {
+            lanes[index].id(),
+            10.0,
+            true
+        };
+    }
+    std::array<asyncdownload::flow::PacketPauseAction, 5> actions{};
+
+    const auto reconciled =
+        flow->producer().reconcile(observations, actions);
+
+    ASSERT_FALSE(reconciled.error);
+    ASSERT_EQ(reconciled.action_count, 1U);
+    EXPECT_EQ(actions[0].lane_id, lanes[0].id());
+    EXPECT_EQ(
+        actions[0].kind,
+        asyncdownload::flow::PacketPauseActionKind::pause_receive);
+    for (auto& lane : lanes) {
+        ASSERT_FALSE(flow->producer().discard(lane));
+    }
+}
+
 TEST(PacketFlowTest, AcceptsContiguousChunksIntoOneLaneDraft) {
     asyncdownload::telemetry::TelemetrySession telemetry;
     auto flow = make_flow(telemetry);

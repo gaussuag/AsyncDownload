@@ -52,10 +52,8 @@ struct TransferHandle {
     long response_code = 0;
     double speed_bytes_per_second = 0.0;
     bool in_multi = false;
-    bool paused_by_memory = false;
     bool paused_by_gap = false;
     bool paused_by_window_boundary = false;
-    bool queue_pause_active = false;
     CURLcode curl_result = CURLE_OK;
     std::error_code packet_error;
     Clock::time_point request_started{};
@@ -83,63 +81,19 @@ void update_transfer_pause_state(TransferHandle& transfer) noexcept {
         return;
     }
 
-    transfer.range->pause_for_memory.store(transfer.paused_by_memory, std::memory_order_release);
-    if (transfer.paused_by_memory ||
+    const auto packet_paused =
+        transfer.packet_producer != nullptr &&
+        transfer.packet_producer->paused(transfer.packet_lane);
+    transfer.range->pause_for_memory.store(
+        packet_paused, std::memory_order_release);
+    if (packet_paused ||
         transfer.paused_by_gap ||
-        transfer.paused_by_window_boundary ||
-        transfer.queue_pause_active) {
+        transfer.paused_by_window_boundary) {
         mark_range_status(*transfer.range, core::RangeStatus::paused);
         return;
     }
 
     mark_range_status(*transfer.range, core::RangeStatus::downloading);
-}
-
-void start_queue_pause(TransferHandle& transfer) noexcept {
-    if (transfer.range == nullptr) {
-        return;
-    }
-
-    transfer.paused_by_window_boundary = false;
-    if (!transfer.queue_pause_active) {
-        transfer.queue_pause_active = true;
-        transfer.session->telemetry_session_.record_pause(
-            telemetry::TelemetryPauseReason::queue_full, true);
-    }
-
-    update_transfer_pause_state(transfer);
-}
-
-void finish_queue_pause(TransferHandle& transfer) noexcept {
-    if (!transfer.queue_pause_active) {
-        return;
-    }
-
-    transfer.queue_pause_active = false;
-    update_transfer_pause_state(transfer);
-}
-
-void start_memory_pause(TransferHandle& transfer) noexcept {
-    if (transfer.range == nullptr) {
-        return;
-    }
-
-    if (!transfer.paused_by_memory) {
-        transfer.paused_by_memory = true;
-        transfer.session->telemetry_session_.record_pause(
-            telemetry::TelemetryPauseReason::memory_pressure, false);
-    }
-
-    update_transfer_pause_state(transfer);
-}
-
-void finish_memory_pause(TransferHandle& transfer) noexcept {
-    if (!transfer.paused_by_memory) {
-        return;
-    }
-
-    transfer.paused_by_memory = false;
-    update_transfer_pause_state(transfer);
 }
 
 void record_first_network_byte(core::SessionState& session,
@@ -496,10 +450,8 @@ void reflect_packet_publication(
     transfer.request_bytes = 0;
     transfer.response_code = 0;
     transfer.speed_bytes_per_second = 0.0;
-    transfer.paused_by_memory = false;
     transfer.paused_by_gap = false;
     transfer.paused_by_window_boundary = false;
-    transfer.queue_pause_active = false;
     transfer.curl_result = CURLE_OK;
     transfer.packet_error = {};
     transfer.request_started = Clock::now();
@@ -533,7 +485,7 @@ void reflect_packet_publication(
                 if (current->packet_error) {
                     return 0;
                 }
-                start_queue_pause(*current);
+                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
 
@@ -583,14 +535,14 @@ void reflect_packet_publication(
         if (!admission.accepted()) {
             if (admission.code ==
                 flow::PacketAdmissionCode::memory_budget_exhausted) {
-                start_memory_pause(*current);
+                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
             if (admission.code ==
                     flow::PacketAdmissionCode::packet_budget_exhausted ||
                 admission.code ==
                     flow::PacketAdmissionCode::backend_temporarily_unavailable) {
-                start_queue_pause(*current);
+                update_transfer_pause_state(*current);
                 return CURL_WRITEFUNC_PAUSE;
             }
             current->packet_error = admission.error ?
@@ -601,12 +553,12 @@ void reflect_packet_publication(
         if ((admission.active_pause_mask &
              static_cast<std::uint8_t>(
                  flow::PacketPauseReason::memory)) != 0) {
-            start_memory_pause(*current);
+            update_transfer_pause_state(*current);
         }
         if ((admission.active_pause_mask &
              static_cast<std::uint8_t>(
                  flow::PacketPauseReason::queue)) != 0) {
-            start_queue_pause(*current);
+            update_transfer_pause_state(*current);
         }
 
         record_first_network_byte(*current->session, allowed);
@@ -639,55 +591,6 @@ void reflect_packet_publication(
     return {};
 }
 
-void resume_paused_transfers(std::vector<TransferHandle>& handles,
-                             const FlowControlPolicy& policy) noexcept {
-    const auto current_bytes = handles.empty() ||
-            handles.front().packet_producer == nullptr ?
-        0 :
-        handles.front().packet_producer->snapshot().accounted_bytes;
-    for (auto& handle : handles) {
-        if (!handle.in_multi) {
-            continue;
-        }
-
-        const auto queue_can_resume = handle.queue_pause_active &&
-            handle.packet_producer->snapshot().queued_packets <
-                policy.packet_budget &&
-            current_bytes <= policy.memory_low_bytes;
-
-        if (handle.paused_by_memory &&
-            current_bytes > policy.memory_low_bytes) {
-            continue;
-        }
-
-        auto resumed_any = false;
-        if (handle.paused_by_memory) {
-            finish_memory_pause(handle);
-            resumed_any = true;
-        }
-        if (queue_can_resume) {
-            finish_queue_pause(handle);
-            resumed_any = true;
-        }
-
-        if (handle.range != nullptr) {
-            if (handle.range->pause_for_gap.load(std::memory_order_acquire) ||
-                handle.queue_pause_active ||
-                handle.paused_by_memory ||
-                handle.paused_by_window_boundary) {
-                update_transfer_pause_state(handle);
-                continue;
-            }
-
-            update_transfer_pause_state(handle);
-        }
-
-        if (resumed_any) {
-            curl_easy_pause(handle.easy, CURLPAUSE_CONT);
-        }
-    }
-}
-
 void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
     // gap pause 的信号来自 Persistence 线程，它比网络层更早知道某个 range 前面
     // 是否已经堆出了过大的洞。
@@ -705,8 +608,8 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
             curl_easy_pause(handle.easy, CURLPAUSE_RECV);
         } else if (!pause_for_gap && handle.paused_by_gap) {
             handle.paused_by_gap = false;
-            if (!handle.paused_by_memory &&
-                !handle.queue_pause_active &&
+            if (!handle.packet_producer->paused(
+                    handle.packet_lane) &&
                 !handle.paused_by_window_boundary) {
                 update_transfer_pause_state(handle);
                 curl_easy_pause(handle.easy, CURLPAUSE_CONT);
@@ -715,44 +618,63 @@ void apply_gap_pauses(std::vector<TransferHandle>& handles) noexcept {
     }
 }
 
-void apply_memory_backpressure(std::vector<TransferHandle>& handles,
-                               const FlowControlPolicy& policy) noexcept {
-    const auto current_bytes = handles.empty() ||
-            handles.front().packet_producer == nullptr ?
-        0 :
-        handles.front().packet_producer->snapshot().accounted_bytes;
-    if (current_bytes <= policy.memory_high_bytes) {
-        return;
-    }
-
-    std::vector<TransferHandle*> active;
-    active.reserve(handles.size());
-    // 内存红线被踩中后，不是把所有连接一刀切暂停，而是优先暂停当前最快的那部分，
-    // 让整体积压回落得更快。
+[[nodiscard]] std::error_code reconcile_packet_flow(
+    std::vector<TransferHandle>& handles,
+    std::vector<flow::PacketLaneObservation>& observations,
+    std::vector<flow::PacketPauseAction>& actions) noexcept {
+    observations.clear();
     for (auto& handle : handles) {
-        if (!handle.in_multi || handle.paused_by_memory || handle.range == nullptr ||
-            handle.paused_by_window_boundary) {
+        if (!handle.in_multi || handle.range == nullptr) {
             continue;
         }
-
-        update_speed(handle);
-        active.push_back(&handle);
+        const auto eligible = !handle.paused_by_window_boundary;
+        if (eligible) {
+            update_speed(handle);
+        }
+        observations.push_back({
+            handle.packet_lane.id(),
+            handle.speed_bytes_per_second,
+            eligible
+        });
     }
-
-    if (active.empty()) {
-        return;
+    if (observations.empty()) {
+        return {};
     }
-
-    std::sort(active.begin(), active.end(), [](const TransferHandle* lhs, const TransferHandle* rhs) {
-        return lhs->speed_bytes_per_second > rhs->speed_bytes_per_second;
-    });
-
-    const auto pause_count = std::max<std::size_t>(1, (active.size() + 4) / 5);
-    for (std::size_t index = 0; index < pause_count && index < active.size(); ++index) {
-        auto* handle = active[index];
-        start_memory_pause(*handle);
-        curl_easy_pause(handle->easy, CURLPAUSE_RECV);
+    actions.resize(observations.size());
+    const auto result = handles.front().packet_producer->reconcile(
+        observations, actions);
+    if (result.error) {
+        return result.error;
     }
+    for (std::size_t index = 0;
+         index < result.action_count;
+         ++index) {
+        const auto& action = actions[index];
+        const auto found = std::find_if(
+            handles.begin(),
+            handles.end(),
+            [&action](const TransferHandle& handle) {
+                return handle.packet_lane.id() == action.lane_id;
+            });
+        if (found == handles.end() ||
+            !found->in_multi ||
+            found->range == nullptr) {
+            return make_error_code(DownloadErrc::internal_error);
+        }
+        update_transfer_pause_state(*found);
+        if (action.kind ==
+            flow::PacketPauseActionKind::pause_receive) {
+            curl_easy_pause(found->easy, CURLPAUSE_RECV);
+            continue;
+        }
+        if (!found->paused_by_gap &&
+            !found->paused_by_window_boundary &&
+            !found->packet_producer->paused(
+                found->packet_lane)) {
+            curl_easy_pause(found->easy, CURLPAUSE_CONT);
+        }
+    }
+    return {};
 }
 
 [[nodiscard]] std::error_code finalize_completed_request(
@@ -791,8 +713,6 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     }
 
     transfer.range->pause_for_gap.store(false, std::memory_order_release);
-    finish_queue_pause(transfer);
-    finish_memory_pause(transfer);
     transfer.paused_by_window_boundary = false;
     update_transfer_pause_state(transfer);
 
@@ -817,9 +737,7 @@ void apply_memory_backpressure(std::vector<TransferHandle>& handles,
     transfer.range = nullptr;
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
-    transfer.paused_by_memory = false;
     transfer.paused_by_window_boundary = false;
-    transfer.queue_pause_active = false;
     return {};
 }
 
@@ -829,17 +747,13 @@ void release_transfer(CURLM* multi, TransferHandle& transfer) noexcept {
         transfer.in_multi = false;
     }
 
-    finish_queue_pause(transfer);
-    finish_memory_pause(transfer);
     transfer.paused_by_window_boundary = false;
     // easy handle 会被复用给下一个 range/window，因此这里只清运行期状态，
     // 不销毁底层 easy 对象本身。
     transfer.range = nullptr;
     transfer.range_header.clear();
     transfer.paused_by_gap = false;
-    transfer.paused_by_memory = false;
     transfer.paused_by_window_boundary = false;
-    transfer.queue_pause_active = false;
 }
 
 std::error_code stop_network_phase(core::SessionState& session,
@@ -1163,6 +1077,11 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
 
         std::vector<TransferHandle> handles(
             session.effective_policy.scheduling().connection_limit);
+        std::vector<flow::PacketLaneObservation>
+            packet_observations;
+        std::vector<flow::PacketPauseAction> packet_actions;
+        packet_observations.reserve(handles.size());
+        packet_actions.reserve(handles.size());
         std::error_code failure;
         for (auto& handle : handles) {
             handle.session = &session;
@@ -1252,12 +1171,18 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             // gap pause 和 memory backpressure 都是在事件循环里集中执行，避免在
             // write callback 里直接操作其他 handle，保持控制流简单。
             apply_gap_pauses(handles);
-            apply_memory_backpressure(
-                handles,
-                session.effective_policy.flow_control());
-            resume_paused_transfers(
-                handles,
-                session.effective_policy.flow_control());
+            if (const auto reconcile_error =
+                    reconcile_packet_flow(
+                        handles,
+                        packet_observations,
+                        packet_actions);
+                reconcile_error) {
+                failure = reconcile_error;
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
 
             int running_handles = 0;
             const auto perform_status = curl_multi_perform(multi, &running_handles);

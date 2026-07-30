@@ -795,8 +795,10 @@ PacketReconcileResult PacketProducer::reconcile(
     }
 
     std::vector<const PacketLaneObservation*> eligible;
+    std::vector<bool> seen;
     try {
         eligible.reserve(observations.size());
+        seen.resize(implementation.lanes.size() + 1, false);
     } catch (...) {
         return {
             0,
@@ -804,7 +806,6 @@ PacketReconcileResult PacketProducer::reconcile(
         };
     }
 
-    std::vector<bool> seen(implementation.lanes.size() + 1, false);
     for (const auto& observation : observations) {
         if (observation.lane_id == 0 ||
             observation.lane_id > implementation.lanes.size() ||
