@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
@@ -135,6 +136,17 @@ void save_candidate(
     asyncdownload::metadata::MetadataStore store(
         request.paths.metadata_path);
     ASSERT_FALSE(store.save(state));
+}
+
+[[nodiscard]] std::vector<std::uint8_t>
+read_file(
+    const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    EXPECT_TRUE(stream.is_open());
+    return {
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>()
+    };
 }
 
 }
@@ -581,4 +593,41 @@ TEST(
         request.paths.temporary_path));
     EXPECT_TRUE(std::filesystem::exists(
         request.paths.metadata_path));
+}
+
+TEST(
+    RecoveryCheckpointTest,
+    RejectsHoleBeforeSerializedVdlWithoutMutation) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_vdl_hole");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {2, 0};
+    state.vdl_offset = 8192;
+    const auto part_before = part_contents();
+    save_candidate(
+        request,
+        state,
+        part_before);
+    const auto metadata_before =
+        read_file(request.paths.metadata_path);
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    EXPECT_EQ(
+        opened.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_parse_failed));
+    EXPECT_EQ(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        read_file(request.paths.temporary_path),
+        part_before);
+    EXPECT_EQ(
+        read_file(request.paths.metadata_path),
+        metadata_before);
+    EXPECT_FALSE(std::filesystem::exists(
+        request.paths.output_path));
 }

@@ -140,6 +140,33 @@ void project_legacy_ranges(
     }
 }
 
+[[nodiscard]] bool vdl_prefix_is_finished(
+    const core::AtomicBlockBitmap& bitmap,
+    const std::int64_t serialized_vdl,
+    const std::size_t block_size,
+    const std::int64_t total_size) noexcept {
+    if (serialized_vdl <= 0) {
+        return true;
+    }
+    const auto prefix_end =
+        std::min(serialized_vdl, total_size);
+    for (std::size_t index = 0;
+         index < bitmap.block_count();
+         ++index) {
+        const auto block_begin =
+            static_cast<std::int64_t>(
+                index * block_size);
+        if (block_begin >= prefix_end) {
+            break;
+        }
+        if (bitmap.load(index) !=
+            core::BlockState::finished) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] std::error_code validate_crc_samples(
     const core::MetadataState& state,
     storage::FileWriter& file_writer,
@@ -278,6 +305,16 @@ RecoveryOpenResult RecoveryCheckpoint::open(
                 loaded->ranges,
                 request.policy.block_bytes,
                 request.remote.total_size);
+            if (!vdl_prefix_is_finished(
+                    bitmap,
+                    loaded->vdl_offset,
+                    request.policy.block_bytes,
+                    request.remote.total_size)) {
+                result.error = make_error_code(
+                    DownloadErrc::
+                        metadata_parse_failed);
+                return result;
+            }
             const auto validation_error =
                 validate_crc_samples(
                     *loaded,
