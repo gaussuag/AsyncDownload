@@ -18,6 +18,7 @@
 #include <string_view>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -411,6 +412,89 @@ std::set<int> read_logged_ports(const std::filesystem::path& path) {
     }
 
     return ports;
+}
+
+struct LoggedRequest {
+    std::string method;
+    int client_port = 0;
+    std::string range_header;
+};
+
+std::vector<LoggedRequest> read_logged_requests(
+    const std::filesystem::path& path) {
+    std::vector<LoggedRequest> requests;
+    std::ifstream stream(path);
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::istringstream parser(line);
+        LoggedRequest request{};
+        parser >> request.method >> request.client_port;
+        std::getline(parser, request.range_header);
+        const auto first =
+            request.range_header.find_first_not_of(' ');
+        if (first == std::string::npos) {
+            request.range_header.clear();
+        } else {
+            request.range_header.erase(0, first);
+        }
+        requests.push_back(std::move(request));
+    }
+    return requests;
+}
+
+void write_legacy_resume_state(
+    const std::filesystem::path& metadata_file,
+    const std::filesystem::path& output_file,
+    const std::filesystem::path& part_file,
+    const std::string& url,
+    const std::size_t total_size,
+    const std::size_t block_size,
+    const bool complete) {
+    asyncdownload::core::MetadataState state{};
+    state.url = url;
+    state.output_path = output_file;
+    state.temporary_path = part_file;
+    state.total_size = static_cast<std::int64_t>(total_size);
+    state.vdl_offset = complete
+        ? static_cast<std::int64_t>(total_size)
+        : static_cast<std::int64_t>(block_size);
+    state.accept_ranges = true;
+    state.resumed = true;
+    state.block_size = block_size;
+    state.io_alignment = 4 * 1024;
+    const auto block_count =
+        asyncdownload::core::required_block_count(
+            state.total_size,
+            block_size);
+    state.bitmap_states.assign(
+        block_count,
+        static_cast<std::uint8_t>(
+            complete
+                ? asyncdownload::core::BlockState::finished
+                : asyncdownload::core::BlockState::empty));
+    if (!complete) {
+        state.bitmap_states.front() =
+            static_cast<std::uint8_t>(
+                asyncdownload::core::BlockState::finished);
+    }
+    state.ranges.push_back({
+        0,
+        0,
+        static_cast<std::int64_t>(total_size - 1),
+        complete
+            ? static_cast<std::int64_t>(total_size)
+            : static_cast<std::int64_t>(block_size),
+        complete
+            ? static_cast<std::int64_t>(total_size)
+            : static_cast<std::int64_t>(block_size),
+        static_cast<std::uint8_t>(
+            complete
+                ? asyncdownload::core::RangeStatus::finished
+                : asyncdownload::core::RangeStatus::paused)
+    });
+
+    asyncdownload::metadata::MetadataStore store(metadata_file);
+    ASSERT_FALSE(store.save(state));
 }
 
 #endif
@@ -1020,6 +1104,264 @@ TEST(DownloadIntegrationTest, PreservesResumeArtifactsAfterServerFailure) {
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, DowngradesNonRangeServerToSingleFullRequest) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_non_range_fresh");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, 1024 * 1024);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --chunk-size 65536 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --disable-ranges";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    std::size_t max_active_requests = 0;
+    asyncdownload::DownloadRequest request{};
+    request.url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    request.output_path = output_file;
+    request.options.max_connections = 8;
+    request.progress_callback =
+        [&max_active_requests](
+            const asyncdownload::ProgressSnapshot& snapshot) {
+            max_active_requests =
+                std::max(max_active_requests, snapshot.active_requests);
+        };
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    const auto requests = read_logged_requests(request_log);
+    const auto get_count = std::count_if(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        });
+    EXPECT_EQ(get_count, 1);
+    EXPECT_TRUE(std::all_of(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method != "GET" ||
+                logged.range_header.empty();
+        }));
+    EXPECT_LE(max_active_requests, 1U);
+    EXPECT_TRUE(files_equal(source_file, output_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, RestartsSparseResumeStateWhenRangeIsUnavailable) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_non_range_sparse");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    constexpr std::size_t block_size = 64 * 1024;
+    constexpr std::size_t total_size = 4 * block_size;
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto part_file =
+        std::filesystem::path(output_file.string() + ".part");
+    const auto metadata_file =
+        std::filesystem::path(output_file.string() + ".config.json");
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, total_size);
+    ASSERT_TRUE(std::filesystem::copy_file(source_file, part_file, ec));
+    ASSERT_FALSE(ec);
+    std::vector<std::byte> corrupt_tail(
+        total_size - block_size,
+        std::byte{0x6D});
+    overwrite_bytes(
+        part_file,
+        static_cast<std::int64_t>(block_size),
+        corrupt_tail);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --chunk-size 65536 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --disable-ranges";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+    const auto url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    write_legacy_resume_state(
+        metadata_file,
+        output_file,
+        part_file,
+        url,
+        total_size,
+        block_size,
+        false);
+
+    std::size_t max_active_requests = 0;
+    asyncdownload::DownloadRequest request{};
+    request.url = url;
+    request.output_path = output_file;
+    request.options.max_connections = 8;
+    request.options.block_size = block_size;
+    request.progress_callback =
+        [&max_active_requests](
+            const asyncdownload::ProgressSnapshot& snapshot) {
+            max_active_requests =
+                std::max(max_active_requests, snapshot.active_requests);
+        };
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    EXPECT_FALSE(result.resumed);
+    const auto requests = read_logged_requests(request_log);
+    const auto get_count = std::count_if(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        });
+    EXPECT_EQ(get_count, 1);
+    EXPECT_TRUE(std::all_of(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method != "GET" ||
+                logged.range_header.empty();
+        }));
+    EXPECT_LE(max_active_requests, 1U);
+    EXPECT_TRUE(files_equal(source_file, output_file));
+    EXPECT_FALSE(std::filesystem::exists(part_file));
+    EXPECT_FALSE(std::filesystem::exists(metadata_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, FinalizesAlreadyCompleteStateWithoutRangeSupport) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_non_range_complete");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    constexpr std::size_t block_size = 64 * 1024;
+    constexpr std::size_t total_size = 4 * block_size;
+    const auto source_file = temp_root / "source.bin";
+    const auto output_file = temp_root / "downloaded.bin";
+    const auto part_file =
+        std::filesystem::path(output_file.string() + ".part");
+    const auto metadata_file =
+        std::filesystem::path(output_file.string() + ".config.json");
+    const auto request_log = temp_root / "requests.log";
+    write_test_file(source_file, total_size);
+    ASSERT_TRUE(std::filesystem::copy_file(source_file, part_file, ec));
+    ASSERT_FALSE(ec);
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --chunk-size 65536 --request-log " +
+        quote_arg(request_log.wstring()) +
+        L" --disable-ranges";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+    const auto url =
+        std::string("http://127.0.0.1:") + port_line + "/source.bin";
+    write_legacy_resume_state(
+        metadata_file,
+        output_file,
+        part_file,
+        url,
+        total_size,
+        block_size,
+        true);
+
+    asyncdownload::DownloadRequest request{};
+    request.url = url;
+    request.output_path = output_file;
+    request.options.max_connections = 8;
+    request.options.block_size = block_size;
+
+    asyncdownload::DownloadClient client;
+    const auto result = client.download(request);
+    stop_child(server, 0);
+
+    ASSERT_TRUE(result.ok()) << result.error.message();
+    EXPECT_TRUE(result.resumed);
+    const auto requests = read_logged_requests(request_log);
+    EXPECT_TRUE(std::none_of(
+        requests.begin(),
+        requests.end(),
+        [](const LoggedRequest& logged) {
+            return logged.method == "GET";
+        }));
+    EXPECT_TRUE(files_equal(source_file, output_file));
+    EXPECT_FALSE(std::filesystem::exists(part_file));
+    EXPECT_FALSE(std::filesystem::exists(metadata_file));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
 #endif
 }
 

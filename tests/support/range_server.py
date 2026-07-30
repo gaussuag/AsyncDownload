@@ -27,7 +27,7 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
         range_header = ""
 
         request_range = self.headers.get("Range")
-        if request_range:
+        if request_range and not self.server.disable_ranges:
             range_header = request_range
             unit, _, value = request_range.partition("=")
             if unit.strip() != "bytes":
@@ -51,7 +51,8 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(content_length))
-        self.send_header("Accept-Ranges", "bytes")
+        if not self.server.disable_ranges:
+            self.send_header("Accept-Ranges", "bytes")
         self.send_header("ETag", f'"{self.server.etag}"')
         self.send_header("Last-Modified", self.date_time_string(self.server.last_modified))
         if status == HTTPStatus.PARTIAL_CONTENT:
@@ -78,12 +79,21 @@ class RangeRequestHandler(BaseHTTPRequestHandler):
 class RangeServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, file_path, chunk_size, delay_ms, request_log_path):
+    def __init__(
+        self,
+        server_address,
+        file_path,
+        chunk_size,
+        delay_ms,
+        request_log_path,
+        disable_ranges,
+    ):
         super().__init__(server_address, RangeRequestHandler)
         self.file_path = file_path
         self.chunk_size = chunk_size
         self.delay_ms = delay_ms
         self.request_log_path = request_log_path
+        self.disable_ranges = disable_ranges
         self.request_log_lock = threading.Lock()
         stat = os.stat(file_path)
         self.last_modified = stat.st_mtime
@@ -106,10 +116,11 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=65536)
     parser.add_argument("--delay-ms", type=int, default=0)
     parser.add_argument("--request-log", default="")
+    parser.add_argument("--disable-ranges", action="store_true")
     args = parser.parse_args()
 
     server = RangeServer((args.host, args.port), os.path.abspath(args.file_path), args.chunk_size,
-        args.delay_ms, args.request_log)
+        args.delay_ms, args.request_log, args.disable_ranges)
     actual_port = server.server_address[1]
     print(actual_port, flush=True)
     try:

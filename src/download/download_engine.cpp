@@ -233,6 +233,27 @@ void invoke_progress(core::SessionState& session,
     return true;
 }
 
+[[nodiscard]] bool metadata_proves_complete(
+    const core::MetadataState& state,
+    const RecoveryIdentityPolicy& policy) noexcept {
+    if (state.total_size <= 0 ||
+        state.vdl_offset < state.total_size) {
+        return false;
+    }
+
+    const auto expected_blocks = core::required_block_count(
+        state.total_size,
+        policy.block_bytes);
+    return state.bitmap_states.size() == expected_blocks &&
+        std::all_of(
+            state.bitmap_states.begin(),
+            state.bitmap_states.end(),
+            [](const std::uint8_t value) {
+                return value ==
+                    static_cast<std::uint8_t>(core::BlockState::finished);
+            });
+}
+
 [[nodiscard]] std::int64_t sum_finished_bytes(const core::AtomicBlockBitmap& bitmap,
                                               const std::size_t block_size,
                                               const std::int64_t total_size) noexcept {
@@ -974,14 +995,23 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             return result;
         }
 
-        const auto temp_exists = std::filesystem::exists(session.paths.temporary_path);
-        const auto can_resume = temp_exists && loaded_metadata.has_value() &&
+        const auto temp_exists =
+            std::filesystem::exists(session.paths.temporary_path);
+        auto can_resume = false;
+        if (temp_exists &&
+            loaded_metadata.has_value() &&
             metadata_matches(
                 *loaded_metadata,
                 request.url,
                 effective_policy.recovery_identity(),
                 probe_result,
-                session.paths);
+                session.paths)) {
+            can_resume =
+                effective_policy.recovery_identity().allow_sparse_resume ||
+                metadata_proves_complete(
+                    *loaded_metadata,
+                    effective_policy.recovery_identity());
+        }
 
         // FileWriter 总是绑定到 .part 文件；若可以恢复则保留现有临时文件，
         // 否则按新任务语义重新打开并预分配。
