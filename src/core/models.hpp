@@ -65,16 +65,6 @@ struct MetadataState {
     std::vector<BlockCrcSample> crc_samples;
 };
 
-struct RemoteProbeResult {
-    // probe 自己的错误与 HTTP 响应码拆开保存，方便区分“网络失败”和“服务端响应无效”。
-    std::error_code error;
-    long response_code = 0;
-    std::int64_t total_size = 0;
-    bool accept_ranges = false;
-    std::string etag;
-    std::string last_modified;
-};
-
 struct SessionPaths {
     // output_path 是最终产物路径；其余两个是恢复阶段使用的中间文件。
     std::filesystem::path output_path;
