@@ -112,17 +112,6 @@ private:
     [[nodiscard]] metadata::MetadataStore&
     legacy_metadata_store() noexcept;
 
-    [[nodiscard]] std::error_code
-    legacy_flush_part() noexcept;
-
-    [[nodiscard]] std::error_code legacy_read_part(
-        std::int64_t offset,
-        std::size_t length,
-        std::vector<std::byte>& output) noexcept;
-
-    [[nodiscard]] std::error_code legacy_save_metadata(
-        const core::MetadataState& state) noexcept;
-
     std::unique_ptr<Implementation> implementation_;
 
     friend class download::DownloadEngine;

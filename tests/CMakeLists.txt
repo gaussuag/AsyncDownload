@@ -120,9 +120,15 @@ add_executable(asyncdownload_recovery_fault_tests
     ${CMAKE_SOURCE_DIR}/src/core/block_bitmap.cpp
     ${CMAKE_SOURCE_DIR}/src/core/crc32.cpp
     ${CMAKE_SOURCE_DIR}/src/core/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/download/download_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/flow/packet_flow.cpp
     ${CMAKE_SOURCE_DIR}/src/metadata/metadata_store.cpp
+    ${CMAKE_SOURCE_DIR}/src/persistence/persistence_thread.cpp
+    ${CMAKE_SOURCE_DIR}/src/range/range_fact_slot.cpp
     ${CMAKE_SOURCE_DIR}/src/recovery/recovery_checkpoint.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/file_writer.cpp
+    ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_collector.cpp
+    ${CMAKE_SOURCE_DIR}/src/telemetry/telemetry_session.cpp
 )
 target_compile_definitions(
     asyncdownload_recovery_fault_tests
@@ -135,6 +141,17 @@ target_include_directories(
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/src
 )
+file(GLOB RECOVERY_FAULT_LIB_INCLUDE_DIRS
+    LIST_DIRECTORIES true
+    "${CMAKE_SOURCE_DIR}/libs/*/include")
+foreach(inc_dir ${RECOVERY_FAULT_LIB_INCLUDE_DIRS})
+    if(IS_DIRECTORY ${inc_dir})
+        target_include_directories(
+            asyncdownload_recovery_fault_tests
+            PRIVATE
+                ${inc_dir})
+    endif()
+endforeach()
 target_link_libraries(
     asyncdownload_recovery_fault_tests
     PRIVATE

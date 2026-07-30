@@ -3,7 +3,6 @@
 #include "asyncdownload/error.hpp"
 #include "core/alignment.hpp"
 #include "core/constants.hpp"
-#include "core/crc32.hpp"
 #include "range/range_fault_adapter.hpp"
 #include "recovery/recovery_checkpoint.hpp"
 
@@ -795,10 +794,7 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
         return;
     }
 
-    // 同一时刻最多只允许一个异步 flush 在跑，避免 file_writer_ 的 flush/read/save
-    // 和下一轮快照生成互相打架。
-    if (pending_flush_.valid() &&
-        pending_flush_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+    if (pending_flush_.valid()) {
         return;
     }
 
@@ -811,28 +807,34 @@ void PersistenceThread::maybe_schedule_flush(const bool force) {
         return;
     }
 
-    // Flush 和 metadata 保存都放到线程池异步做，Persistence 线程继续串行消费
-    // 数据包，避免把网络到磁盘这条主链卡死在 FlushFileBuffers 上。
-    auto snapshot = build_metadata_state();
+    auto prepared = checkpoint_.prepare(
+        bitmap_.snapshot(),
+        build_recovery_ranges());
+    if (prepared.error ||
+        prepared.checkpoint == nullptr) {
+        set_error(
+            prepared.error ?
+                prepared.error :
+                make_error_code(
+                    DownloadErrc::internal_error));
+        return;
+    }
+    pending_generation_ =
+        next_checkpoint_generation_;
+    next_checkpoint_generation_ =
+        next_checkpoint_generation_ ==
+                std::numeric_limits<
+                    recovery::CheckpointGeneration>::max() ?
+            0 :
+            next_checkpoint_generation_ + 1;
+    pending_flush_ = workers_.submit_task(
+        [this, checkpoint =
+             std::move(prepared.checkpoint)]() mutable {
+            return checkpoint_.commit(
+                std::move(checkpoint));
+        });
     bytes_since_flush_ = 0;
     last_flush_time_ = now;
-
-    pending_flush_ = workers_.submit_task([this, snapshot]() mutable {
-        auto flush_error =
-            checkpoint_.legacy_flush_part();
-        if (flush_error) {
-            return flush_error;
-        }
-
-        // CRC 只对 VDL 之后仍被标成 finished 的块采样，因为 VDL 之前的数据已经由
-        // “最长连续安全前沿”语义兜底，恢复时不需要再逐块复查。
-        snapshot.vdl_offset = bitmap_.contiguous_finished_bytes(policy_.block_bytes,
-            session_.total_size);
-        snapshot.crc_samples = build_crc_samples(snapshot);
-        auto metadata_error =
-            checkpoint_.legacy_save_metadata(snapshot);
-        return metadata_error;
-    });
 }
 
 void PersistenceThread::poll_pending_flush() {
@@ -844,15 +846,8 @@ void PersistenceThread::poll_pending_flush() {
         return;
     }
 
-    const auto flush_error = pending_flush_.get();
-    if (flush_error) {
-        set_error(flush_error);
-        return;
-    }
-
-    // 只有 flush 和 metadata 都成功后，新的 VDL 才算真正对外可见。
-    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(policy_.block_bytes,
-        session_.total_size), std::memory_order_release);
+    const auto result = pending_flush_.get();
+    publish_commit_result(result);
 }
 
 void PersistenceThread::wait_pending_flush() {
@@ -860,37 +855,15 @@ void PersistenceThread::wait_pending_flush() {
         return;
     }
 
-    const auto flush_error = pending_flush_.get();
-    if (flush_error) {
-        set_error(flush_error);
-        return;
-    }
-
-    // 退出阶段也要按同样的顺序推进 VDL，避免最后一轮已写盘数据没有进入恢复元数据。
-    session_.vdl_offset.store(bitmap_.contiguous_finished_bytes(policy_.block_bytes,
-        session_.total_size), std::memory_order_release);
+    const auto result = pending_flush_.get();
+    publish_commit_result(result);
 }
 
-core::MetadataState PersistenceThread::build_metadata_state() const {
-    core::MetadataState state{};
-    state.url = session_.url;
-    state.output_path = session_.paths.output_path;
-    state.temporary_path = session_.paths.temporary_path;
-    state.total_size = session_.total_size;
-    state.accept_ranges =
-        session_.effective_policy.remote_facts().accept_ranges;
-    state.resumed = session_.resumed;
-    state.etag = session_.etag;
-    state.last_modified = session_.last_modified;
-    state.block_size = policy_.block_bytes;
-    state.io_alignment = policy_.io_alignment_bytes;
-
-    core::AtomicBlockBitmap snapshot_bitmap(core::required_block_count(session_.total_size,
-        policy_.block_bytes));
-    snapshot_bitmap.restore(bitmap_.snapshot());
-
-    // metadata 快照不能只信 bitmap 当前值，因为某些 range 的 persisted_offset
-    // 可能已经推进了，但本轮 snapshot 还没来得及把这些推进反映到独立副本里。
+std::vector<recovery::RecoveryRangeFact>
+PersistenceThread::build_recovery_ranges() const {
+    std::vector<recovery::RecoveryRangeFact>
+        snapshot;
+    snapshot.reserve(ranges_.size());
     for (const auto& range : ranges_) {
         if (range == nullptr) {
             continue;
@@ -905,63 +878,37 @@ core::MetadataState PersistenceThread::build_metadata_state() const {
                     range->observed_activity ?
                         core::RangeStatus::downloading :
                         core::RangeStatus::empty;
-        state.ranges.push_back(core::RangeStateSnapshot{
-            static_cast<std::size_t>(range->id.value),
-            range->bytes.begin,
-            range->bytes.end - 1,
+        snapshot.push_back({
+            range->id,
+            range->bytes,
             std::max(
                 range->observed_dispatch_through,
                 range->persisted_through),
             range->persisted_through,
-            static_cast<std::uint8_t>(status)});
-
-        if (range->persisted_through >
-            range->bytes.begin) {
-            snapshot_bitmap.mark_finished_range(
-                range->bytes.begin,
-                range->persisted_through,
-                policy_.block_bytes,
-                session_.total_size);
-        }
+            static_cast<std::uint8_t>(status)
+        });
     }
-
-    state.bitmap_states = snapshot_bitmap.snapshot();
-    state.vdl_offset = snapshot_bitmap.contiguous_finished_bytes(policy_.block_bytes,
-        session_.total_size);
-    return state;
+    return snapshot;
 }
 
-std::vector<core::BlockCrcSample>
-PersistenceThread::build_crc_samples(const core::MetadataState& state) const {
-    std::vector<core::BlockCrcSample> samples;
-    const auto block_size = static_cast<std::int64_t>(state.block_size);
-
-    for (std::size_t index = 0; index < state.bitmap_states.size(); ++index) {
-        if (state.bitmap_states[index] != static_cast<std::uint8_t>(core::BlockState::finished)) {
-            continue;
-        }
-
-        const auto offset = static_cast<std::int64_t>(index) * block_size;
-        if (offset < state.vdl_offset) {
-            continue;
-        }
-
-        const auto length = static_cast<std::size_t>(std::min(block_size,
-            state.total_size - offset));
-        std::vector<std::byte> bytes;
-        const auto read_error =
-            checkpoint_.legacy_read_part(
-                offset,
-                length,
-                bytes);
-        if (read_error) {
-            continue;
-        }
-
-        samples.push_back(core::BlockCrcSample{offset, core::crc32(bytes), length});
+void PersistenceThread::publish_commit_result(
+    const recovery::CheckpointCommitResult& result) {
+    const auto expected_generation =
+        pending_generation_;
+    pending_generation_ = 0;
+    if (result.error) {
+        set_error(result.error);
+        return;
     }
-
-    return samples;
+    if (expected_generation == 0 ||
+        result.generation != expected_generation) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
+        return;
+    }
+    session_.vdl_offset.store(
+        result.committed_vdl,
+        std::memory_order_release);
 }
 
 void PersistenceThread::set_error(const std::error_code error) {

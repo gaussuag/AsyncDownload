@@ -631,3 +631,51 @@ TEST(
     EXPECT_FALSE(std::filesystem::exists(
         request.paths.output_path));
 }
+
+TEST(
+    RecoveryCheckpointTest,
+    SerializesPreparedImagesAndGenerations) {
+    RecoveryTempDirectory temp(
+        "asyncdownload_recovery_generations");
+    const auto request = fresh_request(temp.path());
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<
+        asyncdownload::recovery::RecoveryRangeFact>
+        ranges;
+
+    auto first =
+        opened.checkpoint->prepare(bitmap, ranges);
+    auto overlapping =
+        opened.checkpoint->prepare(bitmap, ranges);
+
+    ASSERT_FALSE(first.error);
+    ASSERT_NE(first.checkpoint, nullptr);
+    EXPECT_EQ(overlapping.checkpoint, nullptr);
+    EXPECT_EQ(
+        overlapping.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                internal_error));
+    const auto first_result =
+        opened.checkpoint->commit(
+            std::move(first.checkpoint));
+    ASSERT_FALSE(first_result.error);
+    EXPECT_EQ(first_result.generation, 1U);
+    EXPECT_EQ(first_result.committed_vdl, 0);
+
+    auto second =
+        opened.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(second.error);
+    ASSERT_NE(second.checkpoint, nullptr);
+    const auto second_result =
+        opened.checkpoint->commit(
+            std::move(second.checkpoint));
+    ASSERT_FALSE(second_result.error);
+    EXPECT_EQ(second_result.generation, 2U);
+    EXPECT_EQ(second_result.committed_vdl, 0);
+}

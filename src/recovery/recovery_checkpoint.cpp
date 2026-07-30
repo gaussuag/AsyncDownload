@@ -11,13 +11,28 @@
 #include <cstddef>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace asyncdownload::recovery {
 
-class PreparedCheckpoint::Implementation {};
+class PreparedCheckpoint::Implementation {
+public:
+    Implementation(
+        const void* checkpoint_owner,
+        const CheckpointGeneration checkpoint_generation,
+        core::MetadataState checkpoint_state)
+        : owner(checkpoint_owner),
+          generation(checkpoint_generation),
+          state(std::move(checkpoint_state)) {}
+
+    const void* owner = nullptr;
+    CheckpointGeneration generation = 0;
+    core::MetadataState state;
+};
 
 PreparedCheckpoint::PreparedCheckpoint(
     std::unique_ptr<Implementation>
@@ -49,6 +64,13 @@ public:
     bool overwrite_existing = false;
     storage::FileWriter file_writer;
     metadata::MetadataStore metadata_store;
+    std::mutex state_mutex;
+    CheckpointGeneration next_generation = 1;
+    CheckpointGeneration prepared_generation = 0;
+    CheckpointGeneration active_generation = 0;
+    CheckpointGeneration last_committed_generation = 0;
+    std::int64_t last_committed_vdl = 0;
+    bool resumed = false;
 };
 
 namespace {
@@ -395,6 +417,14 @@ RecoveryOpenResult RecoveryCheckpoint::open(
             result.restored.bitmap_states =
                 bitmap.snapshot();
         }
+        implementation->resumed =
+            result.restored.disposition !=
+            RecoveryDisposition::fresh;
+        if (result.restored.disposition ==
+            RecoveryDisposition::complete) {
+            implementation->last_committed_vdl =
+                request.remote.total_size;
+        }
         result.checkpoint =
             std::unique_ptr<RecoveryCheckpoint>(
                 new RecoveryCheckpoint(
@@ -439,16 +469,273 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
     const std::span<const std::uint8_t> bitmap_states,
     const std::span<const RecoveryRangeFact> ranges)
     noexcept {
-    static_cast<void>(bitmap_states);
-    static_cast<void>(ranges);
-    return {nullptr, internal_error()};
+    PrepareCheckpointResult result{};
+    if (implementation_ == nullptr) {
+        result.error = internal_error();
+        return result;
+    }
+
+    try {
+        std::scoped_lock lock(
+            implementation_->state_mutex);
+        if (implementation_->prepared_generation != 0 ||
+            implementation_->active_generation != 0 ||
+            implementation_->next_generation == 0) {
+            result.error = internal_error();
+            return result;
+        }
+        const auto block_count =
+            core::required_block_count(
+                implementation_->remote.total_size,
+                implementation_->policy.block_bytes);
+        if (bitmap_states.size() != block_count) {
+            result.error =
+                std::make_error_code(
+                    std::errc::invalid_argument);
+            return result;
+        }
+        std::vector<std::uint8_t> frozen_bitmap(
+            bitmap_states.begin(),
+            bitmap_states.end());
+        for (const auto state : frozen_bitmap) {
+            if (state >
+                static_cast<std::uint8_t>(
+                    core::BlockState::finished)) {
+                result.error =
+                    std::make_error_code(
+                        std::errc::invalid_argument);
+                return result;
+            }
+        }
+        core::AtomicBlockBitmap projected_bitmap(
+            block_count);
+        projected_bitmap.restore(frozen_bitmap);
+
+        core::MetadataState state{};
+        state.url = implementation_->remote.url;
+        state.output_path =
+            implementation_->paths.output_path;
+        state.temporary_path =
+            implementation_->paths.temporary_path;
+        state.total_size =
+            implementation_->remote.total_size;
+        state.accept_ranges =
+            implementation_->remote.accept_ranges;
+        state.resumed = implementation_->resumed;
+        state.etag = implementation_->remote.etag;
+        state.last_modified =
+            implementation_->remote.last_modified;
+        state.block_size =
+            implementation_->policy.block_bytes;
+        state.io_alignment =
+            implementation_->policy.io_alignment_bytes;
+        state.ranges.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            if (range.id.value >
+                    std::numeric_limits<
+                        std::size_t>::max() ||
+                range.bytes.begin < 0 ||
+                range.bytes.begin >= range.bytes.end ||
+                range.bytes.end >
+                    implementation_->remote.total_size ||
+                range.dispatch_cursor <
+                    range.bytes.begin ||
+                range.dispatch_cursor >
+                    range.bytes.end ||
+                range.persisted_through <
+                    range.bytes.begin ||
+                range.persisted_through >
+                    range.bytes.end) {
+                result.error =
+                    std::make_error_code(
+                        std::errc::invalid_argument);
+                return result;
+            }
+            state.ranges.push_back({
+                static_cast<std::size_t>(
+                    range.id.value),
+                range.bytes.begin,
+                range.bytes.end - 1,
+                std::max(
+                    range.dispatch_cursor,
+                    range.persisted_through),
+                range.persisted_through,
+                range.legacy_status
+            });
+            projected_bitmap.mark_finished_range(
+                range.bytes.begin,
+                range.persisted_through,
+                implementation_->policy.block_bytes,
+                implementation_->remote.total_size);
+        }
+        state.bitmap_states =
+            projected_bitmap.snapshot();
+        state.vdl_offset =
+            projected_bitmap.
+                contiguous_finished_bytes(
+                    implementation_->policy.block_bytes,
+                    implementation_->remote.total_size);
+
+        const auto generation =
+            implementation_->next_generation;
+        auto prepared_implementation =
+            std::make_unique<
+                PreparedCheckpoint::Implementation>(
+                    implementation_.get(),
+                    generation,
+                    std::move(state));
+        result.checkpoint =
+            std::unique_ptr<PreparedCheckpoint>(
+                new PreparedCheckpoint(
+                    std::move(
+                        prepared_implementation)));
+        implementation_->prepared_generation =
+            generation;
+        implementation_->next_generation =
+            generation ==
+                    std::numeric_limits<
+                        CheckpointGeneration>::max() ?
+                0 :
+                generation + 1;
+    } catch (const std::bad_alloc&) {
+        result.error = internal_error();
+    } catch (...) {
+        result.error = internal_error();
+    }
+    if (result.error) {
+        result.checkpoint.reset();
+    }
+    return result;
 }
 
 CheckpointCommitResult RecoveryCheckpoint::commit(
     std::unique_ptr<PreparedCheckpoint> checkpoint)
     noexcept {
-    static_cast<void>(checkpoint);
-    return {0, 0, internal_error()};
+    CheckpointCommitResult result{};
+    if (implementation_ == nullptr ||
+        checkpoint == nullptr ||
+        checkpoint->implementation_ == nullptr) {
+        result.error = internal_error();
+        return result;
+    }
+    auto& prepared =
+        *checkpoint->implementation_;
+    result.generation = prepared.generation;
+    {
+        std::scoped_lock lock(
+            implementation_->state_mutex);
+        if (prepared.owner != implementation_.get() ||
+            prepared.generation == 0 ||
+            implementation_->prepared_generation !=
+                prepared.generation ||
+            implementation_->active_generation != 0) {
+            result.error = internal_error();
+            return result;
+        }
+        implementation_->prepared_generation = 0;
+        implementation_->active_generation =
+            prepared.generation;
+    }
+
+    const auto finish = [this, &result](
+                            const std::error_code error) {
+        std::scoped_lock lock(
+            implementation_->state_mutex);
+        if (!error &&
+            implementation_->active_generation ==
+                result.generation) {
+            implementation_->last_committed_generation =
+                result.generation;
+            implementation_->last_committed_vdl =
+                result.committed_vdl;
+        }
+        implementation_->active_generation = 0;
+        result.error = error;
+    };
+
+    try {
+        const auto flush_error =
+            implementation_->file_writer.flush();
+        if (flush_error) {
+            finish(flush_error);
+            return result;
+        }
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        auto& fault_plan =
+            detail::recovery_fault_plan();
+        fault_plan.
+            part_flush_completed_generation.store(
+                result.generation,
+                std::memory_order_release);
+        while (fault_plan.
+                   pause_after_part_flush_generation.load(
+                       std::memory_order_acquire) ==
+               result.generation) {
+            std::this_thread::yield();
+        }
+        if (fault_plan.stop_after_part_flush.exchange(
+                false,
+                std::memory_order_acq_rel)) {
+            finish(internal_error());
+            return result;
+        }
+#endif
+        const auto block_size =
+            static_cast<std::int64_t>(
+                prepared.state.block_size);
+        for (std::size_t index = 0;
+             index <
+                 prepared.state.bitmap_states.size();
+             ++index) {
+            if (prepared.state.bitmap_states[index] !=
+                static_cast<std::uint8_t>(
+                    core::BlockState::finished)) {
+                continue;
+            }
+            const auto offset =
+                static_cast<std::int64_t>(index) *
+                block_size;
+            if (offset <
+                prepared.state.vdl_offset) {
+                continue;
+            }
+            const auto length =
+                static_cast<std::size_t>(
+                    std::min(
+                        block_size,
+                        prepared.state.total_size -
+                            offset));
+            std::vector<std::byte> bytes;
+            const auto read_error =
+                implementation_->file_writer.read(
+                    offset,
+                    length,
+                    bytes);
+            if (read_error) {
+                continue;
+            }
+            prepared.state.crc_samples.push_back({
+                offset,
+                core::crc32(bytes),
+                length
+            });
+        }
+        const auto metadata_error =
+            implementation_->metadata_store.save(
+                prepared.state);
+        if (metadata_error) {
+            finish(metadata_error);
+            return result;
+        }
+        result.committed_vdl =
+            prepared.state.vdl_offset;
+        finish({});
+    } catch (const std::bad_alloc&) {
+        finish(internal_error());
+    } catch (...) {
+        finish(internal_error());
+    }
+    return result;
 }
 
 FinalizeResult RecoveryCheckpoint::finalize() noexcept {
@@ -488,26 +775,6 @@ RecoveryCheckpoint::legacy_file_writer() noexcept {
 metadata::MetadataStore&
 RecoveryCheckpoint::legacy_metadata_store() noexcept {
     return implementation_->metadata_store;
-}
-
-std::error_code RecoveryCheckpoint::legacy_flush_part()
-    noexcept {
-    return implementation_->file_writer.flush();
-}
-
-std::error_code RecoveryCheckpoint::legacy_read_part(
-    const std::int64_t offset,
-    const std::size_t length,
-    std::vector<std::byte>& output) noexcept {
-    return implementation_->file_writer.read(
-        offset,
-        length,
-        output);
-}
-
-std::error_code RecoveryCheckpoint::legacy_save_metadata(
-    const core::MetadataState& state) noexcept {
-    return implementation_->metadata_store.save(state);
 }
 
 }

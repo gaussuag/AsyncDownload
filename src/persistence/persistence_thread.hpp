@@ -6,6 +6,7 @@
 #include "flow/packet_flow.hpp"
 #include "persistence/range_write_state.hpp"
 #include "range/range_lifecycle.hpp"
+#include "recovery/recovery_types.hpp"
 
 #include <thread-pool/BS_thread_pool.hpp>
 
@@ -122,11 +123,11 @@ private:
     void poll_pending_flush();
     // 退出阶段阻塞等待最后一个 flush 完成。
     void wait_pending_flush();
-    // 汇总当前位图、range 前沿和资源身份信息，构造 metadata 快照。
-    [[nodiscard]] core::MetadataState build_metadata_state() const;
-    // 为 VDL 之后仍 finished 的块生成 CRC 样本。
-    [[nodiscard]] std::vector<core::BlockCrcSample>
-    build_crc_samples(const core::MetadataState& state) const;
+    [[nodiscard]] std::vector<
+        recovery::RecoveryRangeFact>
+    build_recovery_ranges() const;
+    void publish_commit_result(
+        const recovery::CheckpointCommitResult& result);
     // 只记录首个错误，后续错误当作连带症状忽略。
     void set_error(std::error_code error);
 
@@ -146,7 +147,12 @@ private:
     std::deque<RangeRegistrationAck> geometry_acks_;
     RangeRegistrationTicket next_geometry_ticket_ = 1;
     std::thread worker_thread_;
-    std::future<std::error_code> pending_flush_;
+    std::future<recovery::CheckpointCommitResult>
+        pending_flush_;
+    recovery::CheckpointGeneration
+        pending_generation_ = 0;
+    recovery::CheckpointGeneration
+        next_checkpoint_generation_ = 1;
     std::chrono::steady_clock::time_point last_flush_time_{std::chrono::steady_clock::now()};
     std::size_t bytes_since_flush_ = 0;
     mutable std::mutex error_mutex_;
