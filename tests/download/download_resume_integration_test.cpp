@@ -497,6 +497,48 @@ void write_legacy_resume_state(
     ASSERT_FALSE(store.save(state));
 }
 
+struct CliExecution {
+    DWORD start_error = 0;
+    DWORD wait_result = WAIT_FAILED;
+    DWORD exit_code = 0;
+    std::string output;
+};
+
+CliExecution run_cli(
+    const std::filesystem::path& cli_path,
+    const std::wstring& command,
+    const std::filesystem::path& working_directory) {
+    ChildProcess child;
+    CliExecution execution{};
+    if (!start_process(
+            child,
+            cli_path.wstring(),
+            command,
+            working_directory,
+            true)) {
+        execution.start_error = g_last_start_process_error;
+        return execution;
+    }
+
+    execution.wait_result = child.wait(20000);
+    if (execution.wait_result == WAIT_TIMEOUT) {
+        child.terminate(91);
+        execution.wait_result = child.wait(5000);
+    }
+    execution.exit_code = child.exit_code();
+    execution.output = read_all_from_pipe(child.stdout_read);
+    child.close();
+    return execution;
+}
+
+void write_text_file(
+    const std::filesystem::path& path,
+    const std::string_view text) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.is_open());
+    stream << text;
+}
+
 #endif
 
 TEST(DownloadIntegrationTest, ResumeAfterInterruptedCliDownload) {
@@ -1104,6 +1146,209 @@ TEST(DownloadIntegrationTest, PreservesResumeArtifactsAfterServerFailure) {
 
     const auto final_removed = std::filesystem::remove_all(temp_root, ec);
     static_cast<void>(final_removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, RejectsConfigWithInvalidWatermarkOrder) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_invalid_watermark");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto cli_path = get_cli_path();
+    const auto config_file = temp_root / "config.json";
+    const auto output_file = temp_root / "output.bin";
+    write_text_file(
+        config_file,
+        R"({"backpressure_high_bytes":1024,"backpressure_low_bytes":2048})");
+    const auto command = quote_arg(cli_path.wstring()) +
+        L" http://127.0.0.1:1/unreachable " +
+        quote_arg(output_file.wstring()) +
+        L" --config " +
+        quote_arg(config_file.wstring());
+
+    const auto execution =
+        run_cli(cli_path, command, workspace_root);
+    if (execution.start_error == ERROR_ELEVATION_REQUIRED) {
+        GTEST_SKIP() << "CreateProcess error=740";
+    }
+
+    ASSERT_EQ(execution.start_error, 0U);
+    ASSERT_EQ(execution.wait_result, WAIT_OBJECT_0);
+    EXPECT_NE(execution.exit_code, 0U);
+    EXPECT_NE(execution.output.find("invalid request"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, RejectsConfigWithUnsafeIoAlignment) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_unsafe_alignment");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto cli_path = get_cli_path();
+    const auto config_file = temp_root / "config.json";
+    const auto output_file = temp_root / "output.bin";
+    write_text_file(config_file, R"({"io_alignment":8192})");
+    const auto command = quote_arg(cli_path.wstring()) +
+        L" http://127.0.0.1:1/unreachable " +
+        quote_arg(output_file.wstring()) +
+        L" --config " +
+        quote_arg(config_file.wstring());
+
+    const auto execution =
+        run_cli(cli_path, command, workspace_root);
+    if (execution.start_error == ERROR_ELEVATION_REQUIRED) {
+        GTEST_SKIP() << "CreateProcess error=740";
+    }
+
+    ASSERT_EQ(execution.start_error, 0U);
+    ASSERT_EQ(execution.wait_result, WAIT_OBJECT_0);
+    EXPECT_NE(execution.exit_code, 0U);
+    EXPECT_NE(execution.output.find("invalid request"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, AppliesConnectionsOverrideBeforePolicyValidation) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_zero_override");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto cli_path = get_cli_path();
+    const auto config_file = temp_root / "config.json";
+    const auto output_file = temp_root / "output.bin";
+    write_text_file(config_file, R"({"max_connections":2})");
+    const auto command = quote_arg(cli_path.wstring()) +
+        L" http://127.0.0.1:1/unreachable " +
+        quote_arg(output_file.wstring()) +
+        L" 0 --config " +
+        quote_arg(config_file.wstring());
+
+    const auto execution =
+        run_cli(cli_path, command, workspace_root);
+    if (execution.start_error == ERROR_ELEVATION_REQUIRED) {
+        GTEST_SKIP() << "CreateProcess error=740";
+    }
+
+    ASSERT_EQ(execution.start_error, 0U);
+    ASSERT_EQ(execution.wait_result, WAIT_OBJECT_0);
+    EXPECT_NE(execution.exit_code, 0U);
+    EXPECT_NE(execution.output.find("invalid request"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(output_file));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".part")));
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(output_file.string() + ".config.json")));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
+#endif
+}
+
+TEST(DownloadIntegrationTest, PreservesDirectAndWrappedConfigShapes) {
+#ifndef _WIN32
+    GTEST_SKIP() << "This integration test currently uses Windows process control.";
+#else
+    const auto workspace_root = get_workspace_root();
+    const auto temp_root =
+        make_unique_temp_root("asyncdownload_config_shapes");
+    std::error_code ec;
+    std::filesystem::create_directories(temp_root, ec);
+    ASSERT_FALSE(ec);
+
+    const auto source_file = temp_root / "source.bin";
+    const auto direct_output = temp_root / "direct.bin";
+    const auto wrapped_output = temp_root / "wrapped.bin";
+    const auto direct_config = temp_root / "direct.json";
+    const auto wrapped_config = temp_root / "wrapped.json";
+    write_test_file(source_file, 256 * 1024);
+    write_text_file(direct_config, R"({"max_connections":2})");
+    write_text_file(
+        wrapped_config,
+        R"({"download_options":{"max_connections":2}})");
+
+    ChildProcess server;
+    const auto script_path =
+        workspace_root / "tests" / "support" / "range_server.py";
+    const auto server_command = quote_arg(L"python") + L" " +
+        quote_arg(script_path.wstring()) + L" " +
+        quote_arg(source_file.wstring()) +
+        L" --port 0 --chunk-size 65536";
+    ASSERT_TRUE(start_process(
+        server,
+        L"",
+        server_command,
+        workspace_root,
+        true));
+    const auto port_line = read_line_from_pipe(server.stdout_read, 5000);
+    ASSERT_FALSE(port_line.empty());
+
+    const auto cli_path = get_cli_path();
+    const auto url = std::wstring(
+        L"http://127.0.0.1:") +
+        std::wstring(port_line.begin(), port_line.end()) +
+        L"/source.bin";
+    const auto direct_command = quote_arg(cli_path.wstring()) +
+        L" " + quote_arg(url) +
+        L" " + quote_arg(direct_output.wstring()) +
+        L" --config " + quote_arg(direct_config.wstring());
+    const auto direct =
+        run_cli(cli_path, direct_command, workspace_root);
+    if (direct.start_error == ERROR_ELEVATION_REQUIRED) {
+        stop_child(server, 0);
+        GTEST_SKIP() << "CreateProcess error=740";
+    }
+    const auto wrapped_command = quote_arg(cli_path.wstring()) +
+        L" " + quote_arg(url) +
+        L" " + quote_arg(wrapped_output.wstring()) +
+        L" --config " + quote_arg(wrapped_config.wstring());
+    const auto wrapped =
+        run_cli(cli_path, wrapped_command, workspace_root);
+    stop_child(server, 0);
+
+    ASSERT_EQ(direct.start_error, 0U);
+    ASSERT_EQ(wrapped.start_error, 0U);
+    ASSERT_EQ(direct.wait_result, WAIT_OBJECT_0);
+    ASSERT_EQ(wrapped.wait_result, WAIT_OBJECT_0);
+    EXPECT_EQ(direct.exit_code, 0U) << direct.output;
+    EXPECT_EQ(wrapped.exit_code, 0U) << wrapped.output;
+    EXPECT_TRUE(files_equal(source_file, direct_output));
+    EXPECT_TRUE(files_equal(source_file, wrapped_output));
+
+    const auto removed = std::filesystem::remove_all(temp_root, ec);
+    static_cast<void>(removed);
 #endif
 }
 

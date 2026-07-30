@@ -3,14 +3,17 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cstdlib>
+#include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #ifdef _WIN32
@@ -21,17 +24,10 @@
 namespace {
 
 [[nodiscard]] bool parse_connections(const char* value, std::size_t& result) {
-    try {
-        const auto parsed = std::stoull(value);
-        if (parsed == 0) {
-            return false;
-        }
-
-        result = static_cast<std::size_t>(parsed);
-        return true;
-    } catch (...) {
-        return false;
-    }
+    const std::string_view input(value);
+    const auto [end, error] =
+        std::from_chars(input.data(), input.data() + input.size(), result);
+    return error == std::errc{} && end == input.data() + input.size();
 }
 
 struct CliOptions {
@@ -90,8 +86,7 @@ void print_usage() {
 
 [[nodiscard]] bool read_size_field(const nlohmann::json& object,
                                    const char* key,
-                                   std::size_t& target,
-                                   const bool allow_zero) {
+                                   std::size_t& target) {
     if (!object.contains(key)) {
         return true;
     }
@@ -101,8 +96,17 @@ void print_usage() {
         return false;
     }
 
+    if (field.is_number_unsigned()) {
+        const auto value = field.get<std::uint64_t>();
+        if (value > std::numeric_limits<std::size_t>::max()) {
+            return false;
+        }
+        target = static_cast<std::size_t>(value);
+        return true;
+    }
+
     const auto value = field.get<std::int64_t>();
-    if (value < 0 || (!allow_zero && value == 0)) {
+    if (value < 0) {
         return false;
     }
 
@@ -138,11 +142,18 @@ void print_usage() {
         return false;
     }
 
-    const auto value = field.get<std::int64_t>();
-    if (value < 0) {
-        return false;
+    if (field.is_number_unsigned()) {
+        const auto value = field.get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(
+                std::chrono::milliseconds::max().count())) {
+            return false;
+        }
+        target = std::chrono::milliseconds(
+            static_cast<std::chrono::milliseconds::rep>(value));
+        return true;
     }
 
+    const auto value = field.get<std::int64_t>();
     target = std::chrono::milliseconds(value);
     return true;
 }
@@ -173,24 +184,21 @@ void print_usage() {
         return false;
     }
 
-    if (!read_size_field(*object, "max_connections", options.max_connections, false) ||
-        !read_size_field(*object, "queue_capacity_packets", options.queue_capacity_packets, false) ||
+    if (!read_size_field(*object, "max_connections", options.max_connections) ||
+        !read_size_field(*object, "queue_capacity_packets", options.queue_capacity_packets) ||
         !read_size_field(*object,
             "scheduler_window_bytes",
-            options.scheduler_window_bytes,
-            false) ||
+            options.scheduler_window_bytes) ||
         !read_size_field(*object,
             "backpressure_high_bytes",
-            options.backpressure_high_bytes,
-            false) ||
+            options.backpressure_high_bytes) ||
         !read_size_field(*object,
             "backpressure_low_bytes",
-            options.backpressure_low_bytes,
-            true) ||
-        !read_size_field(*object, "block_size", options.block_size, false) ||
-        !read_size_field(*object, "io_alignment", options.io_alignment, false) ||
-        !read_size_field(*object, "max_gap_bytes", options.max_gap_bytes, false) ||
-        !read_size_field(*object, "flush_threshold_bytes", options.flush_threshold_bytes, false) ||
+            options.backpressure_low_bytes) ||
+        !read_size_field(*object, "block_size", options.block_size) ||
+        !read_size_field(*object, "io_alignment", options.io_alignment) ||
+        !read_size_field(*object, "max_gap_bytes", options.max_gap_bytes) ||
+        !read_size_field(*object, "flush_threshold_bytes", options.flush_threshold_bytes) ||
         !read_duration_field(*object, "flush_interval_ms", options.flush_interval) ||
         !read_bool_field(*object, "overwrite_existing", options.overwrite_existing)) {
         error_message = "config file contains an invalid DownloadOptions field";
