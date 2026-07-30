@@ -1394,6 +1394,7 @@ TEST(DownloadIntegrationTest, DowngradesNonRangeServerToSingleFullRequest) {
         std::string("http://127.0.0.1:") + port_line + "/source.bin";
     request.output_path = output_file;
     request.options.max_connections = 8;
+    request.options.queue_capacity_packets = 1;
     request.progress_callback =
         [&max_active_requests](
             const asyncdownload::ProgressSnapshot& snapshot) {
