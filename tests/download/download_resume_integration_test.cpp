@@ -294,6 +294,21 @@ std::optional<double> parse_summary_speed_mb_s(const std::string& text,
     }
 }
 
+std::set<std::string> parse_summary_keys(const std::string& text) {
+    std::set<std::string> keys;
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const auto first = line.find_first_not_of(' ');
+        const auto delimiter = line.find('=', first);
+        if (first == std::string::npos || delimiter == std::string::npos) {
+            continue;
+        }
+        keys.insert(line.substr(first, delimiter - first));
+    }
+    return keys;
+}
+
 void write_test_file(const std::filesystem::path& path, const std::size_t size_bytes) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     ASSERT_TRUE(stream.is_open());
@@ -588,11 +603,18 @@ TEST(DownloadIntegrationTest, LoadsDownloadOptionsFromConfigFile) {
     ASSERT_TRUE(files_equal(source_file, output_file));
 
     const auto summary_text = read_text_file(summary_file);
-    EXPECT_NE(summary_text.find("avg_network_speed="), std::string::npos);
-    EXPECT_NE(summary_text.find("avg_disk_speed="), std::string::npos);
-    EXPECT_NE(summary_text.find("time_to_first_byte_ms="), std::string::npos);
-    EXPECT_NE(summary_text.find("total_pause_count="), std::string::npos);
-    EXPECT_NE(summary_text.find("packets_enqueued_total="), std::string::npos);
+    const std::set<std::string> expected_summary_keys{
+        "avg_network_speed",
+        "avg_disk_speed",
+        "time_to_first_byte_ms",
+        "max_memory_bytes",
+        "max_inflight_bytes",
+        "total_pause_count",
+        "queue_full_pause_count",
+        "packets_enqueued_total",
+        "avg_packet_size_bytes",
+        "max_packet_size_bytes"};
+    EXPECT_EQ(parse_summary_keys(summary_text), expected_summary_keys);
     EXPECT_EQ(summary_text.find("status="), std::string::npos);
     EXPECT_EQ(summary_text.find("total_bytes="), std::string::npos);
     EXPECT_EQ(summary_text.find("downloaded_bytes="), std::string::npos);
