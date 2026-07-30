@@ -1141,7 +1141,7 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
 
 TEST(
     PersistenceThreadTest,
-    AcknowledgesRegisteredAndResizedGeometryInTicketOrder) {
+    AcknowledgesGeometryInOrderBeforeFirstData) {
     asyncdownload::download::PersistencePolicy policy{};
     policy.block_bytes = 4096;
     policy.io_alignment_bytes = 4096;
@@ -1166,6 +1166,9 @@ TEST(
         temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
     auto packet_flow = make_packet_flow(session);
+    asyncdownload::flow::ProducerLane packet_lane;
+    ASSERT_FALSE(
+        packet_flow->producer().open_lane(packet_lane));
     asyncdownload::core::AtomicBlockBitmap bitmap(1);
     asyncdownload::storage::FileWriter writer;
     ASSERT_FALSE(writer.open(
@@ -1185,6 +1188,7 @@ TEST(
         store,
         workers,
         1);
+    asyncdownload::range::RangeFactSlot facts({0}, 0);
     persistence.start();
 
     const auto registered = persistence.submit_range_geometry(
@@ -1192,7 +1196,8 @@ TEST(
             asyncdownload::range::RegisterRangeEffect{
                 {0},
                 {0, 4096},
-                0
+                0,
+                facts.publisher()
             }
         });
     std::optional<
@@ -1209,6 +1214,10 @@ TEST(
             return true;
         },
         std::chrono::milliseconds(1000));
+    ASSERT_FALSE(registered.error);
+    ASSERT_TRUE(observed_registration);
+    ASSERT_TRUE(registration_ack.has_value());
+    ASSERT_FALSE(registration_ack->error);
 
     const auto resized = persistence.submit_range_geometry(
         asyncdownload::persistence::RangeGeometryCommand{
@@ -1232,6 +1241,26 @@ TEST(
             return true;
         },
         std::chrono::milliseconds(1000));
+    ASSERT_FALSE(resized.error);
+    ASSERT_TRUE(observed_resize);
+    ASSERT_TRUE(resize_ack.has_value());
+    ASSERT_FALSE(resize_ack->error);
+
+    TestPacket packet{};
+    packet.range_id = 0;
+    packet.lease_span = {0, 2048};
+    packet.offset = 0;
+    packet.payload.assign(512, 0x4A);
+    enqueue_data_packet(
+        packet_flow->producer(),
+        packet_lane,
+        session,
+        packet);
+    ASSERT_TRUE(wait_for_condition([&facts]() {
+        const auto snapshot = facts.read_since(0);
+        return snapshot.has_value() &&
+            snapshot->persisted_through == 512;
+    }, std::chrono::milliseconds(1000)));
 
     const auto close_error = packet_flow->producer().close();
     persistence.stop();
@@ -1239,22 +1268,14 @@ TEST(
     writer.close();
 
     EXPECT_FALSE(close_error);
-    ASSERT_FALSE(registered.error);
-    ASSERT_FALSE(resized.error);
     EXPECT_EQ(registered.ticket, 1U);
     EXPECT_EQ(resized.ticket, 2U);
-    ASSERT_TRUE(observed_registration);
-    ASSERT_TRUE(registration_ack.has_value());
     EXPECT_EQ(registration_ack->ticket, registered.ticket);
     EXPECT_EQ(registration_ack->range, (asyncdownload::range::RangeId{0}));
     EXPECT_EQ(registration_ack->geometry_revision, 0U);
-    EXPECT_FALSE(registration_ack->error);
-    ASSERT_TRUE(observed_resize);
-    ASSERT_TRUE(resize_ack.has_value());
     EXPECT_EQ(resize_ack->ticket, resized.ticket);
     EXPECT_EQ(resize_ack->range, (asyncdownload::range::RangeId{0}));
     EXPECT_EQ(resize_ack->geometry_revision, 1U);
-    EXPECT_FALSE(resize_ack->error);
     EXPECT_FALSE(persistence.error());
     const auto removed = std::filesystem::remove_all(
         temp_root,

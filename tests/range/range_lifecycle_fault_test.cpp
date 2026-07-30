@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <system_error>
 #include <utility>
@@ -115,6 +116,36 @@ TEST_F(
     EXPECT_EQ(
         after.value.ranges[0].phase,
         asyncdownload::range::RangePhase::ready);
+}
+
+TEST_F(
+    RangeLifecycleFaultTest,
+    GenerationOverflowFailsWithoutAdvancingCursor) {
+    const std::array<asyncdownload::range::ByteSpan, 1>
+        ranges{{{0, 256}}};
+    auto creation =
+        asyncdownload::range::RangeLifecycle::create(
+            256,
+            fault_policy(),
+            ranges);
+    ASSERT_FALSE(creation.error);
+    ASSERT_NE(creation.value, nullptr);
+    auto& plan =
+        asyncdownload::range::detail::range_fault_plan();
+    plan.force_next_lease_generation.store(
+        std::numeric_limits<std::uint64_t>::max(),
+        std::memory_order_release);
+
+    const auto acquired = creation.value->acquire();
+    const auto snapshot = creation.value->snapshot();
+
+    EXPECT_TRUE(acquired.error);
+    EXPECT_FALSE(acquired.lease.has_value());
+    ASSERT_FALSE(snapshot.error);
+    EXPECT_EQ(snapshot.value.ranges[0].dispatch_cursor, 0);
+    EXPECT_EQ(
+        snapshot.value.ranges[0].phase,
+        asyncdownload::range::RangePhase::failed);
 }
 
 TEST_F(

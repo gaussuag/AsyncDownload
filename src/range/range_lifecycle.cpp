@@ -130,6 +130,17 @@ public:
 
     [[nodiscard]] AcquireResult issue_lease(
         RangeRecord& record) noexcept {
+#if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+        const auto forced_generation =
+            detail::range_fault_plan()
+                .force_next_lease_generation.exchange(
+                    0,
+                    std::memory_order_acq_rel);
+        if (forced_generation != 0) {
+            record.next_lease_generation =
+                forced_generation;
+        }
+#endif
         if (record.next_lease_generation ==
             std::numeric_limits<std::uint64_t>::max()) {
             fail_record(record, internal_error());

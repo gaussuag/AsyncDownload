@@ -466,6 +466,54 @@ TEST(
     EXPECT_FALSE(snapshot.value.all_finished);
 }
 
+TEST(
+    RangeLifecycleTest,
+    NeverReopensFailedCancelledOrFinishedRange) {
+    auto failed =
+        require_lifecycle(create_lifecycle(128, {{0, 128}}));
+    const auto failed_lease = failed->acquire().lease;
+    ASSERT_TRUE(failed_lease.has_value());
+    ASSERT_TRUE(failed->apply(
+        LeaseFailed{
+            failed_lease->id,
+            0,
+            std::make_error_code(std::errc::io_error)
+        }).error);
+
+    auto cancelled =
+        require_lifecycle(create_lifecycle(128, {{0, 128}}));
+    ASSERT_TRUE(cancelled->acquire().lease.has_value());
+    ASSERT_TRUE(
+        cancelled->apply(CancelRequested{}).task_should_stop);
+
+    auto finished =
+        require_lifecycle(create_lifecycle(128, {{0, 128}}));
+    const auto finished_lease = finished->acquire().lease;
+    ASSERT_TRUE(finished_lease.has_value());
+    const auto closed = finished->apply(
+        LeaseSucceeded{finished_lease->id, 128});
+    ASSERT_EQ(closed.effects.size, 1U);
+    ASSERT_FALSE(finished->apply(PersistedThrough{{0}, 128}).error);
+    const auto completion =
+        std::get<PublishRangeCompleteEffect>(
+            closed.effects.values[0]).completion;
+    ASSERT_FALSE(finished->apply(
+        PersistenceCommitted{completion, 128}).error);
+
+    EXPECT_FALSE(failed->acquire().lease.has_value());
+    EXPECT_FALSE(cancelled->acquire().lease.has_value());
+    EXPECT_FALSE(finished->acquire().lease.has_value());
+    EXPECT_EQ(
+        failed->snapshot().value.ranges[0].phase,
+        RangePhase::failed);
+    EXPECT_EQ(
+        cancelled->snapshot().value.ranges[0].phase,
+        RangePhase::cancelled);
+    EXPECT_EQ(
+        finished->snapshot().value.ranges[0].phase,
+        RangePhase::finished);
+}
+
 TEST(RangeLifecycleTest, EmitsGeometryEffectsBeforeStolenLease) {
     auto policy = range_policy();
     policy.connection_limit = 16;

@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdint>
+#include <latch>
 #include <optional>
 #include <thread>
 
@@ -88,4 +89,52 @@ TEST(
         publish_failed.load(std::memory_order_acquire));
     EXPECT_EQ(observed->committed_generation, 7U);
     EXPECT_EQ(observed->persisted_through, 4096);
+}
+
+TEST(
+    RangeFactSlotTest,
+    OneMillionCoalescedFactsRemainMonotonicAndKeepCompletion) {
+    constexpr std::int64_t iterations = 1'000'000;
+    asyncdownload::range::RangeFactSlot slot({9}, 0);
+    auto publisher = slot.publisher();
+    std::latch start(1);
+    std::atomic<bool> publish_failed{false};
+    std::thread writer(
+        [&publisher, &start, &publish_failed]() {
+            start.wait();
+            for (std::int64_t offset = 1;
+                 offset <= iterations;
+                 ++offset) {
+                publisher.publish_persisted_through(offset);
+            }
+            publish_failed.store(
+                static_cast<bool>(
+                    publisher.publish_committed(
+                        {{9}, 7},
+                        iterations)),
+                std::memory_order_release);
+        });
+
+    start.count_down();
+    std::uint64_t revision = 0;
+    std::int64_t frontier = 0;
+    std::uint64_t completion = 0;
+    while (completion == 0) {
+        const auto snapshot = slot.read_since(revision);
+        if (!snapshot.has_value()) {
+            std::this_thread::yield();
+            continue;
+        }
+        EXPECT_GE(snapshot->persisted_through, frontier);
+        EXPECT_GE(snapshot->revision, revision);
+        frontier = snapshot->persisted_through;
+        revision = snapshot->revision;
+        completion = snapshot->committed_generation;
+    }
+    writer.join();
+
+    EXPECT_FALSE(
+        publish_failed.load(std::memory_order_acquire));
+    EXPECT_EQ(frontier, iterations);
+    EXPECT_EQ(completion, 7U);
 }

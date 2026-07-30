@@ -3,6 +3,7 @@
 #if defined(ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
 
 #include <atomic>
+#include <cstdint>
 #include <new>
 
 namespace asyncdownload::range::detail {
@@ -13,6 +14,8 @@ struct RangeFaultPlan {
     std::atomic<bool> fail_next_geometry_submit_allocation{false};
     std::atomic<bool> fail_next_write_state_allocation{false};
     std::atomic<bool> fail_next_reorder_allocation{false};
+    std::atomic<std::uint64_t>
+        force_next_lease_generation{0};
 
     void reset() noexcept {
         fail_next_create_allocation.store(
@@ -29,6 +32,9 @@ struct RangeFaultPlan {
             std::memory_order_release);
         fail_next_reorder_allocation.store(
             false,
+            std::memory_order_release);
+        force_next_lease_generation.store(
+            0,
             std::memory_order_release);
     }
 };

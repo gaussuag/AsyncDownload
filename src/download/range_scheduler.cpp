@@ -170,12 +170,6 @@ RangeScheduler::build_unfinished_spans(const core::AtomicBlockBitmap& bitmap) co
         spans.emplace_back(current_start, total_size_ - 1);
     }
 
-    if (spans.empty() && total_size_ > 0) {
-        // bitmap 为空洞的极端情况一般意味着全新任务或恢复信息缺失；
-        // 这里保守退回整文件 span，避免调度器什么也不派发。
-        spans.emplace_back(0, total_size_ - 1);
-    }
-
     return spans;
 }
 
