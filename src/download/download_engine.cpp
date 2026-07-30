@@ -934,10 +934,17 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.error = probe_result.error;
             return result;
         }
-        if (probe_result.total_size <= 0) {
-            result.error = make_error_code(DownloadErrc::http_probe_failed);
+        const auto effective_policy_result = bind_remote_facts(
+            *validated_policy.value,
+            RemoteObjectFacts{
+                probe_result.total_size,
+                probe_result.accept_ranges
+            });
+        if (!effective_policy_result.ok()) {
+            result.error = effective_policy_result.failure.error;
             return result;
         }
+        const auto& effective_policy = *effective_policy_result.value;
 
         core::SessionState session{};
         session.paths.output_path = request.output_path;
@@ -946,18 +953,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         session.url = request.url;
         session.etag = probe_result.etag;
         session.last_modified = probe_result.last_modified;
-        session.options = request.options;
-        session.total_size = probe_result.total_size;
-        session.accept_ranges = probe_result.accept_ranges;
+        session.options = effective_policy.raw_options();
+        session.total_size = effective_policy.remote_facts().total_size;
+        session.accept_ranges = effective_policy.remote_facts().accept_ranges;
         session.progress_callback = request.progress_callback;
         session.task_started_at = run_started;
         session.telemetry_session_.record_task_started(run_started);
-        if (!session.accept_ranges) {
-            // 不支持 Range 的服务端无法安全做多连接和窗口化调度，所以这里主动
-            // 退化到单连接整文件下载，保证行为正确性优先。
-            session.options.max_connections = 1;
-            session.options.scheduler_window_bytes = static_cast<std::size_t>(session.total_size);
-        }
 
         metadata::MetadataStore metadata_store(session.paths.metadata_path);
         storage::FileWriter file_writer;
@@ -1068,7 +1069,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             kQueueExplicitProducers,
             kQueueImplicitProducers);
         DataQueue::producer_token_t network_queue_producer(data_queue);
-        BS::thread_pool<> workers(std::max<std::size_t>(1, session.options.max_connections));
+        BS::thread_pool<> workers(effective_policy.scheduling().connection_limit);
         persistence::PersistenceThread persistence(session,
             data_queue,
             bitmap,
@@ -1093,11 +1094,12 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
 
         curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS,
-            static_cast<long>(session.options.max_connections));
+            static_cast<long>(effective_policy.scheduling().connection_limit));
         curl_multi_setopt(multi, CURLMOPT_MAX_HOST_CONNECTIONS,
-            static_cast<long>(session.options.max_connections));
+            static_cast<long>(effective_policy.scheduling().connection_limit));
 
-        std::vector<TransferHandle> handles(std::max<std::size_t>(1, session.options.max_connections));
+        std::vector<TransferHandle> handles(
+            effective_policy.scheduling().connection_limit);
         std::error_code failure;
         for (auto& handle : handles) {
             handle.session = &session;
