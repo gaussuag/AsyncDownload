@@ -1,6 +1,7 @@
 #pragma once
 
 #include "download/download_policy.hpp"
+#include "range/range_fact_slot.hpp"
 #include "range/range_types.hpp"
 
 #include <array>
@@ -71,6 +72,7 @@ struct RegisterRangeEffect {
     RangeId range{};
     ByteSpan bytes{};
     std::uint64_t geometry_revision = 0;
+    RangeFactPublisher facts{};
 };
 
 struct ResizeRangeEffect {

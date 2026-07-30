@@ -2,6 +2,7 @@
 
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 #include "asyncdownload/types.hpp"
+#include "core/constants.hpp"
 #include "download/download_policy.hpp"
 
 #include <array>
@@ -15,8 +16,6 @@
 #include <vector>
 
 namespace asyncdownload::core {
-
-inline constexpr std::size_t TAIL_BUFFER_CAPACITY_BYTES = 4096;
 
 enum class RangeStatus : std::uint8_t {
     // 当前没有请求在处理这个 range，等待被调度。

@@ -491,3 +491,40 @@ TEST(RangeLifecycleTest, EmitsGeometryEffectsBeforeStolenLease) {
     EXPECT_EQ(resized.new_end, registered.bytes.begin);
     EXPECT_EQ(stolen.lease->bytes.begin, registered.bytes.begin);
 }
+
+TEST(
+    RangeLifecycleTest,
+    DrainsPersistedGapAndCompletionFactsInProtocolOrder) {
+    auto creation = create_lifecycle(128, {{0, 128}});
+    ASSERT_FALSE(creation.error);
+    ASSERT_EQ(creation.effects.values.size(), 1U);
+    auto facts = std::get<RegisterRangeEffect>(
+        creation.effects.values[0]).facts;
+    auto lifecycle = std::move(creation.value);
+    ASSERT_NE(lifecycle, nullptr);
+    const auto lease = lifecycle->acquire().lease;
+    ASSERT_TRUE(lease.has_value());
+    const auto closed = lifecycle->apply(
+        LeaseSucceeded{lease->id, 128});
+    ASSERT_FALSE(closed.error);
+
+    facts.publish_gap_pause(true);
+    facts.publish_gap_pause(false);
+    facts.publish_persisted_through(128);
+    ASSERT_FALSE(facts.publish_committed(
+        {lease->id.range, lease->id.generation},
+        128));
+    const auto drained =
+        lifecycle->drain_persistence_facts();
+    const auto snapshot = lifecycle->snapshot();
+
+    EXPECT_FALSE(drained.error);
+    EXPECT_FALSE(snapshot.value.ranges[0].gap_blocked);
+    EXPECT_EQ(
+        snapshot.value.ranges[0].persisted_through,
+        128);
+    EXPECT_EQ(
+        snapshot.value.ranges[0].phase,
+        RangePhase::finished);
+    EXPECT_TRUE(snapshot.value.all_finished);
+}

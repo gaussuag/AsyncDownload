@@ -326,9 +326,6 @@ void rebuild_bitmap_from_ranges(
                     return make_error_code(
                         DownloadErrc::internal_error);
                 }
-                projection->end_offset.store(
-                    resize->new_end - 1,
-                    std::memory_order_release);
                 continue;
             }
 
@@ -1456,10 +1453,27 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 break;
             }
 
+            const auto facts =
+                lifecycle->drain_persistence_facts();
+            if (facts.error) {
+                failure = facts.error;
+                session.stop_requested.store(
+                    true,
+                    std::memory_order_release);
+                break;
+            }
+
             // 主循环开始时先看 Persistence 是否已经报错。写盘或 metadata 失败后，
             // 网络层必须尽快停止继续生产数据。
             if (const auto persistence_error = persistence.error(); persistence_error) {
-                failure = persistence_error;
+                const auto applied = lifecycle->apply(
+                    range::PersistenceFailed{
+                        std::nullopt,
+                        persistence_error
+                    });
+                failure = applied.error ?
+                    applied.error :
+                    persistence_error;
                 session.stop_requested.store(true, std::memory_order_release);
                 break;
             }
@@ -1747,6 +1761,25 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
         failure = stop_persistence_phase(
             packet_flow->producer(), persistence, failure);
+        const auto final_facts =
+            lifecycle->drain_persistence_facts();
+        if (!failure && final_facts.error) {
+            failure = final_facts.error;
+        }
+        if (const auto persistence_error =
+                persistence.error();
+            persistence_error) {
+            const auto applied = lifecycle->apply(
+                range::PersistenceFailed{
+                    std::nullopt,
+                    persistence_error
+                });
+            if (!failure) {
+                failure = applied.error ?
+                    applied.error :
+                    persistence_error;
+            }
+        }
 
         // Persistence 线程拥有每个 range 的真正写盘前沿；停下来之后再做一次 bitmap
         // 重建，可以把最终结果对齐到落盘状态。

@@ -5,6 +5,7 @@
 #include "download/download_policy.hpp"
 #include "flow/packet_flow.hpp"
 #include "metadata/metadata_store.hpp"
+#include "persistence/range_write_state.hpp"
 #include "range/range_lifecycle.hpp"
 #include "storage/file_writer.hpp"
 
@@ -95,12 +96,11 @@ private:
     // 按 packet.kind 分流到 data / range_complete / shutdown 三类处理路径。
     void handle_packet(flow::PacketLease packet);
     void handle_data_packet(flow::PacketLease packet);
-    void handle_range_complete(std::size_t range_id);
-    [[nodiscard]] core::RangeContext* lookup_range(std::size_t range_id) const;
-    [[nodiscard]] std::map<std::int64_t, flow::PacketLease>*
-    lookup_out_of_order_queue(std::size_t range_id) const;
+    void handle_range_complete(const flow::ControlPacket& control);
+    [[nodiscard]] RangeWriteState*
+    lookup_range(std::size_t range_id) const;
     // 把一段逻辑字节按对齐规则写入磁盘，必要时借助 tail buffer 补齐。
-    [[nodiscard]] std::error_code append_bytes(core::RangeContext& range,
+    [[nodiscard]] std::error_code append_bytes(RangeWriteState& range,
                                                std::int64_t offset,
                                                std::span<const std::uint8_t> bytes,
                                                bool sample_timing);
@@ -109,13 +109,18 @@ private:
                                               bool sample_timing,
                                               bool tail_write);
     // 强制把当前 range 的尾部残留刷到磁盘。
-    [[nodiscard]] std::error_code flush_tail(core::RangeContext& range, bool sample_timing);
+    [[nodiscard]] std::error_code flush_tail(
+        RangeWriteState& range,
+        bool sample_timing);
     // 根据 persisted_offset 推进位图 finished 状态。
-    void update_finished_blocks(const core::RangeContext& range) noexcept;
+    void update_finished_blocks(
+        const RangeWriteState& range) noexcept;
     // 从乱序 map 中连续提取已经可以按序写盘的 packet。
-    void drain_ordered_packets(core::RangeContext& range, bool sample_timing);
+    void drain_ordered_packets(
+        RangeWriteState& range,
+        bool sample_timing);
     // 根据当前缺口大小更新 pause_for_gap。
-    void update_gap_flag(core::RangeContext& range);
+    void update_gap_flag(RangeWriteState& range);
     // 达到字节阈值或时间阈值后，异步提交 flush + metadata 保存任务。
     void maybe_schedule_flush(bool force);
     // 非阻塞轮询挂起中的 flush 任务是否完成。
@@ -138,9 +143,8 @@ private:
     metadata::MetadataStore& metadata_store_;
     BS::thread_pool<>& workers_;
     mutable std::mutex ranges_mutex_;
-    std::vector<core::RangeContext*> ranges_;
-    std::vector<std::unique_ptr<std::map<std::int64_t, flow::PacketLease>>>
-        out_of_order_queues_;
+    std::vector<std::unique_ptr<RangeWriteState>>
+        ranges_;
     const std::size_t geometry_capacity_;
     std::mutex geometry_mutex_;
     std::deque<std::pair<

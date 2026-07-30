@@ -11,5 +11,6 @@ inline constexpr std::size_t kDefaultBackpressureLowBytes = 128 * 1024 * 1024;
 inline constexpr std::size_t kDefaultMaxGapBytes = 32 * 1024 * 1024;
 inline constexpr std::size_t kDefaultFlushThresholdBytes = 16 * 1024 * 1024;
 inline constexpr std::size_t kMapNodeOverheadBytes = 48;
+inline constexpr std::size_t TAIL_BUFFER_CAPACITY_BYTES = 4096;
 
 } // namespace asyncdownload::core

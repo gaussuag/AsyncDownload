@@ -40,7 +40,7 @@ void enqueue_data_packet(
                 {
                     static_cast<std::uint64_t>(packet.range_id)
                 },
-                0
+                1
             },
             {0, session.total_size},
             packet.offset,
@@ -61,7 +61,7 @@ void enqueue_range_complete(
             {
                 static_cast<std::uint64_t>(range_id)
             },
-            0
+            1
         },
         session.total_size
     });

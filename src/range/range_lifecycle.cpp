@@ -32,6 +32,9 @@ struct RangeRecord {
     std::optional<RangeLease> active_lease;
     std::optional<CompletionId> completion;
     std::optional<LeaseOutcome> last_lease_outcome;
+    std::unique_ptr<RangeFactSlot> fact_slot;
+    std::uint64_t last_fact_revision = 0;
+    std::uint64_t observed_committed_generation = 0;
 };
 
 [[nodiscard]] std::error_code internal_error() noexcept {
@@ -200,6 +203,10 @@ public:
             added->bytes = {plan->split, old_end};
             added->dispatch_cursor = plan->split;
             added->persisted_through = plan->split;
+            added->fact_slot =
+                std::make_unique<RangeFactSlot>(
+                    new_id,
+                    plan->split);
             ranges.push_back(std::move(added));
 
             ++next_range_id;
@@ -217,7 +224,8 @@ public:
             result.effects.values[1] = RegisterRangeEffect{
                 new_id,
                 ranges.back()->bytes,
-                ranges.back()->geometry_revision
+                ranges.back()->geometry_revision,
+                ranges.back()->fact_slot->publisher()
             };
             result.effects.size = 2;
             return result;
@@ -297,11 +305,16 @@ RangeLifecycleCreation RangeLifecycle::create(
             record->bytes = span;
             record->dispatch_cursor = span.begin;
             record->persisted_through = span.begin;
+            record->fact_slot =
+                std::make_unique<RangeFactSlot>(
+                    record->id,
+                    span.begin);
             creation.effects.values.push_back(
                 RegisterRangeEffect{
                     record->id,
                     span,
-                    record->geometry_revision
+                    record->geometry_revision,
+                    record->fact_slot->publisher()
                 });
             implementation->ranges.push_back(
                 std::move(record));
@@ -687,7 +700,82 @@ ApplyResult RangeLifecycle::drain_persistence_facts() noexcept {
     if (!implementation.owner_thread_matches()) {
         return implementation.reject(nullptr, internal_error());
     }
-    return {};
+
+    ApplyResult combined;
+    for (auto& record_ptr : implementation.ranges) {
+        auto* record = record_ptr.get();
+        if (record == nullptr ||
+            record->fact_slot == nullptr) {
+            return implementation.reject(
+                record,
+                internal_error());
+        }
+        const auto fact = record->fact_slot->read_since(
+            record->last_fact_revision);
+        if (!fact.has_value()) {
+            continue;
+        }
+        record->last_fact_revision = fact->revision;
+
+        const auto merge =
+            [&combined](const ApplyResult& applied) {
+                combined.disposition =
+                    applied.disposition;
+                combined.scheduler_may_run =
+                    combined.scheduler_may_run ||
+                    applied.scheduler_may_run;
+                combined.task_should_stop =
+                    combined.task_should_stop ||
+                    applied.task_should_stop;
+                if (!combined.error && applied.error) {
+                    combined.error = applied.error;
+                }
+            };
+
+        if (fact->persisted_through >
+            record->persisted_through) {
+            const auto applied = apply(
+                PersistedThrough{
+                    record->id,
+                    fact->persisted_through
+                });
+            merge(applied);
+            if (applied.error) {
+                return combined;
+            }
+        }
+        if (fact->gap_paused !=
+            record->gap_blocked) {
+            const auto applied = apply(
+                GapPauseChanged{
+                    record->id,
+                    fact->gap_paused
+                });
+            merge(applied);
+            if (applied.error) {
+                return combined;
+            }
+        }
+        if (fact->committed_generation != 0 &&
+            fact->committed_generation !=
+                record->observed_committed_generation) {
+            const auto applied = apply(
+                PersistenceCommitted{
+                    {
+                        record->id,
+                        fact->committed_generation
+                    },
+                    fact->persisted_through
+                });
+            merge(applied);
+            if (applied.error) {
+                return combined;
+            }
+            record->observed_committed_generation =
+                fact->committed_generation;
+        }
+    }
+    return combined;
 }
 
 SnapshotResult RangeLifecycle::snapshot() const noexcept {
