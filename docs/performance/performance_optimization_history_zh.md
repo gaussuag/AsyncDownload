@@ -2474,3 +2474,43 @@ keeper 条件保持不变：
 1. 正式 10 个 benchmark 指标不能减少。
 2. 进度与 telemetry 的现存真实消费面必须继续可用。
 3. 删除的字段不能只删结构定义而保留伪维护逻辑或伪断言。
+
+## 25. 架构迭代 025：Range Lifecycle 性能中性验收（采纳）
+
+### 25.1 目的
+
+阶段 3 把 Range 几何、Lease 代次、调度游标、完成判定和 Persistence fact 的状态所有权
+收口到 `RangeLifecycle` 与 `RangeWriteState`。本轮性能验收只判断结构迁移是否保持既有
+keeper，不调整连接数、window、queue、backpressure、flush 或 packet 聚合参数。
+
+### 25.2 正式同机结果
+
+对比 Stage 2 post 与 Stage 3 post 的 `regression_v2` Release 结果，两侧均为同机、同一
+loopback 1 GiB 文件、七个 case、每 case 20 次：
+
+- `baseline_default`：`568.89 → 582.37 MB/s`，`+2.37%`
+- `balanced_candidate`：`505.54 → 495.38 MB/s`，`-2.01%`
+- `deep_buffer_candidate`：`485.42 → 500.14 MB/s`，`+3.03%`
+- `memory_guard`：`671.26 → 676.40 MB/s`，`+0.77%`
+- `scheduler_stress`：`501.00 → 489.96 MB/s`，`-2.20%`
+- `queue_backpressure_stress`：`540.09 → 543.40 MB/s`，`+0.61%`
+- `gap_tolerance_probe`：`491.27 → 490.19 MB/s`，`-0.22%`
+
+两个 protected case 均在 5% keeper 内。network/disk、memory、inflight、pause episode、
+约 64.5 KiB 平均 packet、65,536-byte 最大 packet 和正式 10-key schema 均保持连续。
+
+### 25.3 证据与边界
+
+- 正式前态：
+  `build/benchmarks/20260731_004945_phase-2-post`
+- 正式后态：
+  `build/benchmarks/20260731_030514_phase-03-11-legacy-deletion`
+- 最终 production state smoke：
+  `build/benchmarks/20260731_032802_phase-03-final-smoke`
+- WPR gate：
+  `build/profiles/20260731_032735_phase-03-gate`
+
+WPR 仍在 `wpr-start` 被本机 system-performance tracing policy 以 `0xc5585011` 拒绝，
+与阶段 2 的原因一致。该环境限制没有替代 benchmark、Debug/Release tests 或 exact
+10-key schema gate。完整 slice 归因与回滚证据记录在
+`docs/architecture/refactor/evidence/phase_03_range_lifecycle.md`。
