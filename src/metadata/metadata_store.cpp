@@ -1,10 +1,18 @@
 #include "metadata_store.hpp"
 
 #include "asyncdownload/error.hpp"
+#include "metadata_fault_adapter.hpp"
 
 #include <fstream>
 
 #include <nlohmann/json.hpp>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 
 namespace asyncdownload::metadata {
 namespace {
@@ -46,6 +54,32 @@ using nlohmann::json;
     sample.crc32 = value.value("crc32", static_cast<std::uint32_t>(0));
     sample.length = value.value("length", static_cast<std::size_t>(0));
     return sample;
+}
+
+[[nodiscard]] std::error_code replace_file(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination) noexcept {
+#if defined(_WIN32)
+    if (MoveFileExW(
+            source.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING |
+                MOVEFILE_WRITE_THROUGH) == FALSE) {
+        return make_error_code(
+            DownloadErrc::metadata_save_failed);
+    }
+#else
+    std::error_code ec;
+    std::filesystem::rename(
+        source,
+        destination,
+        ec);
+    if (ec) {
+        return make_error_code(
+            DownloadErrc::metadata_save_failed);
+    }
+#endif
+    return {};
 }
 
 } // namespace
@@ -103,15 +137,44 @@ std::error_code MetadataStore::save(const core::MetadataState& state) noexcept {
         }
 
         stream << value.dump(2);
-        stream.close();
-
-        std::filesystem::remove(path_, ec);
-        ec.clear();
-        std::filesystem::rename(tmp_path, path_, ec);
-        if (ec) {
-            std::filesystem::remove(tmp_path, ec);
-            return make_error_code(DownloadErrc::metadata_save_failed);
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::metadata_fault_plan().
+                fail_tmp_close.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            stream.setstate(std::ios::badbit);
         }
+#endif
+        stream.close();
+        if (stream.fail()) {
+            std::filesystem::remove(tmp_path, ec);
+            return make_error_code(
+                DownloadErrc::metadata_save_failed);
+        }
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::metadata_fault_plan().
+                stop_before_replace.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            return make_error_code(
+                DownloadErrc::metadata_save_failed);
+        }
+#endif
+        const auto replace_error =
+            replace_file(tmp_path, path_);
+        if (replace_error) {
+            std::filesystem::remove(tmp_path, ec);
+            return replace_error;
+        }
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::metadata_fault_plan().
+                stop_after_replace.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            return make_error_code(
+                DownloadErrc::metadata_save_failed);
+        }
+#endif
     } catch (...) {
         return make_error_code(DownloadErrc::metadata_save_failed);
     }
@@ -119,7 +182,10 @@ std::error_code MetadataStore::save(const core::MetadataState& state) noexcept {
     return {};
 }
 
-std::pair<std::error_code, std::optional<core::MetadataState>> MetadataStore::load() const noexcept {
+std::pair<
+    std::error_code,
+    std::optional<core::MetadataState>>
+MetadataStore::load() const noexcept {
     std::error_code ec;
     if (!std::filesystem::exists(path_, ec) || ec) {
         // 没有 metadata 不算错误，这只是说明当前没有可恢复状态。

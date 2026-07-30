@@ -19,6 +19,7 @@
 #include "core/models.hpp"
 #include "download/download_policy.hpp"
 #include "flow/packet_flow.hpp"
+#include "metadata/metadata_fault_adapter.hpp"
 #include "metadata/metadata_store.hpp"
 #include "persistence/persistence_thread.hpp"
 #include "range/range_fact_slot.hpp"
@@ -85,11 +86,15 @@ protected:
         ASSERT_FALSE(ec);
         asyncdownload::recovery::detail::
             recovery_fault_plan().reset();
+        asyncdownload::metadata::detail::
+            metadata_fault_plan().reset();
     }
 
     void TearDown() override {
         asyncdownload::recovery::detail::
             recovery_fault_plan().reset();
+        asyncdownload::metadata::detail::
+            metadata_fault_plan().reset();
         std::error_code ec;
         const auto removed =
             std::filesystem::remove_all(root_, ec);
@@ -648,4 +653,149 @@ TEST_F(
     EXPECT_EQ(
         read_file(open_request.paths.metadata_path),
         metadata_before);
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    TmpCloseFailureRetainsLastMetadata) {
+    const auto open_request = request();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    asyncdownload::core::MetadataState baseline{};
+    baseline.url = open_request.remote.url;
+    baseline.output_path =
+        open_request.paths.output_path;
+    baseline.temporary_path =
+        open_request.paths.temporary_path;
+    baseline.total_size =
+        open_request.remote.total_size;
+    baseline.vdl_offset = 4096;
+    baseline.accept_ranges = true;
+    baseline.block_size =
+        open_request.policy.block_bytes;
+    baseline.io_alignment =
+        open_request.policy.io_alignment_bytes;
+    baseline.bitmap_states = {2, 0};
+    ASSERT_FALSE(store.save(baseline));
+    const auto metadata_before =
+        read_file(open_request.paths.metadata_path);
+    auto candidate = baseline;
+    candidate.vdl_offset = 8192;
+    candidate.bitmap_states = {2, 2};
+    asyncdownload::metadata::detail::
+        metadata_fault_plan().fail_tmp_close.store(
+            true,
+            std::memory_order_release);
+
+    const auto error = store.save(candidate);
+
+    EXPECT_EQ(
+        error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_save_failed));
+    EXPECT_EQ(
+        read_file(open_request.paths.metadata_path),
+        metadata_before);
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    CrashBeforeReplaceKeepsOldMetadataVisible) {
+    const auto open_request = request();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    asyncdownload::core::MetadataState baseline{};
+    baseline.url = open_request.remote.url;
+    baseline.output_path =
+        open_request.paths.output_path;
+    baseline.temporary_path =
+        open_request.paths.temporary_path;
+    baseline.total_size =
+        open_request.remote.total_size;
+    baseline.vdl_offset = 4096;
+    baseline.accept_ranges = true;
+    baseline.block_size =
+        open_request.policy.block_bytes;
+    baseline.io_alignment =
+        open_request.policy.io_alignment_bytes;
+    baseline.bitmap_states = {2, 0};
+    ASSERT_FALSE(store.save(baseline));
+    const auto metadata_before =
+        read_file(open_request.paths.metadata_path);
+    auto candidate = baseline;
+    candidate.vdl_offset = 8192;
+    candidate.bitmap_states = {2, 2};
+    asyncdownload::metadata::detail::
+        metadata_fault_plan().stop_before_replace.store(
+            true,
+            std::memory_order_release);
+
+    const auto error = store.save(candidate);
+
+    EXPECT_EQ(
+        error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_save_failed));
+    EXPECT_EQ(
+        read_file(open_request.paths.metadata_path),
+        metadata_before);
+    EXPECT_TRUE(std::filesystem::exists(
+        std::filesystem::path(
+            open_request.paths.metadata_path.string() +
+            ".tmp")));
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    CrashAfterReplaceLeavesNewMetadataVisible) {
+    const auto open_request = request();
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    asyncdownload::core::MetadataState baseline{};
+    baseline.url = open_request.remote.url;
+    baseline.output_path =
+        open_request.paths.output_path;
+    baseline.temporary_path =
+        open_request.paths.temporary_path;
+    baseline.total_size =
+        open_request.remote.total_size;
+    baseline.vdl_offset = 4096;
+    baseline.accept_ranges = true;
+    baseline.block_size =
+        open_request.policy.block_bytes;
+    baseline.io_alignment =
+        open_request.policy.io_alignment_bytes;
+    baseline.bitmap_states = {2, 0};
+    ASSERT_FALSE(store.save(baseline));
+    const auto metadata_before =
+        read_file(open_request.paths.metadata_path);
+    auto candidate = baseline;
+    candidate.vdl_offset = 8192;
+    candidate.bitmap_states = {2, 2};
+    asyncdownload::metadata::detail::
+        metadata_fault_plan().stop_after_replace.store(
+            true,
+            std::memory_order_release);
+
+    const auto error = store.save(candidate);
+    const auto [load_error, loaded] = store.load();
+
+    EXPECT_EQ(
+        error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_save_failed));
+    EXPECT_NE(
+        read_file(open_request.paths.metadata_path),
+        metadata_before);
+    ASSERT_FALSE(load_error);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->vdl_offset, 8192);
+    EXPECT_EQ(loaded->bitmap_states, candidate.bitmap_states);
+    EXPECT_FALSE(std::filesystem::exists(
+        std::filesystem::path(
+            open_request.paths.metadata_path.string() +
+            ".tmp")));
 }
