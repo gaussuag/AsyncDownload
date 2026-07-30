@@ -4,6 +4,7 @@
 #include "core/block_bitmap.hpp"
 #include "core/crc32.hpp"
 #include "metadata/metadata_store.hpp"
+#include "recovery_fault_adapter.hpp"
 #include "storage/file_writer.hpp"
 
 #include <algorithm>
@@ -281,16 +282,61 @@ RecoveryOpenResult RecoveryCheckpoint::open(
              metadata_proves_complete(
                  *loaded,
                  request.policy));
+        if (!can_resume) {
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+            if (detail::recovery_fault_plan().
+                    fail_next_metadata_invalidate.exchange(
+                        false,
+                        std::memory_order_acq_rel)) {
+                result.error = make_error_code(
+                    DownloadErrc::
+                        metadata_save_failed);
+                return result;
+            }
+#endif
+            const auto remove_error =
+                implementation->metadata_store.remove();
+            if (remove_error) {
+                result.error = remove_error;
+                return result;
+            }
+            result.stale_cleanup.status =
+                loaded.has_value() ?
+                    CleanupStatus::removed :
+                    CleanupStatus::not_found;
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+            if (detail::recovery_fault_plan().
+                    stop_after_metadata_invalidation.
+                        exchange(
+                            false,
+                            std::memory_order_acq_rel)) {
+                result.error = internal_error();
+                return result;
+            }
+#endif
+        }
         const auto open_error =
             implementation->file_writer.open(
                 request.paths.temporary_path,
                 request.remote.total_size,
                 can_resume,
-                request.overwrite_existing);
+                can_resume ?
+                    request.overwrite_existing :
+                    true);
         if (open_error) {
             result.error = open_error;
             return result;
         }
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (!can_resume &&
+            detail::recovery_fault_plan().
+                stop_after_part_reset.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            result.error = internal_error();
+            return result;
+        }
+#endif
 
         const auto block_count =
             core::required_block_count(
@@ -348,13 +394,6 @@ RecoveryOpenResult RecoveryCheckpoint::open(
         } else {
             result.restored.bitmap_states =
                 bitmap.snapshot();
-            const auto remove_error =
-                implementation->metadata_store.remove();
-            static_cast<void>(remove_error);
-            result.stale_cleanup.status =
-                loaded.has_value() ?
-                    CleanupStatus::removed :
-                    CleanupStatus::not_found;
         }
         result.checkpoint =
             std::unique_ptr<RecoveryCheckpoint>(

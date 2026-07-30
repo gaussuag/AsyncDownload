@@ -360,7 +360,7 @@ TEST(
 
 TEST(
     RecoveryCharacterizationTest,
-    CurrentRemovalSuppressesFilesystemFailure) {
+    ReportsMetadataRemovalFailure) {
     TempDirectory temp(
         "asyncdownload_hidden_remove_error");
     const auto metadata_path =
@@ -376,26 +376,10 @@ TEST(
 
     const auto error = store.remove();
 
-    EXPECT_FALSE(error);
-    EXPECT_TRUE(std::filesystem::exists(metadata_path));
-}
-
-TEST(
-    RecoveryExpectedRedTest,
-    DISABLED_ReportsMetadataRemovalFailure) {
-    TempDirectory temp(
-        "asyncdownload_remove_error_red");
-    const auto metadata_path =
-        temp.path() / "artifact.bin.config.json";
-    std::error_code ec;
-    std::filesystem::create_directories(
-        metadata_path,
-        ec);
-    ASSERT_FALSE(ec);
-    write_text(metadata_path / "child", "occupied");
-    asyncdownload::metadata::MetadataStore store(
-        metadata_path);
-
-    EXPECT_TRUE(store.remove());
+    EXPECT_EQ(
+        error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_save_failed));
     EXPECT_TRUE(std::filesystem::exists(metadata_path));
 }

@@ -175,9 +175,11 @@ std::pair<std::error_code, std::optional<core::MetadataState>> MetadataStore::lo
 
 std::error_code MetadataStore::remove() noexcept {
     std::error_code ec;
-    // 删除恢复元数据是一个尽力而为的清理动作，不把“不存在”或删除失败提升成
-    // 主流程错误，避免影响已经成功完成的下载结果。
     std::filesystem::remove(path_, ec);
+    if (ec) {
+        return make_error_code(
+            DownloadErrc::metadata_save_failed);
+    }
     return {};
 }
 

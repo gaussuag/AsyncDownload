@@ -4,6 +4,7 @@
 list(REMOVE_ITEM ASYNCDOWNLOAD_TEST_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/flow/packet_flow_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/range/range_lifecycle_fault_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/recovery/recovery_failure_test.cpp"
 )
 
 add_executable(asyncdownload_tests ${ASYNCDOWNLOAD_TEST_SOURCES})
@@ -112,5 +113,40 @@ target_compile_features(
 )
 gtest_discover_tests(
     asyncdownload_range_lifecycle_fault_tests)
+
+add_executable(asyncdownload_recovery_fault_tests
+    recovery/recovery_failure_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/block_bitmap.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/crc32.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/metadata/metadata_store.cpp
+    ${CMAKE_SOURCE_DIR}/src/recovery/recovery_checkpoint.cpp
+    ${CMAKE_SOURCE_DIR}/src/storage/file_writer.cpp
+)
+target_compile_definitions(
+    asyncdownload_recovery_fault_tests
+    PRIVATE
+        ASYNCDOWNLOAD_RECOVERY_FAULT_TEST
+)
+target_include_directories(
+    asyncdownload_recovery_fault_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(
+    asyncdownload_recovery_fault_tests
+    PRIVATE
+        gtest_main
+        nlohmann_json::nlohmann_json
+)
+target_compile_features(
+    asyncdownload_recovery_fault_tests
+    PRIVATE
+        cxx_std_20
+)
+gtest_discover_tests(
+    asyncdownload_recovery_fault_tests)
+
 find_package(CURL CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
