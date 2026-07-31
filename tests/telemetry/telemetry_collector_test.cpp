@@ -1,112 +1,178 @@
-#include "asyncdownload/telemetry/telemetry_collector.hpp"
-
 #include <chrono>
 
 #include <gtest/gtest.h>
 
+#include "asyncdownload/telemetry/telemetry_collector.hpp"
+#include "asyncdownload/telemetry/telemetry_session.hpp"
+
 namespace {
 
-using asyncdownload::telemetry::TelemetryCollector;
+using asyncdownload::PerformanceSummary;
+using asyncdownload::ProgressSnapshot;
 using asyncdownload::telemetry::TelemetryClock;
+using asyncdownload::telemetry::TelemetryCollector;
 using asyncdownload::telemetry::TelemetryPauseReason;
+using asyncdownload::telemetry::TelemetrySession;
 
-class TelemetryCollectorTest : public ::testing::Test {
-protected:
-    TelemetryCollector collector_{};
-};
-
-TEST_F(TelemetryCollectorTest, ComputesTtfbAndIgnoresDuplicates) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_first_byte_received(TelemetryClock::time_point{std::chrono::milliseconds(1250)});
-    collector_.record_first_byte_received(TelemetryClock::time_point{std::chrono::milliseconds(1400)});
-
-    const auto summary = collector_.final_summary();
-    EXPECT_EQ(summary.time_to_first_byte_ms, 250);
+void expect_equal(
+    const ProgressSnapshot& lhs,
+    const ProgressSnapshot& rhs) {
+    EXPECT_EQ(lhs.total_bytes, rhs.total_bytes);
+    EXPECT_EQ(lhs.downloaded_bytes, rhs.downloaded_bytes);
+    EXPECT_EQ(lhs.persisted_bytes, rhs.persisted_bytes);
+    EXPECT_EQ(lhs.vdl_offset, rhs.vdl_offset);
+    EXPECT_EQ(lhs.inflight_bytes, rhs.inflight_bytes);
+    EXPECT_EQ(lhs.queued_packets, rhs.queued_packets);
+    EXPECT_EQ(lhs.active_requests, rhs.active_requests);
+    EXPECT_EQ(lhs.paused_ranges, rhs.paused_ranges);
+    EXPECT_EQ(lhs.memory_bytes, rhs.memory_bytes);
+    EXPECT_DOUBLE_EQ(
+        lhs.network_bytes_per_second,
+        rhs.network_bytes_per_second);
+    EXPECT_DOUBLE_EQ(
+        lhs.disk_bytes_per_second,
+        rhs.disk_bytes_per_second);
+    EXPECT_EQ(lhs.resumed, rhs.resumed);
 }
 
-TEST_F(TelemetryCollectorTest, TracksPacketStatisticsAndAveragePacketSize) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_download_delta(100U, TelemetryClock::time_point{std::chrono::milliseconds(1100)});
-    collector_.record_download_delta(200U, TelemetryClock::time_point{std::chrono::milliseconds(1200)});
-    collector_.record_download_delta(150U, TelemetryClock::time_point{std::chrono::milliseconds(1300)});
-
-    const auto summary = collector_.final_summary();
-    EXPECT_EQ(summary.packets_enqueued_total, 3U);
-    EXPECT_EQ(summary.max_packet_size_bytes, 200U);
-    EXPECT_DOUBLE_EQ(summary.average_packet_size_bytes, 150.0);
+void expect_equal(
+    const PerformanceSummary& lhs,
+    const PerformanceSummary& rhs) {
+    EXPECT_DOUBLE_EQ(
+        lhs.average_network_bytes_per_second,
+        rhs.average_network_bytes_per_second);
+    EXPECT_DOUBLE_EQ(
+        lhs.average_disk_bytes_per_second,
+        rhs.average_disk_bytes_per_second);
+    EXPECT_EQ(
+        lhs.time_to_first_byte_ms,
+        rhs.time_to_first_byte_ms);
+    EXPECT_EQ(lhs.max_memory_bytes, rhs.max_memory_bytes);
+    EXPECT_EQ(lhs.max_inflight_bytes, rhs.max_inflight_bytes);
+    EXPECT_EQ(lhs.total_pause_count, rhs.total_pause_count);
+    EXPECT_EQ(
+        lhs.queue_full_pause_count,
+        rhs.queue_full_pause_count);
+    EXPECT_EQ(
+        lhs.packets_enqueued_total,
+        rhs.packets_enqueued_total);
+    EXPECT_DOUBLE_EQ(
+        lhs.average_packet_size_bytes,
+        rhs.average_packet_size_bytes);
+    EXPECT_EQ(
+        lhs.max_packet_size_bytes,
+        rhs.max_packet_size_bytes);
 }
 
-TEST_F(TelemetryCollectorTest, ComputesEmaSpeedsForCurrentSnapshotAndAveragesForSummary) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_download_delta(100U, TelemetryClock::time_point{std::chrono::seconds(2)});
-    collector_.record_download_delta(200U, TelemetryClock::time_point{std::chrono::seconds(3)});
-    collector_.record_persist_delta(80U, TelemetryClock::time_point{std::chrono::milliseconds(2500)});
-    collector_.record_persist_delta(120U, TelemetryClock::time_point{std::chrono::seconds(4)});
-    collector_.record_task_completed(TelemetryClock::time_point{std::chrono::seconds(5)});
+TEST(
+    TelemetryCollectorCompatibilityTest,
+    ForwardsEveryExplicitTimestampMethodLikeSession) {
+    TelemetryCollector collector;
+    TelemetrySession session;
+    const auto start =
+        TelemetryClock::time_point{std::chrono::seconds(1)};
+    const auto first_byte =
+        start + std::chrono::milliseconds(250);
+    const auto download_at =
+        start + std::chrono::milliseconds(500);
+    const auto persist_at =
+        start + std::chrono::milliseconds(750);
+    const auto pause_at =
+        start + std::chrono::seconds(1);
+    const auto memory_at =
+        start + std::chrono::milliseconds(1250);
+    const auto completed_at =
+        start + std::chrono::seconds(2);
 
-    const auto snapshot = collector_.current_snapshot();
-    EXPECT_DOUBLE_EQ(snapshot.network_bytes_per_second, 200.0);
-    EXPECT_DOUBLE_EQ(snapshot.disk_bytes_per_second, 80.0);
-
-    const auto summary = collector_.final_summary();
-    EXPECT_DOUBLE_EQ(summary.average_network_bytes_per_second, 75.0);
-    EXPECT_DOUBLE_EQ(summary.average_disk_bytes_per_second, 50.0);
-}
-
-TEST_F(TelemetryCollectorTest, TracksPeakMemoryAndInflightBytes) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_download_delta(300U, TelemetryClock::time_point{std::chrono::milliseconds(1100)});
-    collector_.record_memory_sample(1024U, TelemetryClock::time_point{std::chrono::milliseconds(1150)});
-    collector_.record_persist_delta(100U, TelemetryClock::time_point{std::chrono::milliseconds(1200)});
-    collector_.record_download_delta(200U, TelemetryClock::time_point{std::chrono::milliseconds(1300)});
-    collector_.record_memory_sample(2048U, TelemetryClock::time_point{std::chrono::milliseconds(1350)});
-
-    const auto snapshot = collector_.current_snapshot();
-    EXPECT_EQ(snapshot.downloaded_bytes, 500);
-    EXPECT_EQ(snapshot.persisted_bytes, 100);
-    EXPECT_EQ(snapshot.inflight_bytes, 400);
-    EXPECT_EQ(snapshot.memory_bytes, 2048U);
-
-    const auto summary = collector_.final_summary();
-    EXPECT_EQ(summary.max_memory_bytes, 2048U);
-    EXPECT_EQ(summary.max_inflight_bytes, 400);
-}
-
-TEST_F(TelemetryCollectorTest, TracksPauseCounts) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_pause(TelemetryPauseReason::queue_full,
+    collector.record_task_started(start);
+    session.record_task_started(start);
+    collector.record_first_byte_received(first_byte);
+    session.record_first_byte_received(first_byte);
+    collector.record_download_delta(300, download_at);
+    session.record_download_delta_at(300, download_at);
+    collector.record_persist_delta(100, persist_at);
+    session.record_persist_delta_at(100, persist_at);
+    collector.record_pause(
+        TelemetryPauseReason::queue_full,
         true,
-        TelemetryClock::time_point{std::chrono::milliseconds(1100)});
-    collector_.record_pause(TelemetryPauseReason::gap,
+        pause_at);
+    session.record_pause_at(
+        TelemetryPauseReason::queue_full,
+        true,
+        pause_at);
+    collector.record_memory_sample(2048, memory_at);
+    session.record_memory_sample_at(2048, memory_at);
+    collector.record_task_completed(completed_at);
+    session.record_task_completed(completed_at);
+
+    expect_equal(
+        collector.current_snapshot(),
+        session.current_snapshot());
+    expect_equal(
+        collector.final_summary(completed_at),
+        session.final_summary(completed_at));
+}
+
+TEST(
+    TelemetryCollectorCompatibilityTest,
+    ForwardsCompletionIgnoreAndStartReset) {
+    TelemetryCollector collector;
+    const auto start =
+        TelemetryClock::time_point{std::chrono::seconds(1)};
+    collector.record_task_started(start);
+    collector.record_download_delta(
+        100,
+        start + std::chrono::seconds(1));
+    collector.record_task_completed(
+        start + std::chrono::seconds(2));
+    collector.record_download_delta(
+        900,
+        start + std::chrono::seconds(3));
+
+    EXPECT_EQ(
+        collector.final_summary().packets_enqueued_total,
+        1U);
+
+    collector.record_task_started(
+        start + std::chrono::seconds(4));
+    const auto snapshot = collector.current_snapshot();
+    const auto summary = collector.final_summary(
+        start + std::chrono::seconds(5));
+    EXPECT_EQ(snapshot.downloaded_bytes, 0);
+    EXPECT_EQ(snapshot.persisted_bytes, 0);
+    EXPECT_EQ(summary.packets_enqueued_total, 0U);
+    EXPECT_EQ(summary.total_pause_count, 0U);
+}
+
+TEST(
+    TelemetryCollectorCompatibilityTest,
+    DoesNotShareStateWithIndependentSession) {
+    TelemetryCollector collector;
+    TelemetrySession session;
+    const auto start =
+        TelemetryClock::time_point{std::chrono::seconds(1)};
+    collector.record_task_started(start);
+    session.record_task_started(start);
+    collector.record_download_delta(
+        128,
+        start + std::chrono::seconds(1));
+    collector.record_pause(
+        TelemetryPauseReason::gap,
         false,
-        TelemetryClock::time_point{std::chrono::milliseconds(1200)});
-    collector_.record_pause(TelemetryPauseReason::queue_full,
-        false,
-        TelemetryClock::time_point{std::chrono::milliseconds(1300)});
+        start + std::chrono::seconds(1));
 
-    const auto summary = collector_.final_summary();
-    EXPECT_EQ(summary.total_pause_count, 3U);
-    EXPECT_EQ(summary.queue_full_pause_count, 2U);
+    EXPECT_EQ(
+        collector.final_summary().packets_enqueued_total,
+        1U);
+    EXPECT_EQ(
+        collector.final_summary().total_pause_count,
+        1U);
+    EXPECT_EQ(
+        session.final_summary().packets_enqueued_total,
+        0U);
+    EXPECT_EQ(
+        session.final_summary().total_pause_count,
+        0U);
 }
 
-TEST_F(TelemetryCollectorTest, IgnoresUpdatesAfterTaskCompleted) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_download_delta(120U, TelemetryClock::time_point{std::chrono::milliseconds(1100)});
-    collector_.record_task_completed(TelemetryClock::time_point{std::chrono::seconds(2)});
-    collector_.record_download_delta(999U, TelemetryClock::time_point{std::chrono::seconds(3)});
-
-    const auto summary = collector_.final_summary();
-    EXPECT_EQ(summary.packets_enqueued_total, 1U);
-    EXPECT_EQ(summary.max_packet_size_bytes, 120U);
 }
-
-TEST_F(TelemetryCollectorTest, UsesProvidedNowForIncompleteTaskSummary) {
-    collector_.record_task_started(TelemetryClock::time_point{std::chrono::seconds(1)});
-    collector_.record_download_delta(100U, TelemetryClock::time_point{std::chrono::seconds(2)});
-
-    const auto summary = collector_.final_summary(TelemetryClock::time_point{std::chrono::seconds(5)});
-    EXPECT_DOUBLE_EQ(summary.average_network_bytes_per_second, 25.0);
-    EXPECT_DOUBLE_EQ(summary.average_disk_bytes_per_second, 0.0);
-}
-
-} // namespace
