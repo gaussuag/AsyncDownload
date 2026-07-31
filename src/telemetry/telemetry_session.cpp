@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 #include "asyncdownload/telemetry/telemetry_session.hpp"
 
@@ -8,6 +9,47 @@ namespace {
 
 constexpr double EMA_PREVIOUS_WEIGHT = 0.8;
 constexpr double EMA_CURRENT_WEIGHT = 0.2;
+
+template <typename Value>
+Value saturating_add(
+    const Value lhs,
+    const Value rhs) noexcept {
+    const auto maximum =
+        std::numeric_limits<Value>::max();
+    return rhs > maximum - lhs
+        ? maximum
+        : lhs + rhs;
+}
+
+template <typename Value>
+Value saturating_increment(
+    const Value value) noexcept {
+    return saturating_add<Value>(value, 1);
+}
+
+std::size_t saturating_size(
+    const std::uint64_t value) noexcept {
+    if constexpr (
+        std::numeric_limits<std::size_t>::max() <
+        std::numeric_limits<std::uint64_t>::max()) {
+        if (value >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+    }
+    return static_cast<std::size_t>(value);
+}
+
+std::int64_t saturating_int64(
+    const std::uint64_t value) noexcept {
+    const auto maximum =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max());
+    return value > maximum
+        ? std::numeric_limits<std::int64_t>::max()
+        : static_cast<std::int64_t>(value);
+}
 
 double compute_instantaneous_speed(
     const std::uint64_t bytes,
@@ -30,7 +72,7 @@ std::int64_t clamp_inflight_bytes(
     if (downloaded_bytes <= persisted_bytes) {
         return 0;
     }
-    return static_cast<std::int64_t>(
+    return saturating_int64(
         downloaded_bytes - persisted_bytes);
 }
 
@@ -72,12 +114,17 @@ void TelemetrySession::record_download_delta_at(
         return;
     }
     update_latest_event_timestamp(timestamp);
-    ++state_.packets_enqueued_total;
-    state_.total_packet_bytes += bytes;
+    state_.packets_enqueued_total =
+        saturating_increment(
+            state_.packets_enqueued_total);
+    state_.total_packet_bytes =
+        saturating_add(
+            state_.total_packet_bytes,
+            bytes);
     state_.max_packet_size_bytes =
         std::max(
             state_.max_packet_size_bytes,
-            static_cast<std::size_t>(bytes));
+            saturating_size(bytes));
     if (state_.last_network_sample_at.has_value()) {
         const auto current_speed =
             compute_instantaneous_speed(
@@ -96,7 +143,10 @@ void TelemetrySession::record_download_delta_at(
         }
     }
     state_.last_network_sample_at = timestamp;
-    state_.total_download_bytes += bytes;
+    state_.total_download_bytes =
+        saturating_add(
+            state_.total_download_bytes,
+            bytes);
     state_.max_inflight_bytes =
         std::max(
             state_.max_inflight_bytes,
@@ -139,7 +189,10 @@ void TelemetrySession::record_persist_delta_at(
         }
     }
     state_.last_disk_sample_at = timestamp;
-    state_.total_persist_bytes += bytes;
+    state_.total_persist_bytes =
+        saturating_add(
+            state_.total_persist_bytes,
+            bytes);
 }
 
 void TelemetrySession::record_pause(
@@ -161,10 +214,14 @@ void TelemetrySession::record_pause_at(
         return;
     }
     update_latest_event_timestamp(timestamp);
-    ++state_.total_pause_count;
+    state_.total_pause_count =
+        saturating_increment(
+            state_.total_pause_count);
     if (is_queue_full ||
         reason == TelemetryPauseReason::queue_full) {
-        ++state_.queue_full_pause_count;
+        state_.queue_full_pause_count =
+            saturating_increment(
+                state_.queue_full_pause_count);
     }
 }
 
@@ -185,7 +242,7 @@ void TelemetrySession::record_memory_sample_at(
     }
     update_latest_event_timestamp(timestamp);
     state_.latest_memory_bytes =
-        static_cast<std::size_t>(memory_bytes);
+        saturating_size(memory_bytes);
     state_.max_memory_bytes =
         std::max(
             state_.max_memory_bytes,
@@ -213,10 +270,10 @@ TelemetrySession::current_snapshot() const noexcept {
     std::lock_guard<std::mutex> lock(state_mutex_);
     ProgressSnapshot snapshot{};
     snapshot.downloaded_bytes =
-        static_cast<std::int64_t>(
+        saturating_int64(
             state_.total_download_bytes);
     snapshot.persisted_bytes =
-        static_cast<std::int64_t>(
+        saturating_int64(
             state_.total_persist_bytes);
     snapshot.inflight_bytes =
         clamp_inflight_bytes(

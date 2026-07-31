@@ -47,6 +47,8 @@ public:
         TelemetryClock::time_point now = TelemetryClock::now()) const noexcept;
 
 private:
+    friend struct TelemetrySessionTestAccess;
+
     struct AggregationState {
         bool task_started = false;
         bool task_completed = false;
