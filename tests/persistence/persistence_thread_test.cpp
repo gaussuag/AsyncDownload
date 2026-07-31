@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <thread-pool/BS_thread_pool.hpp>
 
+#include "asyncdownload/error.hpp"
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
 #include "flow/packet_flow.hpp"
@@ -251,6 +252,10 @@ void persist_single_range_at_tail_capacity(
     EXPECT_EQ(
         session.persisted_bytes.load(std::memory_order_relaxed),
         total_size);
+    EXPECT_EQ(
+        session.telemetry_session_.
+            current_snapshot().persisted_bytes,
+        total_size);
 
     checkpoint->close_preserving_artifacts();
     std::ifstream stored_file(
@@ -280,6 +285,8 @@ void persist_single_range_at_tail_capacity(
 struct PersistenceScenarioResult {
     std::error_code error;
     asyncdownload::flow::PacketFlowSnapshot flow;
+    asyncdownload::ProgressSnapshot telemetry;
+    std::int64_t absolute_persisted = 0;
     std::int64_t persisted_through = 0;
     bool committed = false;
 };
@@ -289,7 +296,8 @@ PersistenceScenarioResult run_persistence_scenario(
     const std::vector<
         asyncdownload::flow::ControlPacket>& controls = {},
     const bool close_checkpoint_before_start = false,
-    const std::int64_t total_size = 4096) {
+    const std::int64_t total_size = 4096,
+    const std::int64_t initial_persisted = 0) {
     static std::atomic<std::uint64_t> sequence{0};
     const auto temp_root =
         std::filesystem::temp_directory_path() /
@@ -317,6 +325,10 @@ PersistenceScenarioResult run_persistence_scenario(
     session.paths.metadata_path =
         temp_root / "output.bin.config.json";
     session.url = "http://127.0.0.1/test.bin";
+    session.persisted_bytes.store(
+        initial_persisted,
+        std::memory_order_relaxed);
+    session.telemetry_session_.record_task_started();
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane lane;
     EXPECT_FALSE(
@@ -381,6 +393,9 @@ PersistenceScenarioResult run_persistence_scenario(
     PersistenceScenarioResult result{
         persistence.error(),
         packet_flow->producer().snapshot(),
+        session.telemetry_session_.current_snapshot(),
+        session.persisted_bytes.load(
+            std::memory_order_relaxed),
         fact_snapshot.has_value() ?
             fact_snapshot->persisted_through :
             0,
@@ -393,6 +408,45 @@ PersistenceScenarioResult run_persistence_scenario(
         filesystem_error);
     static_cast<void>(removed);
     return result;
+}
+
+TEST(PersistenceThreadTest, RecordsOnlyNewSuccessfulWritesAfterRestoredBase) {
+    TestPacket packet{};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x2A);
+
+    const auto result = run_persistence_scenario(
+        {packet},
+        {},
+        false,
+        12 * 1024,
+        8 * 1024);
+
+    EXPECT_FALSE(result.error);
+    EXPECT_EQ(result.absolute_persisted, 12 * 1024);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 4096);
+}
+
+TEST(PersistenceThreadTest, RejectsAbsolutePersistedCounterOverflow) {
+    TestPacket packet{};
+    packet.offset = 0;
+    packet.payload.assign(4096, 0x2B);
+    const auto initial =
+        std::numeric_limits<std::int64_t>::max() - 2048;
+
+    const auto result = run_persistence_scenario(
+        {packet},
+        {},
+        false,
+        4096,
+        initial);
+
+    EXPECT_EQ(
+        result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::internal_error));
+    EXPECT_EQ(result.absolute_persisted, initial);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 0);
 }
 
 TEST(PersistenceThreadTest, AcceptsValidatedAlignmentAtTailCapacity) {
@@ -597,6 +651,8 @@ TEST(
 
     EXPECT_TRUE(result.error);
     EXPECT_FALSE(result.committed);
+    EXPECT_EQ(result.absolute_persisted, 0);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 0);
 }
 
 TEST(

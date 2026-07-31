@@ -640,14 +640,16 @@ std::error_code PersistenceThread::append_bytes(RangeWriteState& range,
             return write_error;
         }
 
+        const auto counter_error =
+            record_persisted_bytes(aligned_bytes);
+        if (counter_error) {
+            return counter_error;
+        }
         bitmap_.mark_downloading_range(cursor,
             cursor + static_cast<std::int64_t>(aligned_bytes),
             policy_.block_bytes,
             session_.total_size);
         bytes_since_flush_ += aligned_bytes;
-        session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(aligned_bytes),
-            std::memory_order_relaxed);
-        session_.telemetry_session_.record_persist_delta(static_cast<std::uint64_t>(aligned_bytes));
         cursor += static_cast<std::int64_t>(aligned_bytes);
         index += aligned_bytes;
     }
@@ -662,6 +664,34 @@ std::error_code PersistenceThread::write_bytes(const std::int64_t offset,
     static_cast<void>(sample_timing);
     static_cast<void>(tail_write);
     return checkpoint_.write(offset, bytes);
+}
+
+std::error_code PersistenceThread::record_persisted_bytes(
+    const std::size_t bytes) noexcept {
+    auto current = session_.persisted_bytes.load(
+        std::memory_order_relaxed);
+    while (true) {
+        if (current < 0 ||
+            bytes > static_cast<std::size_t>(
+                std::numeric_limits<std::int64_t>::max() -
+                current)) {
+            return make_error_code(
+                DownloadErrc::internal_error);
+        }
+        const auto next =
+            current + static_cast<std::int64_t>(bytes);
+        if (session_.persisted_bytes.
+                compare_exchange_weak(
+                    current,
+                    next,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+            session_.telemetry_session_.
+                record_persist_delta(
+                    static_cast<std::uint64_t>(bytes));
+            return {};
+        }
+    }
 }
 
 std::error_code PersistenceThread::flush_tail(
@@ -693,15 +723,16 @@ std::error_code PersistenceThread::flush_tail(
         return write_error;
     }
 
+    const auto counter_error =
+        record_persisted_bytes(range.tail.length);
+    if (counter_error) {
+        return counter_error;
+    }
     bitmap_.mark_downloading_range(range.tail.offset,
         range.tail.offset + static_cast<std::int64_t>(write_size),
         policy_.block_bytes,
         session_.total_size);
     bytes_since_flush_ += range.tail.length;
-    session_.persisted_bytes.fetch_add(static_cast<std::int64_t>(range.tail.length),
-        std::memory_order_relaxed);
-    session_.telemetry_session_.record_persist_delta(
-        static_cast<std::uint64_t>(range.tail.length));
     range.tail = {};
     return {};
 }

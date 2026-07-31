@@ -505,6 +505,11 @@ TEST_F(
         }
     }
     EXPECT_EQ(get_count, 2U);
+    const auto summary = telemetry_.final_summary();
+    EXPECT_EQ(summary.total_pause_count, 0U);
+    EXPECT_EQ(summary.packets_enqueued_total, 2U);
+    EXPECT_DOUBLE_EQ(summary.average_packet_size_bytes, 4.0);
+    EXPECT_EQ(summary.max_packet_size_bytes, 4U);
     const auto removed =
         std::filesystem::remove_all(root, ec);
     static_cast<void>(removed);
@@ -707,6 +712,9 @@ TEST_F(
             session->poll(
                 std::chrono::milliseconds(0)));
     }
+    EXPECT_EQ(
+        telemetry_.final_summary().total_pause_count,
+        0U);
     EXPECT_TRUE(session->close());
     server.stop();
 

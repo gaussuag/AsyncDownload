@@ -690,8 +690,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             result.completed_ranges =
                 recovery_open.restored.completed_ranges;
             result.resumed = session.resumed;
-            session.telemetry_session_.record_task_completed(Clock::now());
-            result.performance = build_performance_summary(session, Clock::now());
+            const auto completed_at = Clock::now();
+            session.telemetry_session_.
+                record_task_completed(completed_at);
+            result.performance =
+                build_performance_summary(
+                    session,
+                    completed_at);
             return result;
         }
 
@@ -1259,9 +1264,20 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.temporary_path = session.paths.temporary_path;
         result.metadata_path = session.paths.metadata_path;
         if (!failure) {
-            session.telemetry_session_.record_task_completed(Clock::now());
+            const auto completed_at = Clock::now();
+            session.telemetry_session_.
+                record_task_completed(completed_at);
+            result.performance =
+                build_performance_summary(
+                    session,
+                    completed_at);
+        } else {
+            const auto failed_at = Clock::now();
+            result.performance =
+                build_performance_summary(
+                    session,
+                    failed_at);
         }
-        result.performance = build_performance_summary(session, Clock::now());
         return result;
     } catch (...) {
         // 对外契约是不抛异常，所以任何未预期错误最终都折叠成 internal_error。

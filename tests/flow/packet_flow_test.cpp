@@ -193,6 +193,60 @@ TEST(PacketFlowTest, ControlBypassesDataAdmissionBudgetWithoutBeingDropped) {
         asyncdownload::flow::PacketReceiveCode::closed);
 }
 
+TEST(PacketFlowTest, RecordsOnlySuccessfulDataPacketPublications) {
+    asyncdownload::telemetry::TelemetrySession telemetry;
+    telemetry.record_task_started();
+    auto flow = make_flow(telemetry);
+    asyncdownload::flow::ProducerLane lane;
+    ASSERT_FALSE(flow->producer().open_lane(lane));
+    const std::array<std::uint8_t, 4> first{1, 2, 3, 4};
+    const std::array<std::uint8_t, 4> second{5, 6, 7, 8};
+
+    const auto first_admission = flow->producer().accept(
+        lane, {{{10}, 1}, {0, 8}, 0, first});
+    const auto second_admission = flow->producer().accept(
+        lane, {{{10}, 1}, {0, 8}, 4, second});
+
+    ASSERT_TRUE(first_admission.accepted());
+    ASSERT_TRUE(second_admission.accepted());
+    EXPECT_EQ(
+        telemetry.final_summary().packets_enqueued_total,
+        0U);
+
+    const auto flushed = flow->producer().flush(lane);
+    ASSERT_TRUE(flushed.accepted());
+    EXPECT_EQ(flushed.published_bytes, 8U);
+    auto summary = telemetry.final_summary();
+    EXPECT_EQ(summary.packets_enqueued_total, 1U);
+    EXPECT_DOUBLE_EQ(summary.average_packet_size_bytes, 8.0);
+    EXPECT_EQ(summary.max_packet_size_bytes, 8U);
+
+    ASSERT_EQ(
+        flow->producer().publish({
+            asyncdownload::flow::ControlPacketKind::range_complete,
+            {{10}, 1},
+            8
+        }).code,
+        asyncdownload::flow::PacketPublishCode::published);
+    ASSERT_FALSE(flow->producer().close());
+    EXPECT_EQ(
+        flow->producer().accept(
+            lane, {{{10}, 1}, {0, 8}, 8, first}).code,
+        asyncdownload::flow::PacketAdmissionCode::closed);
+    summary = telemetry.final_summary();
+    EXPECT_EQ(summary.packets_enqueued_total, 1U);
+    EXPECT_DOUBLE_EQ(summary.average_packet_size_bytes, 8.0);
+    EXPECT_EQ(summary.max_packet_size_bytes, 8U);
+
+    asyncdownload::flow::PacketLease packet;
+    while (flow->consumer().receive(
+               packet,
+               std::chrono::milliseconds(1)).code ==
+           asyncdownload::flow::PacketReceiveCode::packet) {
+        packet.complete();
+    }
+}
+
 TEST(PacketFlowTest, ConcurrentDownloadInstancesDoNotShareAccounting) {
     asyncdownload::telemetry::TelemetrySession first_telemetry;
     asyncdownload::telemetry::TelemetrySession second_telemetry;

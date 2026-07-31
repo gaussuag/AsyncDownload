@@ -1022,7 +1022,8 @@ private:
                 finish_callback();
                 return CURL_WRITEFUNC_ERROR;
             }
-            if (!slot.first_byte_recorded) {
+            if (admission.consumed_bytes > 0 &&
+                !slot.first_byte_recorded) {
                 telemetry_.
                     record_first_byte_received();
                 slot.first_byte_recorded = true;

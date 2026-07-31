@@ -103,6 +103,8 @@ private:
                                               std::span<const std::uint8_t> bytes,
                                               bool sample_timing,
                                               bool tail_write);
+    [[nodiscard]] std::error_code record_persisted_bytes(
+        std::size_t bytes) noexcept;
     // 强制把当前 range 的尾部残留刷到磁盘。
     [[nodiscard]] std::error_code flush_tail(
         RangeWriteState& range,
