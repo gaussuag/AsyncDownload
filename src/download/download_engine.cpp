@@ -5,6 +5,7 @@
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
 #include "download/download_policy.hpp"
+#include "download/progress_snapshot_builder.hpp"
 #include "download/range_scheduler.hpp"
 #include "flow/packet_flow.hpp"
 #include "http/http_transfer.hpp"
@@ -67,7 +68,6 @@ struct ActiveTransfer {
 
 [[nodiscard]] std::error_code invoke_progress(
     core::SessionState& session,
-    range::RangeLifecycle& lifecycle,
     flow::PacketProducer& packet_producer,
     const http::HttpSessionSnapshot& http_snapshot)
         noexcept {
@@ -75,40 +75,31 @@ struct ActiveTransfer {
         return {};
     }
 
-    const auto lifecycle_snapshot = lifecycle.snapshot();
-    if (lifecycle_snapshot.error) {
-        return lifecycle_snapshot.error;
-    }
-    auto snapshot = session.telemetry_session_.current_snapshot();
+    const auto telemetry_snapshot =
+        session.telemetry_session_.current_snapshot();
     const auto flow_snapshot =
         packet_producer.snapshot();
-    snapshot.total_bytes = session.total_size;
-    snapshot.downloaded_bytes =
-        merged_downloaded_bytes(session, flow_snapshot).value_or(
-            std::numeric_limits<std::int64_t>::max());
-    snapshot.persisted_bytes = session.persisted_bytes.load(std::memory_order_relaxed);
-    snapshot.vdl_offset = session.vdl_offset.load(std::memory_order_relaxed);
-    snapshot.inflight_bytes = std::max<std::int64_t>(0,
-        snapshot.downloaded_bytes - snapshot.persisted_bytes);
-    snapshot.queued_packets = flow_snapshot.queued_packets;
-    snapshot.memory_bytes = flow_snapshot.accounted_bytes;
-    snapshot.resumed = session.resumed;
-
-    const auto gap_paused = static_cast<std::size_t>(
-        std::count_if(
-            lifecycle_snapshot.value.ranges.begin(),
-            lifecycle_snapshot.value.ranges.end(),
-            [](const range::RangeSnapshot& current) {
-                return current.gap_blocked;
-            }));
-    snapshot.paused_ranges = std::max(
-        gap_paused,
-        http_snapshot.paused_transfers);
-    snapshot.active_requests =
-        http_snapshot.active_transfers;
+    ProgressSnapshotSources sources{};
+    sources.total_bytes = session.total_size;
+    sources.recovery_trusted_bytes =
+        session.recovery_initial_trusted_bytes;
+    sources.persisted_bytes =
+        session.persisted_bytes.load(
+            std::memory_order_relaxed);
+    sources.vdl_offset =
+        session.vdl_offset.load(
+            std::memory_order_relaxed);
+    sources.packet_flow = flow_snapshot;
+    sources.http = http_snapshot;
+    sources.telemetry = telemetry_snapshot;
+    sources.resumed = session.resumed;
+    const auto built = build_progress_snapshot(sources);
+    if (built.error) {
+        return built.error;
+    }
 
     try {
-        session.progress_callback(snapshot);
+        session.progress_callback(built.snapshot);
     } catch (...) {
     }
     return {};
@@ -1118,7 +1109,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 if (const auto progress_error =
                         invoke_progress(
                             session,
-                            *lifecycle,
                             packet_flow->producer(),
                             http_session->snapshot());
                     progress_error) {
@@ -1222,7 +1212,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         if (const auto progress_error =
                 invoke_progress(
                     session,
-                    *lifecycle,
                     packet_flow->producer(),
                     http_session->snapshot());
             !failure && progress_error) {
