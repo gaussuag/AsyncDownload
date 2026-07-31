@@ -651,8 +651,8 @@ TEST(
 
     EXPECT_TRUE(result.error);
     EXPECT_FALSE(result.committed);
-    EXPECT_EQ(result.absolute_persisted, 0);
-    EXPECT_EQ(result.telemetry.persisted_bytes, 0);
+    EXPECT_EQ(result.absolute_persisted, 4096);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 4096);
 }
 
 TEST(
@@ -759,6 +759,8 @@ TEST(
 
     EXPECT_TRUE(result.error);
     EXPECT_FALSE(result.committed);
+    EXPECT_EQ(result.absolute_persisted, 4096);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 4096);
 }
 
 TEST(
@@ -783,6 +785,8 @@ TEST(
 
     EXPECT_TRUE(result.error);
     EXPECT_FALSE(result.committed);
+    EXPECT_EQ(result.absolute_persisted, 0);
+    EXPECT_EQ(result.telemetry.persisted_bytes, 0);
 }
 
 TEST(
