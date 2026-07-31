@@ -2612,3 +2612,54 @@ header callback；body callback 只读取缓存的 header state，不新增 heap
 payload copy、mutex、`std::function` 或 virtual per-batch dispatch。pause replay 仍由
 Curl 驱动，1 ms wait 只存在于 final lane flush。完整 slice 与 rollback 证据见
 `docs/architecture/refactor/evidence/phase_05_http_transfer.md`。
+
+## 28. 架构迭代 028：Telemetry Session 性能中性验收（采纳）
+
+### 28.1 目的
+
+阶段 6 把 task lifecycle、时间规则、EMA、observation totals、memory/inflight peak、
+pause/packet 统计、snapshot、正式 Summary 与同步收口到唯一的 `TelemetrySession`。
+`TelemetryCollector` 只保留公开兼容转发；progress 从 Phase 2–5 权威事实显式合并，只从
+Telemetry 复制 network/disk speed。本轮不改变 64 KiB aggregation、HTTP、Persistence、
+backpressure、flush 或正式 10-key schema。
+
+### 28.2 正式同机结果
+
+实际 base `d1b58ce` 在隔离 worktree 重新构建。pre/post 都使用 Release、同一 loopback
+1 GiB identity 对象、四个 case 和每 case 20 次：
+
+- `baseline_default`：`399.35 -> 594.17 MB/s`，`+48.79%`
+- `balanced_candidate`：`472.84 -> 510.98 MB/s`，`+8.07%`
+- `memory_guard`：`445.26 -> 575.07 MB/s`，`+29.15%`
+- `scheduler_stress`：`320.22 -> 483.97 MB/s`，`+51.14%`
+
+所有 case 的 network/disk 都改善，TTFB 从 pre 的 `12.5–16 ms` 改善到 `4–6 ms`，pause
+中位数也下降。平均 packet 仍约 64 KiB，最大 packet 仍为 65,536 bytes。
+
+主机在全套 pre/post 边界切换了运行模态，因此按 gate 把 memory 信号提升到 40 次紧邻
+确认。`memory_guard` 结果为：
+
+- network/disk：`466.97 -> 579.56 MB/s`，`+24.11%`
+- TTFB：`13.5 -> 4 ms`
+- max memory：`4,526,952 -> 12,398,719 bytes`
+- max inflight：`4,275,018 -> 12,135,545 bytes`
+- pause：`213 -> 17`
+
+上升的 producer/persistence overlap 同时带来明确吞吐、延迟和 pause 收益；后态
+`memory_guard` memory 仍只有后态 default 的 `9.12%`，inflight 只有 `8.94%`，低内存形态
+保持。不存在多 case 无收益内存上升或 throughput keeper 回归。
+
+### 28.3 证据与边界
+
+- 正式 actual base：`build/benchmarks/20260731_084241_phase-6-pre`
+- 正式 post：`build/benchmarks/20260731_084708_phase-6-post`
+- 40-run actual-base memory：
+  `build/benchmarks/20260731_085231_phase-6-pre-memory-confirmation`
+- 40-run post memory：
+  `build/benchmarks/20260731_085440_phase-6-post-memory-confirmation`
+- WPR：`build/profiles/20260731_085656_phase-6-profile`
+
+WPR 在 `wpr-start` 被相同 policy 以 `0xc5585011` 拒绝。源码审计确认 record/query 只使用
+一个 task-local mutex，Collector 只有一次转发，没有 per-event allocation、queue、worker
+或第二份 aggregation state。完整 slice、schema、并发和 rollback 证据见
+`docs/architecture/refactor/evidence/phase_06_telemetry_session.md`。

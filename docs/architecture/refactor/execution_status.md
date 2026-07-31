@@ -4,12 +4,12 @@
 
 | Item | Value |
 | --- | --- |
-| Active stage | 6 — Telemetry Session |
-| Last passed stage | 5 — HTTP Transfer |
+| Active stage | complete — final acceptance passed |
+| Last passed stage | 6 — Telemetry Session |
 | Stage 0 base | `622339136e563752885d8b5ee6a6a0157e28266c` |
 | Stage 0 test rollback point | `98f891f` |
-| Current branch | `codex/refactor-05-http-transfer` |
-| Next slice | 06.1 — characterize telemetry contracts |
+| Current branch | `codex/refactor-06-telemetry-session` |
+| Next slice | none |
 
 ## Stage ledger
 
@@ -21,7 +21,7 @@
 | 3 — Range Lifecycle | passed | `evidence/phase_03_range_lifecycle.md` | commits after `f271997` |
 | 4 — Recovery Checkpoint | passed | `evidence/phase_04_recovery_checkpoint.md` | commits after `af1a61d` |
 | 5 — HTTP Transfer | passed | `evidence/phase_05_http_transfer.md` | commits after `6f77a1d` |
-| 6 — Telemetry Session | active | pending | depends on Stage 5 |
+| 6 — Telemetry Session | passed | `evidence/phase_06_telemetry_session.md` | commits after `d1b58ce` |
 
 ## Persistent environment facts
 
@@ -63,5 +63,19 @@
   `build/benchmarks/20260731_073819_phase-5-post-normalized-confirmation`.
 - Stage 5 WPR attempted artifact is `build/profiles/20260731_072838_phase-5-profile`; WPR start was
   denied by the same `0xc5585011` local tracing policy.
+- Stage 6 Debug and Release main test binaries each run 273 tests: 271 pass and the same 2
+  architecture skips. HTTP fault tests pass 18/18, Packet Flow 8/8, Range 6/6, and Recovery
+  16/16 in both configurations.
+- Stage 6 formal actual-base/post benchmark artifacts are
+  `build/benchmarks/20260731_084241_phase-6-pre` and
+  `build/benchmarks/20260731_084708_phase-6-post`; all 160 runs pass with exact 10-key summaries.
+  The memory signal was elevated to consecutive 40-run artifacts
+  `build/benchmarks/20260731_085231_phase-6-pre-memory-confirmation` and
+  `build/benchmarks/20260731_085440_phase-6-post-memory-confirmation`.
+- Stage 6 WPR attempted artifact is `build/profiles/20260731_085656_phase-6-profile`; WPR start was
+  denied by the same `0xc5585011` local tracing policy. Source inspection confirms one task-local
+  Telemetry mutex and no per-event allocation, queue, or worker.
+- Stages 0–6 have passed their functional, schema, deletion, performance, rollback, and evidence
+  gates. The progressive architecture refactor roadmap is complete.
 - `skills/asyncdownload-performance` and `skills/history-archive` are absent at current HEAD but
   available in base commit `7a96af2`; their workflows govern this execution as a fallback.
