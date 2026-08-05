@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -148,6 +149,39 @@ read_file(
         std::istreambuf_iterator<char>(stream),
         std::istreambuf_iterator<char>()
     };
+}
+
+void expect_candidate_rejected_without_mutation(
+    const asyncdownload::recovery::RecoveryOpenRequest& request,
+    const asyncdownload::core::MetadataState& state,
+    const std::vector<std::uint8_t>& part_before) {
+    const std::vector<std::uint8_t> output_before(
+        31,
+        0xA7);
+    save_candidate(request, state, part_before);
+    write_part(request.paths.output_path, output_before);
+    const auto metadata_before =
+        read_file(request.paths.metadata_path);
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            request);
+
+    EXPECT_EQ(
+        opened.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::
+                metadata_parse_failed));
+    EXPECT_EQ(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        read_file(request.paths.temporary_path),
+        part_before);
+    EXPECT_EQ(
+        read_file(request.paths.metadata_path),
+        metadata_before);
+    EXPECT_EQ(
+        read_file(request.paths.output_path),
+        output_before);
 }
 
 }
@@ -736,7 +770,7 @@ TEST(
 
 TEST(
     RecoveryCheckpointTest,
-    CrcReadFailurePreservesCandidateArtifacts) {
+    RejectsOversizedCrcReadWithoutMutation) {
     RecoveryTempDirectory temp(
         "asyncdownload_recovery_crc_read");
     const auto request = fresh_request(temp.path());
@@ -752,20 +786,158 @@ TEST(
         state,
         part_contents());
 
-    auto opened =
-        asyncdownload::recovery::RecoveryCheckpoint::open(
-            request);
+    expect_candidate_rejected_without_mutation(
+        request,
+        state,
+        part_contents());
+}
 
-    EXPECT_EQ(
-        opened.error,
-        asyncdownload::make_error_code(
-            asyncdownload::DownloadErrc::
-                file_read_failed));
-    EXPECT_EQ(opened.checkpoint, nullptr);
-    EXPECT_TRUE(std::filesystem::exists(
-        request.paths.temporary_path));
-    EXPECT_TRUE(std::filesystem::exists(
-        request.paths.metadata_path));
+TEST(RecoveryCheckpointTest, RejectsNegativeVdlWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_negative_vdl");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.vdl_offset = -1;
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsVdlBeyondTotalWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_large_vdl");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.vdl_offset = 8193;
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsUnalignedVdlWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_unaligned_vdl");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.vdl_offset = 1;
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsInvalidBitmapStateWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_bitmap_state");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {3};
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsOversizedBitmapWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_bitmap_size");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.bitmap_states = {0, 0, 0};
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsOverflowingRangeWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_range_overflow");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.ranges.push_back({
+        0,
+        0,
+        std::numeric_limits<std::int64_t>::max(),
+        0,
+        0,
+        0
+    });
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsOverlappingPersistedRangesWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_range_overlap");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.ranges = {
+        {0, 0, 4095, 4096, 4096, 0},
+        {1, 2048, 8191, 4096, 4096, 0}
+    };
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsInvalidRangeFrontiersWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_range_frontiers");
+    const auto request = fresh_request(temp.path());
+    const std::array<asyncdownload::core::RangeStateSnapshot, 5> ranges{{
+        {0, -1, 4095, 0, 0, 0},
+        {0, 1, 4095, 1, 0, 0},
+        {0, 0, 4095, 1024, 2048, 0},
+        {0, 0, 4095, 4097, 0, 0},
+        {0, 0, 8192, 0, 0, 0}
+    }};
+    for (const auto& range : ranges) {
+        auto state = candidate_state(request);
+        state.ranges = {range};
+        SCOPED_TRACE(range.start_offset);
+        SCOPED_TRACE(range.end_offset);
+        SCOPED_TRACE(range.current_offset);
+        SCOPED_TRACE(range.persisted_offset);
+        expect_candidate_rejected_without_mutation(
+            request, state, part_contents());
+    }
+}
+
+TEST(RecoveryCheckpointTest, RejectsMalformedCrcLengthsWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_crc_lengths");
+    const auto request = fresh_request(temp.path());
+    for (const auto length : {std::size_t{0}, std::size_t{1}, std::size_t{4095}}) {
+        auto state = candidate_state(request);
+        state.crc_samples.push_back({4096, 0, length});
+        SCOPED_TRACE(length);
+        expect_candidate_rejected_without_mutation(
+            request, state, part_contents());
+    }
+}
+
+TEST(RecoveryCheckpointTest, RejectsMalformedCrcOffsetsWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_crc_offsets");
+    const auto request = fresh_request(temp.path());
+    for (const auto offset : {
+             std::int64_t{-4096},
+             std::int64_t{1},
+             std::int64_t{8192}}) {
+        auto state = candidate_state(request);
+        state.crc_samples.push_back({offset, 0, 4096});
+        SCOPED_TRACE(offset);
+        expect_candidate_rejected_without_mutation(
+            request, state, part_contents());
+    }
+}
+
+TEST(RecoveryCheckpointTest, RejectsDuplicateCrcOffsetsWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_crc_duplicate");
+    const auto request = fresh_request(temp.path());
+    auto state = candidate_state(request);
+    state.crc_samples = {
+        {4096, 0, 4096},
+        {4096, 0, 4096}
+    };
+    expect_candidate_rejected_without_mutation(
+        request, state, part_contents());
+}
+
+TEST(RecoveryCheckpointTest, RejectsFullLengthForShortTailWithoutMutation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_crc_tail");
+    auto request = fresh_request(temp.path());
+    request.remote.total_size = 6144;
+    auto state = candidate_state(request);
+    state.total_size = 6144;
+    state.bitmap_states = {2, 2};
+    state.crc_samples = {{4096, 0, 4096}};
+    auto bytes = part_contents();
+    bytes.resize(6144);
+    expect_candidate_rejected_without_mutation(
+        request, state, bytes);
 }
 
 TEST(
@@ -851,6 +1023,143 @@ TEST(
     ASSERT_FALSE(second_result.error);
     EXPECT_EQ(second_result.generation, 2U);
     EXPECT_EQ(second_result.committed_vdl, 0);
+}
+
+TEST(RecoveryCheckpointTest, AbandonedPreparedCheckpointReleasesReservation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_abandon");
+    const auto request = fresh_request(temp.path());
+    auto opened = asyncdownload::recovery::RecoveryCheckpoint::open(request);
+    ASSERT_FALSE(opened.error);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<asyncdownload::recovery::RecoveryRangeFact> ranges;
+
+    auto abandoned = opened.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(abandoned.error);
+    abandoned.checkpoint.reset();
+    auto successor = opened.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(successor.error);
+    const auto committed = opened.checkpoint->commit(
+        std::move(successor.checkpoint));
+
+    EXPECT_FALSE(committed.error);
+    EXPECT_EQ(committed.generation, 2U);
+}
+
+TEST(RecoveryCheckpointTest, MoveConstructionTransfersPreparedReservation) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_move_construct");
+    const auto request = fresh_request(temp.path());
+    auto opened = asyncdownload::recovery::RecoveryCheckpoint::open(request);
+    ASSERT_FALSE(opened.error);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<asyncdownload::recovery::RecoveryRangeFact> ranges;
+    auto prepared = opened.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(prepared.error);
+    asyncdownload::recovery::PreparedCheckpoint moved(
+        std::move(*prepared.checkpoint));
+
+    const auto moved_from_result = opened.checkpoint->commit(
+        std::move(prepared.checkpoint));
+    const auto committed = opened.checkpoint->commit(
+        std::make_unique<asyncdownload::recovery::PreparedCheckpoint>(
+            std::move(moved)));
+
+    EXPECT_EQ(
+        moved_from_result.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::internal_error));
+    EXPECT_FALSE(committed.error);
+    EXPECT_EQ(committed.generation, 1U);
+}
+
+TEST(RecoveryCheckpointTest, MoveAssignmentReleasesTargetReservation) {
+    RecoveryTempDirectory first_temp("asyncdownload_recovery_move_assign_first");
+    RecoveryTempDirectory second_temp("asyncdownload_recovery_move_assign_second");
+    const auto first_request = fresh_request(first_temp.path());
+    const auto second_request = fresh_request(second_temp.path());
+    auto first = asyncdownload::recovery::RecoveryCheckpoint::open(first_request);
+    auto second = asyncdownload::recovery::RecoveryCheckpoint::open(second_request);
+    ASSERT_FALSE(first.error);
+    ASSERT_FALSE(second.error);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<asyncdownload::recovery::RecoveryRangeFact> ranges;
+    auto first_prepared = first.checkpoint->prepare(bitmap, ranges);
+    auto second_prepared = second.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(first_prepared.error);
+    ASSERT_FALSE(second_prepared.error);
+
+    *first_prepared.checkpoint = std::move(*second_prepared.checkpoint);
+    auto first_successor = first.checkpoint->prepare(bitmap, ranges);
+    const auto second_committed = second.checkpoint->commit(
+        std::move(first_prepared.checkpoint));
+
+    EXPECT_FALSE(first_successor.error);
+    EXPECT_FALSE(second_committed.error);
+    EXPECT_EQ(second_committed.generation, 1U);
+}
+
+TEST(RecoveryCheckpointTest, ForeignCommitReleasesSourceReservationOnly) {
+    RecoveryTempDirectory source_temp("asyncdownload_recovery_foreign_source");
+    RecoveryTempDirectory target_temp("asyncdownload_recovery_foreign_target");
+    const auto source_request = fresh_request(source_temp.path());
+    const auto target_request = fresh_request(target_temp.path());
+    auto source = asyncdownload::recovery::RecoveryCheckpoint::open(source_request);
+    auto target = asyncdownload::recovery::RecoveryCheckpoint::open(target_request);
+    ASSERT_FALSE(source.error);
+    ASSERT_FALSE(target.error);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<asyncdownload::recovery::RecoveryRangeFact> ranges;
+    auto prepared = source.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(prepared.error);
+
+    const auto foreign = target.checkpoint->commit(
+        std::move(prepared.checkpoint));
+    auto source_successor = source.checkpoint->prepare(bitmap, ranges);
+    auto target_first = target.checkpoint->prepare(bitmap, ranges);
+
+    EXPECT_EQ(
+        foreign.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::internal_error));
+    ASSERT_FALSE(source_successor.error);
+    ASSERT_FALSE(target_first.error);
+    const auto source_committed = source.checkpoint->commit(
+        std::move(source_successor.checkpoint));
+    const auto target_committed = target.checkpoint->commit(
+        std::move(target_first.checkpoint));
+    EXPECT_EQ(source_committed.generation, 2U);
+    EXPECT_EQ(target_committed.generation, 1U);
+}
+
+TEST(RecoveryCheckpointTest, PreparedTokenMayOutliveCheckpointOwner) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_owner_first");
+    const auto request = fresh_request(temp.path());
+    auto opened = asyncdownload::recovery::RecoveryCheckpoint::open(request);
+    ASSERT_FALSE(opened.error);
+    auto prepared = opened.checkpoint->prepare(
+        std::vector<std::uint8_t>{0, 0},
+        std::vector<asyncdownload::recovery::RecoveryRangeFact>{});
+    ASSERT_FALSE(prepared.error);
+
+    opened.checkpoint.reset();
+    prepared.checkpoint.reset();
+
+    SUCCEED();
+}
+
+TEST(RecoveryCheckpointTest, NullPreparedCheckpointIsRejectedDeterministically) {
+    RecoveryTempDirectory temp("asyncdownload_recovery_null_token");
+    const auto request = fresh_request(temp.path());
+    auto opened = asyncdownload::recovery::RecoveryCheckpoint::open(request);
+    ASSERT_FALSE(opened.error);
+
+    const auto first = opened.checkpoint->commit(nullptr);
+    const auto second = opened.checkpoint->commit(nullptr);
+
+    EXPECT_EQ(first.error, second.error);
+    EXPECT_EQ(
+        first.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::internal_error));
 }
 
 TEST(

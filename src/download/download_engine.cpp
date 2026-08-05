@@ -1,6 +1,7 @@
 ﻿#include "download_engine.hpp"
 
 #include "asyncdownload/error.hpp"
+#include "download/download_engine_internal.hpp"
 #include "core/block_bitmap.hpp"
 #include "core/models.hpp"
 #include "core/path_utils.hpp"
@@ -534,22 +535,48 @@ void rebuild_bitmap_from_ranges(
     return first_error;
 }
 
-std::error_code stop_persistence_phase(flow::PacketProducer& producer,
-                                       persistence::PersistenceThread& persistence,
-                                       std::error_code failure) noexcept {
-    // 网络停住之后再让 Persistence 做最终 drain 和 flush，这样 VDL/metadata
-    // 的最终状态才能和磁盘内容一致。
-    const auto close_error = producer.close();
-    if (!failure && close_error) {
-        failure = close_error;
+class PersistencePhase {
+public:
+    PersistencePhase(
+        flow::PacketProducer& producer,
+        persistence::PersistenceThread& persistence) noexcept
+        : producer_(producer),
+          persistence_(persistence) {}
+
+    ~PersistencePhase() {
+        if (armed_) {
+            static_cast<void>(finish(make_error_code(
+                DownloadErrc::internal_error)));
+        }
     }
-    persistence.stop();
-    persistence.join();
-    if (!failure) {
-        failure = persistence.error();
+
+    void start() {
+        persistence_.start();
+        armed_ = true;
     }
-    return failure;
-}
+
+    [[nodiscard]] std::error_code finish(
+        std::error_code first_error) noexcept {
+        if (!armed_) {
+            return first_error;
+        }
+        armed_ = false;
+        const auto close_error = producer_.close();
+        if (!first_error && close_error) {
+            first_error = close_error;
+        }
+        persistence_.join();
+        if (!first_error) {
+            first_error = persistence_.error();
+        }
+        return first_error;
+    }
+
+private:
+    flow::PacketProducer& producer_;
+    persistence::PersistenceThread& persistence_;
+    bool armed_ = false;
+};
 
 [[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
                                                            const Clock::time_point now) noexcept {
@@ -558,7 +585,9 @@ std::error_code stop_persistence_phase(flow::PacketProducer& producer,
 
 } // namespace
 
-DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
+DownloadResult detail::run_download(
+    const DownloadRequest& request,
+    const DownloadEngineDependencies& dependencies) noexcept {
     DownloadResult result{};
     result.temporary_path = core::make_temporary_path(request.output_path);
     result.metadata_path = core::make_metadata_path(request.output_path);
@@ -580,8 +609,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         const auto run_started = Clock::now();
         std::unique_ptr<http::HttpTransferPort>
             http_transfer_port;
+        if (dependencies.create_http_transfer_port == nullptr) {
+            result.error = make_error_code(
+                DownloadErrc::internal_error);
+            return result;
+        }
         const auto http_port_error =
-            http::create_curl_http_transfer_port(
+            dependencies.create_http_transfer_port(
                 http_transfer_port);
         if (http_port_error ||
             http_transfer_port == nullptr) {
@@ -754,11 +788,37 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             *recovery_checkpoint,
             workers,
             initial_plan.ranges.size());
-        persistence.start();
-
+        const auto connection_limit =
+            session.effective_policy.scheduling().
+                connection_limit;
         std::vector<ExpectedGeometryAck> initial_geometry_acks;
         initial_geometry_acks.reserve(
             lifecycle_creation.effects.values.size());
+        std::vector<PendingLease> pending_leases;
+        std::vector<ActiveTransfer> active_transfers;
+        pending_leases.reserve(connection_limit);
+        active_transfers.reserve(connection_limit);
+        PersistencePhase persistence_phase(
+            packet_flow->producer(),
+            persistence);
+        persistence_phase.start();
+        if (dependencies.post_persistence_start_check !=
+            nullptr) {
+            const auto start_error =
+                dependencies.post_persistence_start_check();
+            if (start_error) {
+                result.error =
+                    persistence_phase.finish(start_error);
+                recovery_checkpoint->
+                    close_preserving_artifacts();
+                result.performance =
+                    build_performance_summary(
+                        session,
+                        Clock::now());
+                return result;
+            }
+        }
+
         std::error_code initial_geometry_error;
         for (const auto& effect :
              lifecycle_creation.effects.values) {
@@ -783,16 +843,14 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 range::EffectApplicationFailed{
                     initial_geometry_error
                 });
-            const auto close_error =
-                packet_flow->producer().close();
-            static_cast<void>(close_error);
-            persistence.stop();
-            persistence.join();
-            recovery_checkpoint->
-                close_preserving_artifacts();
-            result.error = applied.error ?
+            const auto first_error = applied.error ?
                 applied.error :
                 initial_geometry_error;
+            const auto phase_error =
+                persistence_phase.finish(first_error);
+            recovery_checkpoint->
+                close_preserving_artifacts();
+            result.error = phase_error;
             result.performance =
                 build_performance_summary(
                     session,
@@ -800,9 +858,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
             return result;
         }
 
-        const auto connection_limit =
-            session.effective_policy.scheduling().
-                connection_limit;
         auto opened_http_session =
             http_transfer_port->open_session(
                 {
@@ -814,18 +869,16 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 session.telemetry_session_);
         if (opened_http_session.failure.error ||
             opened_http_session.session == nullptr) {
-            const auto close_error =
-                packet_flow->producer().close();
-            static_cast<void>(close_error);
-            persistence.stop();
-            persistence.join();
-            recovery_checkpoint->
-                close_preserving_artifacts();
-            result.error =
+            const auto first_error =
                 opened_http_session.failure.error
                 ? opened_http_session.failure.error
                 : make_error_code(
                     DownloadErrc::http_init_failed);
+            const auto phase_error =
+                persistence_phase.finish(first_error);
+            recovery_checkpoint->
+                close_preserving_artifacts();
+            result.error = phase_error;
             result.performance =
                 build_performance_summary(
                     session,
@@ -834,10 +887,6 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         }
         auto http_session =
             std::move(opened_http_session.session);
-        std::vector<PendingLease> pending_leases;
-        std::vector<ActiveTransfer> active_transfers;
-        pending_leases.reserve(connection_limit);
-        active_transfers.reserve(connection_limit);
         std::error_code failure;
 
         auto emit_progress_at = Clock::now();
@@ -1175,8 +1224,10 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 failure = close_error;
             }
         }
-        failure = stop_persistence_phase(
-            packet_flow->producer(), persistence, failure);
+        const auto final_http_snapshot =
+            http_session->snapshot();
+        http_session.reset();
+        failure = persistence_phase.finish(failure);
         const auto final_facts =
             lifecycle->drain_persistence_facts();
         if (!failure && final_facts.error) {
@@ -1218,7 +1269,7 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
                 invoke_progress(
                     session,
                     packet_flow->producer(),
-                    http_session->snapshot());
+                    final_http_snapshot);
             !failure && progress_error) {
             failure = progress_error;
         }
@@ -1284,6 +1335,13 @@ DownloadResult DownloadEngine::run(const DownloadRequest& request) noexcept {
         result.error = make_error_code(DownloadErrc::internal_error);
         return result;
     }
+}
+
+DownloadResult DownloadEngine::run(
+    const DownloadRequest& request) noexcept {
+    return detail::run_download(
+        request,
+        {http::create_curl_http_transfer_port, nullptr});
 }
 
 } // namespace asyncdownload::download

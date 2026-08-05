@@ -246,7 +246,6 @@ void persist_single_range_at_tail_capacity(
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     EXPECT_FALSE(persistence.error());
     EXPECT_EQ(
@@ -387,7 +386,6 @@ PersistenceScenarioResult run_persistence_scenario(
         checkpoint->close_preserving_artifacts();
         persistence.start();
     }
-    persistence.stop();
     persistence.join();
     const auto fact_snapshot = facts.read_since(0);
     PersistenceScenarioResult result{
@@ -934,7 +932,6 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 
@@ -1000,7 +997,6 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 
@@ -1071,7 +1067,6 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 
@@ -1140,7 +1135,6 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 
@@ -1234,7 +1228,6 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     }, std::chrono::milliseconds(1000)));
 
     ASSERT_FALSE(packet_flow->producer().close());
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 
@@ -1367,7 +1360,6 @@ TEST(
     }, std::chrono::milliseconds(1000)));
 
     const auto close_error = packet_flow->producer().close();
-    persistence.stop();
     persistence.join();
     checkpoint->close_preserving_artifacts();
 

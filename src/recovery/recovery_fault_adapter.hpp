@@ -26,6 +26,10 @@ struct RecoveryFaultPlan {
     std::atomic<std::size_t>
         crc_read_count{0};
     std::atomic<bool>
+        fail_next_resume_crc_read{false};
+    std::atomic<bool>
+        fail_next_prepare_allocation{false};
+    std::atomic<bool>
         fail_next_checkpoint_submit{false};
     std::atomic<bool>
         fail_next_metadata_cleanup{false};
@@ -54,6 +58,12 @@ struct RecoveryFaultPlan {
             std::memory_order_release);
         crc_read_count.store(
             0,
+            std::memory_order_release);
+        fail_next_resume_crc_read.store(
+            false,
+            std::memory_order_release);
+        fail_next_prepare_allocation.store(
+            false,
             std::memory_order_release);
         fail_next_checkpoint_submit.store(
             false,

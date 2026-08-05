@@ -75,12 +75,8 @@ public:
     submit_range_geometry(RangeGeometryCommand command) noexcept;
     [[nodiscard]] RangeRegistrationPollResult
     poll_range_geometry_ack() noexcept;
-    // 启动后台持久化线程。
     void start();
-    // 通过 enqueue shutdown 控制包请求线程收尾退出。
-    void stop();
-    // 等待后台线程结束。
-    void join();
+    void join() noexcept;
 
     // 返回后台线程记录的首个错误。
     [[nodiscard]] std::error_code error() const noexcept;
@@ -160,7 +156,6 @@ private:
     mutable std::mutex error_mutex_;
     std::error_code error_;
     bool force_checkpoint_pending_ = false;
-    bool stopping_ = false;
 };
 
 } // namespace asyncdownload::persistence

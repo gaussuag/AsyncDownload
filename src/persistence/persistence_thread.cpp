@@ -41,7 +41,6 @@ PersistenceThread::PersistenceThread(core::SessionState& session,
                   .connection_limit)) {}
 
 PersistenceThread::~PersistenceThread() {
-    stop();
     join();
 }
 
@@ -107,17 +106,14 @@ void PersistenceThread::start() {
     worker_thread_ = std::thread(&PersistenceThread::process_loop, this);
 }
 
-void PersistenceThread::stop() {
-    if (stopping_) {
-        return;
-    }
-
-    stopping_ = true;
-}
-
-void PersistenceThread::join() {
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
+void PersistenceThread::join() noexcept {
+    try {
+        if (worker_thread_.joinable()) {
+            worker_thread_.join();
+        }
+    } catch (...) {
+        set_error(make_error_code(
+            DownloadErrc::internal_error));
     }
 }
 

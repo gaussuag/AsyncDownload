@@ -251,6 +251,95 @@ TEST_F(
 
 TEST_F(
     RecoveryFailureTest,
+    ResumeCrcReadFailurePreservesCandidateArtifacts) {
+    const auto open_request = request();
+    std::vector<std::uint8_t> part_before(8192, 0x4D);
+    {
+        std::ofstream part(
+            open_request.paths.temporary_path,
+            std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(part.is_open());
+        part.write(
+            reinterpret_cast<const char*>(part_before.data()),
+            static_cast<std::streamsize>(part_before.size()));
+    }
+    asyncdownload::core::MetadataState state{};
+    state.url = open_request.remote.url;
+    state.output_path = open_request.paths.output_path;
+    state.temporary_path = open_request.paths.temporary_path;
+    state.total_size = open_request.remote.total_size;
+    state.vdl_offset = 4096;
+    state.accept_ranges = true;
+    state.block_size = open_request.policy.block_bytes;
+    state.io_alignment = open_request.policy.io_alignment_bytes;
+    state.bitmap_states = {2, 2};
+    state.crc_samples = {{4096, 0, 4096}};
+    asyncdownload::metadata::MetadataStore store(
+        open_request.paths.metadata_path);
+    ASSERT_FALSE(store.save(state));
+    const auto metadata_before =
+        read_file(open_request.paths.metadata_path);
+    asyncdownload::recovery::detail::recovery_fault_plan().
+        fail_next_resume_crc_read.store(
+            true,
+            std::memory_order_release);
+
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+
+    EXPECT_EQ(
+        opened.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::file_read_failed));
+    EXPECT_EQ(opened.checkpoint, nullptr);
+    EXPECT_EQ(
+        read_file(open_request.paths.temporary_path),
+        part_before);
+    EXPECT_EQ(
+        read_file(open_request.paths.metadata_path),
+        metadata_before);
+}
+
+TEST_F(
+    RecoveryFailureTest,
+    PrepareAllocationFailureDoesNotPublishReservation) {
+    const auto open_request = request();
+    auto opened =
+        asyncdownload::recovery::RecoveryCheckpoint::open(
+            open_request);
+    ASSERT_FALSE(opened.error);
+    ASSERT_NE(opened.checkpoint, nullptr);
+    auto& fault_plan =
+        asyncdownload::recovery::detail::
+            recovery_fault_plan();
+    fault_plan.fail_next_prepare_allocation.store(
+        true,
+        std::memory_order_release);
+    const std::vector<std::uint8_t> bitmap{0, 0};
+    const std::vector<
+        asyncdownload::recovery::RecoveryRangeFact>
+        ranges;
+
+    const auto failed =
+        opened.checkpoint->prepare(bitmap, ranges);
+    auto retried =
+        opened.checkpoint->prepare(bitmap, ranges);
+    ASSERT_FALSE(retried.error);
+    const auto committed = opened.checkpoint->commit(
+        std::move(retried.checkpoint));
+
+    EXPECT_EQ(
+        failed.error,
+        asyncdownload::make_error_code(
+            asyncdownload::DownloadErrc::internal_error));
+    EXPECT_EQ(failed.checkpoint, nullptr);
+    EXPECT_FALSE(committed.error);
+    EXPECT_EQ(committed.generation, 1U);
+}
+
+TEST_F(
+    RecoveryFailureTest,
     CrashAfterPartResetCannotLeaveStalePair) {
     const auto open_request = request();
     const auto part_before =
@@ -598,7 +687,6 @@ TEST_F(
             std::memory_order_release);
     const auto close_error =
         packet_flow->producer().close();
-    persistence.stop();
     persistence.join();
 
     EXPECT_TRUE(first_accepted.accepted());
@@ -690,6 +778,19 @@ TEST_F(
     EXPECT_EQ(
         read_file(open_request.paths.metadata_path),
         metadata_before);
+    auto successor = opened.checkpoint->prepare(
+        std::vector<std::uint8_t>{
+            empty,
+            empty,
+            empty
+        },
+        ranges);
+    ASSERT_FALSE(successor.error);
+    const auto successor_result =
+        opened.checkpoint->commit(
+            std::move(successor.checkpoint));
+    EXPECT_FALSE(successor_result.error);
+    EXPECT_EQ(successor_result.generation, 3U);
 }
 
 TEST_F(
@@ -961,7 +1062,6 @@ TEST_F(
             std::memory_order_release);
     const auto close_error =
         packet_flow->producer().close();
-    persistence.stop();
     persistence.join();
     asyncdownload::metadata::MetadataStore store(
         open_request.paths.metadata_path);
@@ -1129,7 +1229,6 @@ TEST_F(
         pause_after_part_flush_generation.store(
             0,
             std::memory_order_release);
-    persistence.stop();
     persistence.join();
     asyncdownload::metadata::MetadataStore store(
         open_request.paths.metadata_path);
@@ -1290,7 +1389,6 @@ TEST_F(
     const auto close_error =
         packet_flow->producer().close();
     static_cast<void>(close_error);
-    persistence.stop();
     persistence.join();
     asyncdownload::metadata::MetadataStore store(
         open_request.paths.metadata_path);

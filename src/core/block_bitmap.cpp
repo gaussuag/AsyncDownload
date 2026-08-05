@@ -1,6 +1,7 @@
 #include "block_bitmap.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace asyncdownload::core {
 
@@ -146,11 +147,19 @@ std::size_t required_block_count(const std::int64_t total_size,
     if (total_size <= 0 || block_size == 0) {
         return 0;
     }
-
-    // 位图是按 block 向上取整覆盖整个文件的，最后一个 block 可以是部分有效数据。
-    return static_cast<std::size_t>((total_size +
-        static_cast<std::int64_t>(block_size) - 1) /
-        static_cast<std::int64_t>(block_size));
+    if (block_size > static_cast<std::size_t>(
+            std::numeric_limits<std::int64_t>::max())) {
+        return 1;
+    }
+    const auto divisor = static_cast<std::int64_t>(block_size);
+    const auto quotient = total_size / divisor;
+    const auto remainder = total_size % divisor;
+    const auto count = static_cast<std::uint64_t>(quotient) +
+        (remainder == 0 ? 0U : 1U);
+    if (count > std::numeric_limits<std::size_t>::max()) {
+        return 0;
+    }
+    return static_cast<std::size_t>(count);
 }
 
 } // namespace asyncdownload::core

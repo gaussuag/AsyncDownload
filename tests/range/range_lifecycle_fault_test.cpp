@@ -295,7 +295,6 @@ TEST_F(
     }
     const auto close_error =
         packet_flow->producer().close();
-    persistence.stop();
     persistence.join();
 
     EXPECT_EQ(
@@ -389,7 +388,6 @@ TEST_F(
     const auto observed_error = persistence.error();
     const auto close_error =
         packet_flow->producer().close();
-    persistence.stop();
     persistence.join();
     const auto flow_snapshot =
         packet_flow->producer().snapshot();

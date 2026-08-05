@@ -20,19 +20,48 @@
 
 namespace asyncdownload::recovery {
 
+class ReservationState {
+public:
+    std::mutex mutex;
+    CheckpointGeneration next_generation = 1;
+    CheckpointGeneration prepared_generation = 0;
+    CheckpointGeneration active_generation = 0;
+    CheckpointGeneration last_committed_generation = 0;
+    std::int64_t last_committed_vdl = 0;
+};
+
 class PreparedCheckpoint::Implementation {
 public:
     Implementation(
-        const void* checkpoint_owner,
+        std::weak_ptr<ReservationState> checkpoint_reservation,
         const CheckpointGeneration checkpoint_generation,
         core::MetadataState checkpoint_state)
-        : owner(checkpoint_owner),
+        : reservation(std::move(checkpoint_reservation)),
           generation(checkpoint_generation),
           state(std::move(checkpoint_state)) {}
 
-    const void* owner = nullptr;
+    ~Implementation() {
+        release();
+    }
+
+    void release() noexcept {
+        if (!owns_reservation) {
+            return;
+        }
+        const auto shared = reservation.lock();
+        if (shared != nullptr) {
+            std::scoped_lock lock(shared->mutex);
+            if (shared->prepared_generation == generation) {
+                shared->prepared_generation = 0;
+            }
+        }
+        owns_reservation = false;
+    }
+
+    std::weak_ptr<ReservationState> reservation;
     CheckpointGeneration generation = 0;
     core::MetadataState state;
+    bool owns_reservation = true;
 };
 
 PreparedCheckpoint::PreparedCheckpoint(
@@ -57,7 +86,9 @@ public:
           policy(request.policy),
           overwrite_existing(
               request.overwrite_existing),
-          metadata_store(paths.metadata_path) {}
+          metadata_store(paths.metadata_path),
+          reservation_state(
+              std::make_shared<ReservationState>()) {}
 
     core::SessionPaths paths;
     RemoteRecoveryIdentity remote;
@@ -65,12 +96,7 @@ public:
     bool overwrite_existing = false;
     storage::FileWriter file_writer;
     metadata::MetadataStore metadata_store;
-    std::mutex state_mutex;
-    CheckpointGeneration next_generation = 1;
-    CheckpointGeneration prepared_generation = 0;
-    CheckpointGeneration active_generation = 0;
-    CheckpointGeneration last_committed_generation = 0;
-    std::int64_t last_committed_vdl = 0;
+    std::shared_ptr<ReservationState> reservation_state;
     bool resumed = false;
 };
 
@@ -122,18 +148,112 @@ namespace {
     return true;
 }
 
+struct ValidatedBlockGeometry {
+    std::size_t block_count = 0;
+    std::int64_t block_size = 0;
+};
+
+[[nodiscard]] std::optional<ValidatedBlockGeometry>
+validate_candidate_structure(
+    const core::MetadataState& state,
+    const RecoveryOpenRequest& request) noexcept {
+    if (state.total_size <= 0 ||
+        state.total_size != request.remote.total_size ||
+        state.block_size != request.policy.block_bytes ||
+        state.io_alignment !=
+            request.policy.io_alignment_bytes ||
+        state.block_size == 0 ||
+        state.block_size > static_cast<std::size_t>(
+            std::numeric_limits<std::int64_t>::max()) ||
+        state.vdl_offset < 0 ||
+        state.vdl_offset > state.total_size) {
+        return std::nullopt;
+    }
+
+    const auto block_size =
+        static_cast<std::int64_t>(state.block_size);
+    if (state.vdl_offset != state.total_size &&
+        state.vdl_offset % block_size != 0) {
+        return std::nullopt;
+    }
+    const auto quotient = state.total_size / block_size;
+    const auto remainder = state.total_size % block_size;
+    if (quotient < 0 ||
+        static_cast<std::uint64_t>(quotient) >
+            std::numeric_limits<std::size_t>::max()) {
+        return std::nullopt;
+    }
+    auto block_count = static_cast<std::size_t>(quotient);
+    if (remainder != 0) {
+        if (block_count ==
+            std::numeric_limits<std::size_t>::max()) {
+            return std::nullopt;
+        }
+        ++block_count;
+    }
+    if (state.bitmap_states.size() > block_count ||
+        std::any_of(
+            state.bitmap_states.begin(),
+            state.bitmap_states.end(),
+            [](const std::uint8_t value) {
+                return value > static_cast<std::uint8_t>(
+                    core::BlockState::finished);
+            })) {
+        return std::nullopt;
+    }
+
+    for (const auto& range : state.ranges) {
+        if (range.start_offset < 0 ||
+            range.end_offset ==
+                std::numeric_limits<std::int64_t>::max()) {
+            return std::nullopt;
+        }
+        const auto end = range.end_offset + 1;
+        if (range.start_offset > range.persisted_offset ||
+            range.persisted_offset > range.current_offset ||
+            range.current_offset > end ||
+            end > state.total_size) {
+            return std::nullopt;
+        }
+    }
+    for (std::size_t left = 0;
+         left < state.ranges.size();
+         ++left) {
+        const auto& first = state.ranges[left];
+        if (first.start_offset == first.persisted_offset) {
+            continue;
+        }
+        for (std::size_t right = left + 1;
+             right < state.ranges.size();
+             ++right) {
+            const auto& second = state.ranges[right];
+            if (second.start_offset ==
+                second.persisted_offset) {
+                continue;
+            }
+            if (first.start_offset <
+                    second.persisted_offset &&
+                second.start_offset <
+                    first.persisted_offset) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    return ValidatedBlockGeometry{
+        block_count,
+        block_size
+    };
+}
+
 [[nodiscard]] bool metadata_proves_complete(
     const core::MetadataState& state,
-    const download::RecoveryIdentityPolicy& policy)
+    const std::size_t required_blocks)
     noexcept {
     if (state.total_size <= 0 ||
         state.vdl_offset < state.total_size) {
         return false;
     }
-    const auto required_blocks =
-        core::required_block_count(
-            state.total_size,
-            policy.block_bytes);
     return
         state.bitmap_states.size() == required_blocks &&
         std::all_of(
@@ -144,6 +264,37 @@ namespace {
                     static_cast<std::uint8_t>(
                         core::BlockState::finished);
             });
+}
+
+[[nodiscard]] bool validate_crc_structure(
+    const core::MetadataState& state,
+    const std::int64_t block_size) noexcept {
+    for (std::size_t index = 0;
+         index < state.crc_samples.size();
+         ++index) {
+        const auto& sample = state.crc_samples[index];
+        if (sample.offset < 0 ||
+            sample.offset >= state.total_size ||
+            sample.offset % block_size != 0) {
+            return false;
+        }
+        const auto remaining =
+            state.total_size - sample.offset;
+        const auto expected = static_cast<std::size_t>(
+            std::min(block_size, remaining));
+        if (sample.length != expected) {
+            return false;
+        }
+        for (std::size_t other = index + 1;
+             other < state.crc_samples.size();
+             ++other) {
+            if (sample.offset ==
+                state.crc_samples[other].offset) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void project_legacy_ranges(
@@ -224,10 +375,23 @@ void project_legacy_ranges(
             continue;
         }
         std::vector<std::byte> bytes;
-        const auto read_error = file_writer.read(
-            offset,
-            sample->length,
-            bytes);
+        std::error_code read_error;
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::recovery_fault_plan().
+                fail_next_resume_crc_read.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            read_error = make_error_code(
+                DownloadErrc::file_read_failed);
+        } else {
+#endif
+            read_error = file_writer.read(
+                offset,
+                sample->length,
+                bytes);
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        }
+#endif
         if (read_error) {
             return read_error;
         }
@@ -316,14 +480,32 @@ RecoveryOpenResult RecoveryCheckpoint::open(
             }
             loaded = std::move(load_result.second);
         }
-        const auto can_resume =
+        const auto identity_matches =
             part_exists &&
             loaded.has_value() &&
-            candidate_identity_matches(*loaded, request) &&
+            candidate_identity_matches(*loaded, request);
+        std::optional<ValidatedBlockGeometry>
+            validated_geometry;
+        if (identity_matches) {
+            validated_geometry =
+                validate_candidate_structure(
+                    *loaded,
+                    request);
+            if (!validated_geometry.has_value() ||
+                !validate_crc_structure(
+                    *loaded,
+                    validated_geometry->block_size)) {
+                result.error = make_error_code(
+                    DownloadErrc::metadata_parse_failed);
+                return result;
+            }
+        }
+        const auto can_resume =
+            identity_matches &&
             (request.policy.allow_sparse_resume ||
              metadata_proves_complete(
                  *loaded,
-                 request.policy));
+                 validated_geometry->block_count));
         if (!can_resume) {
 #if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
             if (detail::recovery_fault_plan().
@@ -380,7 +562,8 @@ RecoveryOpenResult RecoveryCheckpoint::open(
         }
 #endif
 
-        const auto block_count =
+        const auto block_count = can_resume ?
+            validated_geometry->block_count :
             core::required_block_count(
                 request.remote.total_size,
                 request.policy.block_bytes);
@@ -442,8 +625,9 @@ RecoveryOpenResult RecoveryCheckpoint::open(
             RecoveryDisposition::fresh;
         if (result.restored.disposition ==
             RecoveryDisposition::complete) {
-            implementation->last_committed_vdl =
-                request.remote.total_size;
+            implementation->reservation_state->
+                last_committed_vdl =
+                    request.remote.total_size;
         }
         result.checkpoint =
             std::unique_ptr<RecoveryCheckpoint>(
@@ -496,11 +680,12 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
     }
 
     try {
-        std::scoped_lock lock(
-            implementation_->state_mutex);
-        if (implementation_->prepared_generation != 0 ||
-            implementation_->active_generation != 0 ||
-            implementation_->next_generation == 0) {
+        const auto reservation =
+            implementation_->reservation_state;
+        std::scoped_lock lock(reservation->mutex);
+        if (reservation->prepared_generation != 0 ||
+            reservation->active_generation != 0 ||
+            reservation->next_generation == 0) {
             result.error = internal_error();
             return result;
         }
@@ -596,12 +781,21 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
                     implementation_->policy.block_bytes,
                     implementation_->remote.total_size);
 
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::recovery_fault_plan().
+                fail_next_prepare_allocation.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            result.error = internal_error();
+            return result;
+        }
+#endif
         const auto generation =
-            implementation_->next_generation;
+            reservation->next_generation;
         auto prepared_implementation =
             std::make_unique<
                 PreparedCheckpoint::Implementation>(
-                    implementation_.get(),
+                    reservation,
                     generation,
                     std::move(state));
         result.checkpoint =
@@ -609,9 +803,9 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
                 new PreparedCheckpoint(
                     std::move(
                         prepared_implementation)));
-        implementation_->prepared_generation =
+        reservation->prepared_generation =
             generation;
-        implementation_->next_generation =
+        reservation->next_generation =
             generation ==
                     std::numeric_limits<
                         CheckpointGeneration>::max() ?
@@ -641,35 +835,42 @@ CheckpointCommitResult RecoveryCheckpoint::commit(
     auto& prepared =
         *checkpoint->implementation_;
     result.generation = prepared.generation;
+    const auto prepared_reservation =
+        prepared.reservation.lock();
+    const auto reservation =
+        implementation_->reservation_state;
     {
-        std::scoped_lock lock(
-            implementation_->state_mutex);
-        if (prepared.owner != implementation_.get() ||
+        std::scoped_lock lock(reservation->mutex);
+        if (prepared_reservation.get() !=
+                reservation.get() ||
             prepared.generation == 0 ||
-            implementation_->prepared_generation !=
+            reservation->prepared_generation !=
                 prepared.generation ||
-            implementation_->active_generation != 0) {
+            reservation->active_generation != 0) {
             result.error = internal_error();
             return result;
         }
-        implementation_->prepared_generation = 0;
-        implementation_->active_generation =
+        reservation->prepared_generation = 0;
+        reservation->active_generation =
             prepared.generation;
+        prepared.owns_reservation = false;
     }
 
-    const auto finish = [this, &result](
+    const auto finish = [&result, &reservation](
                             const std::error_code error) {
-        std::scoped_lock lock(
-            implementation_->state_mutex);
+        std::scoped_lock lock(reservation->mutex);
         if (!error &&
-            implementation_->active_generation ==
+            reservation->active_generation ==
                 result.generation) {
-            implementation_->last_committed_generation =
+            reservation->last_committed_generation =
                 result.generation;
-            implementation_->last_committed_vdl =
+            reservation->last_committed_vdl =
                 result.committed_vdl;
         }
-        implementation_->active_generation = 0;
+        if (reservation->active_generation ==
+            result.generation) {
+            reservation->active_generation = 0;
+        }
         result.error = error;
     };
 
@@ -782,11 +983,12 @@ FinalizeResult RecoveryCheckpoint::finalize() noexcept {
         return result;
     }
     {
-        std::scoped_lock lock(
-            implementation_->state_mutex);
-        if (implementation_->prepared_generation != 0 ||
-            implementation_->active_generation != 0 ||
-            implementation_->last_committed_vdl !=
+        const auto reservation =
+            implementation_->reservation_state;
+        std::scoped_lock lock(reservation->mutex);
+        if (reservation->prepared_generation != 0 ||
+            reservation->active_generation != 0 ||
+            reservation->last_committed_vdl !=
                 implementation_->remote.total_size) {
             result.error = internal_error();
             return result;
