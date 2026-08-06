@@ -1,21 +1,3 @@
-﻿#include "download_engine.hpp"
-
-#include "asyncdownload/error.hpp"
-#include "download/download_engine_internal.hpp"
-#include "core/block_bitmap.hpp"
-#include "core/models.hpp"
-#include "core/path_utils.hpp"
-#include "download/download_policy.hpp"
-#include "download/progress_snapshot_builder.hpp"
-#include "download/range_scheduler.hpp"
-#include "flow/packet_flow.hpp"
-#include "http/http_transfer.hpp"
-#include "persistence/persistence_thread.hpp"
-#include "range/range_lifecycle.hpp"
-#include "recovery/recovery_checkpoint.hpp"
-
-#include <thread-pool/BS_thread_pool.hpp>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -29,6 +11,24 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <thread-pool/BS_thread_pool.hpp>
+
+#include "asyncdownload/error.hpp"
+#include "download_engine.hpp"
+#include "download/download_engine_internal.hpp"
+#include "download/persistence_phase.hpp"
+#include "core/block_bitmap.hpp"
+#include "core/models.hpp"
+#include "core/path_utils.hpp"
+#include "download/download_policy.hpp"
+#include "download/progress_snapshot_builder.hpp"
+#include "download/range_scheduler.hpp"
+#include "flow/packet_flow.hpp"
+#include "http/http_transfer.hpp"
+#include "persistence/persistence_thread.hpp"
+#include "range/range_lifecycle.hpp"
+#include "recovery/recovery_checkpoint.hpp"
 
 namespace asyncdownload::download {
 namespace {
@@ -534,49 +534,6 @@ void rebuild_bitmap_from_ranges(
     }
     return first_error;
 }
-
-class PersistencePhase {
-public:
-    PersistencePhase(
-        flow::PacketProducer& producer,
-        persistence::PersistenceThread& persistence) noexcept
-        : producer_(producer),
-          persistence_(persistence) {}
-
-    ~PersistencePhase() {
-        if (armed_) {
-            static_cast<void>(finish(make_error_code(
-                DownloadErrc::internal_error)));
-        }
-    }
-
-    void start() {
-        persistence_.start();
-        armed_ = true;
-    }
-
-    [[nodiscard]] std::error_code finish(
-        std::error_code first_error) noexcept {
-        if (!armed_) {
-            return first_error;
-        }
-        armed_ = false;
-        const auto close_error = producer_.close();
-        if (!first_error && close_error) {
-            first_error = close_error;
-        }
-        persistence_.join();
-        if (!first_error) {
-            first_error = persistence_.error();
-        }
-        return first_error;
-    }
-
-private:
-    flow::PacketProducer& producer_;
-    persistence::PersistenceThread& persistence_;
-    bool armed_ = false;
-};
 
 [[nodiscard]] PerformanceSummary build_performance_summary(const core::SessionState& session,
                                                            const Clock::time_point now) noexcept {

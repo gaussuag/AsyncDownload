@@ -2,6 +2,8 @@
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
 )
 list(REMOVE_ITEM ASYNCDOWNLOAD_TEST_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/download/download_engine_lifecycle_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/download/download_engine_lifecycle_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/flow/packet_flow_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/http/curl_http_transfer_fault_test.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/range/range_lifecycle_fault_test.cpp"
@@ -110,6 +112,7 @@ gtest_discover_tests(
 add_executable(asyncdownload_range_lifecycle_fault_tests
     range/range_lifecycle_fault_test.cpp
     ${CMAKE_SOURCE_DIR}/src/core/block_bitmap.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/block_geometry.cpp
     ${CMAKE_SOURCE_DIR}/src/core/crc32.cpp
     ${CMAKE_SOURCE_DIR}/src/core/error.cpp
     ${CMAKE_SOURCE_DIR}/src/download/download_policy.cpp
@@ -164,6 +167,7 @@ gtest_discover_tests(
 add_executable(asyncdownload_recovery_fault_tests
     recovery/recovery_failure_test.cpp
     ${CMAKE_SOURCE_DIR}/src/core/block_bitmap.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/block_geometry.cpp
     ${CMAKE_SOURCE_DIR}/src/core/crc32.cpp
     ${CMAKE_SOURCE_DIR}/src/core/error.cpp
     ${CMAKE_SOURCE_DIR}/src/download/download_policy.cpp
@@ -213,6 +217,49 @@ gtest_discover_tests(
     asyncdownload_recovery_fault_tests
     PROPERTIES
         TIMEOUT 3)
+
+file(GLOB_RECURSE ASYNCDOWNLOAD_LIFECYCLE_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/src/*.cpp")
+list(REMOVE_ITEM ASYNCDOWNLOAD_LIFECYCLE_SOURCES
+    "${CMAKE_SOURCE_DIR}/src/main.cpp")
+add_executable(asyncdownload_download_lifecycle_fault_tests
+    download/download_engine_lifecycle_test.cpp
+    ${ASYNCDOWNLOAD_LIFECYCLE_SOURCES})
+target_compile_definitions(
+    asyncdownload_download_lifecycle_fault_tests
+    PRIVATE
+        ASYNCDOWNLOAD_PACKET_FLOW_FAULT_TEST
+        ASYNCDOWNLOAD_RANGE_LIFECYCLE_FAULT_TEST)
+target_include_directories(
+    asyncdownload_download_lifecycle_fault_tests
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src)
+file(GLOB LIFECYCLE_LIB_INCLUDE_DIRS
+    LIST_DIRECTORIES true
+    "${CMAKE_SOURCE_DIR}/libs/*/include")
+foreach(inc_dir ${LIFECYCLE_LIB_INCLUDE_DIRS})
+    if(IS_DIRECTORY ${inc_dir})
+        target_include_directories(
+            asyncdownload_download_lifecycle_fault_tests
+            PRIVATE
+                ${inc_dir})
+    endif()
+endforeach()
+target_link_libraries(
+    asyncdownload_download_lifecycle_fault_tests
+    PRIVATE
+        gtest_main
+        CURL::libcurl
+        nlohmann_json::nlohmann_json)
+target_compile_features(
+    asyncdownload_download_lifecycle_fault_tests
+    PRIVATE
+        cxx_std_20)
+gtest_discover_tests(
+    asyncdownload_download_lifecycle_fault_tests
+    PROPERTIES
+        TIMEOUT 5)
 
 find_package(CURL CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
