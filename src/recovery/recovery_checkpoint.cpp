@@ -781,15 +781,6 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
                     implementation_->policy.block_bytes,
                     implementation_->remote.total_size);
 
-#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
-        if (detail::recovery_fault_plan().
-                fail_next_prepare_allocation.exchange(
-                    false,
-                    std::memory_order_acq_rel)) {
-            result.error = internal_error();
-            return result;
-        }
-#endif
         const auto generation =
             reservation->next_generation;
         auto prepared_implementation =
@@ -798,6 +789,16 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
                     reservation,
                     generation,
                     std::move(state));
+#if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
+        if (detail::recovery_fault_plan().
+                fail_next_prepared_token_allocation.exchange(
+                    false,
+                    std::memory_order_acq_rel)) {
+            prepared_implementation.reset();
+            result.error = internal_error();
+            return result;
+        }
+#endif
         result.checkpoint =
             std::unique_ptr<PreparedCheckpoint>(
                 new PreparedCheckpoint(

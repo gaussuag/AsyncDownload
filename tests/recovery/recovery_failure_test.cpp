@@ -303,7 +303,7 @@ TEST_F(
 
 TEST_F(
     RecoveryFailureTest,
-    PrepareAllocationFailureDoesNotPublishReservation) {
+    PreparedTokenAllocationFailureDoesNotPublishReservation) {
     const auto open_request = request();
     auto opened =
         asyncdownload::recovery::RecoveryCheckpoint::open(
@@ -313,7 +313,7 @@ TEST_F(
     auto& fault_plan =
         asyncdownload::recovery::detail::
             recovery_fault_plan();
-    fault_plan.fail_next_prepare_allocation.store(
+    fault_plan.fail_next_prepared_token_allocation.store(
         true,
         std::memory_order_release);
     const std::vector<std::uint8_t> bitmap{0, 0};

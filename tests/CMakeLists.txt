@@ -210,7 +210,9 @@ target_compile_features(
         cxx_std_20
 )
 gtest_discover_tests(
-    asyncdownload_recovery_fault_tests)
+    asyncdownload_recovery_fault_tests
+    PROPERTIES
+        TIMEOUT 3)
 
 find_package(CURL CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
