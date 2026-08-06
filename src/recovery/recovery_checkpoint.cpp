@@ -22,22 +22,88 @@ namespace asyncdownload::recovery {
 
 class ReservationState {
 public:
-    std::mutex mutex;
-    CheckpointGeneration next_generation = 1;
-    CheckpointGeneration prepared_generation = 0;
-    CheckpointGeneration active_generation = 0;
-    CheckpointGeneration last_committed_generation = 0;
-    std::int64_t last_committed_vdl = 0;
+    [[nodiscard]] std::optional<CheckpointGeneration>
+    publish_prepared() noexcept {
+        std::scoped_lock lock(mutex_);
+        if (prepared_generation_ != 0 ||
+            active_generation_ != 0 ||
+            next_generation_ == 0) {
+            return std::nullopt;
+        }
+        const auto generation = next_generation_;
+        prepared_generation_ = generation;
+        next_generation_ = generation ==
+                std::numeric_limits<CheckpointGeneration>::max() ?
+            0 :
+            generation + 1;
+        return generation;
+    }
+
+    void release_prepared(
+        const CheckpointGeneration generation) noexcept {
+        std::scoped_lock lock(mutex_);
+        if (prepared_generation_ == generation) {
+            prepared_generation_ = 0;
+        }
+    }
+
+    [[nodiscard]] bool activate(
+        const CheckpointGeneration generation) noexcept {
+        std::scoped_lock lock(mutex_);
+        if (generation == 0 ||
+            prepared_generation_ != generation ||
+            active_generation_ != 0) {
+            return false;
+        }
+        prepared_generation_ = 0;
+        active_generation_ = generation;
+        return true;
+    }
+
+    void finish_active(
+        const CheckpointGeneration generation,
+        const std::optional<std::int64_t> committed_vdl)
+        noexcept {
+        std::scoped_lock lock(mutex_);
+        if (active_generation_ != generation) {
+            return;
+        }
+        if (committed_vdl.has_value()) {
+            last_committed_generation_ = generation;
+            last_committed_vdl_ = *committed_vdl;
+        }
+        active_generation_ = 0;
+    }
+
+    void seed_committed_vdl(
+        const std::int64_t committed_vdl) noexcept {
+        std::scoped_lock lock(mutex_);
+        last_committed_vdl_ = committed_vdl;
+    }
+
+    [[nodiscard]] bool can_finalize(
+        const std::int64_t total_size) const noexcept {
+        std::scoped_lock lock(mutex_);
+        return prepared_generation_ == 0 &&
+            active_generation_ == 0 &&
+            last_committed_vdl_ == total_size;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    CheckpointGeneration next_generation_ = 1;
+    CheckpointGeneration prepared_generation_ = 0;
+    CheckpointGeneration active_generation_ = 0;
+    CheckpointGeneration last_committed_generation_ = 0;
+    std::int64_t last_committed_vdl_ = 0;
 };
 
 class PreparedCheckpoint::Implementation {
 public:
     Implementation(
         std::weak_ptr<ReservationState> checkpoint_reservation,
-        const CheckpointGeneration checkpoint_generation,
         core::MetadataState checkpoint_state)
         : reservation(std::move(checkpoint_reservation)),
-          generation(checkpoint_generation),
           state(std::move(checkpoint_state)) {}
 
     ~Implementation() {
@@ -50,10 +116,7 @@ public:
         }
         const auto shared = reservation.lock();
         if (shared != nullptr) {
-            std::scoped_lock lock(shared->mutex);
-            if (shared->prepared_generation == generation) {
-                shared->prepared_generation = 0;
-            }
+            shared->release_prepared(generation);
         }
         owns_reservation = false;
     }
@@ -61,7 +124,13 @@ public:
     std::weak_ptr<ReservationState> reservation;
     CheckpointGeneration generation = 0;
     core::MetadataState state;
-    bool owns_reservation = true;
+    bool owns_reservation = false;
+
+    void arm(const CheckpointGeneration checkpoint_generation)
+        noexcept {
+        generation = checkpoint_generation;
+        owns_reservation = true;
+    }
 };
 
 PreparedCheckpoint::PreparedCheckpoint(
@@ -626,8 +695,8 @@ RecoveryOpenResult RecoveryCheckpoint::open(
         if (result.restored.disposition ==
             RecoveryDisposition::complete) {
             implementation->reservation_state->
-                last_committed_vdl =
-                    request.remote.total_size;
+                seed_committed_vdl(
+                    request.remote.total_size);
         }
         result.checkpoint =
             std::unique_ptr<RecoveryCheckpoint>(
@@ -682,13 +751,6 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
     try {
         const auto reservation =
             implementation_->reservation_state;
-        std::scoped_lock lock(reservation->mutex);
-        if (reservation->prepared_generation != 0 ||
-            reservation->active_generation != 0 ||
-            reservation->next_generation == 0) {
-            result.error = internal_error();
-            return result;
-        }
         const auto block_count =
             core::required_block_count(
                 implementation_->remote.total_size,
@@ -781,13 +843,10 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
                     implementation_->policy.block_bytes,
                     implementation_->remote.total_size);
 
-        const auto generation =
-            reservation->next_generation;
         auto prepared_implementation =
             std::make_unique<
                 PreparedCheckpoint::Implementation>(
                     reservation,
-                    generation,
                     std::move(state));
 #if defined(ASYNCDOWNLOAD_RECOVERY_FAULT_TEST)
         if (detail::recovery_fault_plan().
@@ -799,19 +858,20 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
             return result;
         }
 #endif
-        result.checkpoint =
+        auto prepared_checkpoint =
             std::unique_ptr<PreparedCheckpoint>(
                 new PreparedCheckpoint(
-                    std::move(
-                        prepared_implementation)));
-        reservation->prepared_generation =
-            generation;
-        reservation->next_generation =
-            generation ==
-                    std::numeric_limits<
-                        CheckpointGeneration>::max() ?
-                0 :
-                generation + 1;
+                    std::move(prepared_implementation)));
+        const auto generation =
+            reservation->publish_prepared();
+        if (!generation.has_value()) {
+            result.error = internal_error();
+            return result;
+        }
+        prepared_checkpoint->implementation_->arm(
+            *generation);
+        result.checkpoint =
+            std::move(prepared_checkpoint);
     } catch (const std::bad_alloc&) {
         result.error = internal_error();
     } catch (...) {
@@ -840,38 +900,21 @@ CheckpointCommitResult RecoveryCheckpoint::commit(
         prepared.reservation.lock();
     const auto reservation =
         implementation_->reservation_state;
-    {
-        std::scoped_lock lock(reservation->mutex);
-        if (prepared_reservation.get() !=
-                reservation.get() ||
-            prepared.generation == 0 ||
-            reservation->prepared_generation !=
-                prepared.generation ||
-            reservation->active_generation != 0) {
+    if (prepared_reservation.get() != reservation.get() ||
+        !reservation->activate(prepared.generation)) {
             result.error = internal_error();
             return result;
-        }
-        reservation->prepared_generation = 0;
-        reservation->active_generation =
-            prepared.generation;
-        prepared.owns_reservation = false;
     }
+    prepared.owns_reservation = false;
 
     const auto finish = [&result, &reservation](
                             const std::error_code error) {
-        std::scoped_lock lock(reservation->mutex);
-        if (!error &&
-            reservation->active_generation ==
-                result.generation) {
-            reservation->last_committed_generation =
-                result.generation;
-            reservation->last_committed_vdl =
-                result.committed_vdl;
-        }
-        if (reservation->active_generation ==
-            result.generation) {
-            reservation->active_generation = 0;
-        }
+        reservation->finish_active(
+            result.generation,
+            error ?
+                std::nullopt :
+                std::optional<std::int64_t>(
+                    result.committed_vdl));
         result.error = error;
     };
 
@@ -983,17 +1026,10 @@ FinalizeResult RecoveryCheckpoint::finalize() noexcept {
         result.error = internal_error();
         return result;
     }
-    {
-        const auto reservation =
-            implementation_->reservation_state;
-        std::scoped_lock lock(reservation->mutex);
-        if (reservation->prepared_generation != 0 ||
-            reservation->active_generation != 0 ||
-            reservation->last_committed_vdl !=
-                implementation_->remote.total_size) {
-            result.error = internal_error();
-            return result;
-        }
+    if (!implementation_->reservation_state->can_finalize(
+            implementation_->remote.total_size)) {
+        result.error = internal_error();
+        return result;
     }
 
     result.error =
