@@ -56,8 +56,4 @@ private:
     std::unique_ptr<std::atomic<std::uint8_t>[]> states_;
 };
 
-// 根据文件总长度和块大小，计算位图需要覆盖多少个块。
-[[nodiscard]] std::size_t required_block_count(std::int64_t total_size,
-                                               std::size_t block_size) noexcept;
-
 } // namespace asyncdownload::core

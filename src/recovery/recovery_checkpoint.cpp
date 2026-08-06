@@ -1,12 +1,3 @@
-#include "recovery_checkpoint.hpp"
-
-#include "asyncdownload/error.hpp"
-#include "core/block_bitmap.hpp"
-#include "core/crc32.hpp"
-#include "metadata/metadata_store.hpp"
-#include "recovery_fault_adapter.hpp"
-#include "storage/file_writer.hpp"
-
 #include <algorithm>
 #include <cstddef>
 #include <filesystem>
@@ -17,6 +8,15 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "asyncdownload/error.hpp"
+#include "core/block_bitmap.hpp"
+#include "core/block_geometry.hpp"
+#include "core/crc32.hpp"
+#include "metadata/metadata_store.hpp"
+#include "recovery_checkpoint.hpp"
+#include "recovery_fault_adapter.hpp"
+#include "storage/file_writer.hpp"
 
 namespace asyncdownload::recovery {
 
@@ -149,7 +149,8 @@ PreparedCheckpoint::~PreparedCheckpoint() = default;
 class RecoveryCheckpoint::Implementation {
 public:
     explicit Implementation(
-        const RecoveryOpenRequest& request)
+        const RecoveryOpenRequest& request,
+        const std::size_t requested_block_count)
         : paths(request.paths),
           remote(request.remote),
           policy(request.policy),
@@ -157,7 +158,8 @@ public:
               request.overwrite_existing),
           metadata_store(paths.metadata_path),
           reservation_state(
-              std::make_shared<ReservationState>()) {}
+              std::make_shared<ReservationState>()),
+          block_count(requested_block_count) {}
 
     core::SessionPaths paths;
     RemoteRecoveryIdentity remote;
@@ -166,6 +168,7 @@ public:
     storage::FileWriter file_writer;
     metadata::MetadataStore metadata_store;
     std::shared_ptr<ReservationState> reservation_state;
+    const std::size_t block_count;
     bool resumed = false;
 };
 
@@ -185,7 +188,10 @@ namespace {
         !request.remote.url.empty() &&
         request.remote.total_size > 0 &&
         request.policy.block_bytes > 0 &&
-        request.policy.io_alignment_bytes > 0;
+        request.policy.io_alignment_bytes > 0 &&
+        core::required_block_count(
+            request.remote.total_size,
+            request.policy.block_bytes).has_value();
 }
 
 [[nodiscard]] bool candidate_identity_matches(
@@ -245,21 +251,13 @@ validate_candidate_structure(
         state.vdl_offset % block_size != 0) {
         return std::nullopt;
     }
-    const auto quotient = state.total_size / block_size;
-    const auto remainder = state.total_size % block_size;
-    if (quotient < 0 ||
-        static_cast<std::uint64_t>(quotient) >
-            std::numeric_limits<std::size_t>::max()) {
+    const auto required_block_count = core::required_block_count(
+        state.total_size,
+        state.block_size);
+    if (!required_block_count.has_value()) {
         return std::nullopt;
     }
-    auto block_count = static_cast<std::size_t>(quotient);
-    if (remainder != 0) {
-        if (block_count ==
-            std::numeric_limits<std::size_t>::max()) {
-            return std::nullopt;
-        }
-        ++block_count;
-    }
+    const auto block_count = *required_block_count;
     if (state.bitmap_states.size() > block_count ||
         std::any_of(
             state.bitmap_states.begin(),
@@ -518,8 +516,18 @@ RecoveryOpenResult RecoveryCheckpoint::open(
     }
 
     try {
+        const auto requested_block_count = core::required_block_count(
+            request.remote.total_size,
+            request.policy.block_bytes);
+        if (!requested_block_count.has_value()) {
+            result.error = make_error_code(
+                DownloadErrc::invalid_request);
+            return result;
+        }
         auto implementation =
-            std::make_unique<Implementation>(request);
+            std::make_unique<Implementation>(
+                request,
+                *requested_block_count);
         std::error_code inventory_error;
         const auto part_exists =
             std::filesystem::exists(
@@ -633,9 +641,7 @@ RecoveryOpenResult RecoveryCheckpoint::open(
 
         const auto block_count = can_resume ?
             validated_geometry->block_count :
-            core::required_block_count(
-                request.remote.total_size,
-                request.policy.block_bytes);
+            implementation->block_count;
         core::AtomicBlockBitmap bitmap(block_count);
         if (can_resume) {
             bitmap.restore(loaded->bitmap_states);
@@ -751,10 +757,7 @@ PrepareCheckpointResult RecoveryCheckpoint::prepare(
     try {
         const auto reservation =
             implementation_->reservation_state;
-        const auto block_count =
-            core::required_block_count(
-                implementation_->remote.total_size,
-                implementation_->policy.block_bytes);
+        const auto block_count = implementation_->block_count;
         if (bitmap_states.size() != block_count) {
             result.error =
                 std::make_error_code(

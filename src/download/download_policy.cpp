@@ -1,12 +1,12 @@
-#include "download_policy.hpp"
-
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <utility>
 
 #include "asyncdownload/error.hpp"
+#include "core/block_geometry.hpp"
 #include "core/constants.hpp"
+#include "download_policy.hpp"
 
 namespace asyncdownload::download {
 namespace {
@@ -198,18 +198,15 @@ bind_remote_facts(const ValidatedDownloadPolicy& policy,
     }
 
     const auto& raw = policy.raw_options_;
-    const auto block_bytes = static_cast<std::int64_t>(raw.block_size);
-    const auto quotient = facts.total_size / block_bytes;
-    const auto remainder = facts.total_size % block_bytes;
-    const auto block_count = quotient + (remainder == 0 ? 0 : 1);
-    if constexpr (sizeof(std::size_t) < sizeof(std::int64_t)) {
-        if (block_count > static_cast<std::int64_t>(
-                std::numeric_limits<std::size_t>::max())) {
-            return reject<EffectiveDownloadPolicy>(
-                DownloadPolicyErrc::remote_block_count_not_representable,
-                DownloadErrc::http_invalid_response);
-        }
+    const auto block_count = core::required_block_count(
+        facts.total_size,
+        raw.block_size);
+    if (!block_count.has_value()) {
+        return reject<EffectiveDownloadPolicy>(
+            DownloadPolicyErrc::remote_block_count_not_representable,
+            DownloadErrc::http_invalid_response);
     }
+    const auto block_bytes = static_cast<std::int64_t>(raw.block_size);
 
     EffectiveDownloadPolicy effective;
     effective.raw_options_ = raw;

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "asyncdownload/types.hpp"
-
 #include <memory>
 #include <system_error>
+
+#include "asyncdownload/types.hpp"
 
 namespace asyncdownload::http {
 class HttpTransferPort;

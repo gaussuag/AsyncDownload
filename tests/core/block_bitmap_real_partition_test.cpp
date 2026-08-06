@@ -1,13 +1,19 @@
-﻿#include "core/block_bitmap.hpp"
+#include <cstdint>
 
 #include <gtest/gtest.h>
+
+#include "core/block_bitmap.hpp"
+#include "core/block_geometry.hpp"
 
 TEST(BlockBitmapTest, MarksRealDownloadPartitionAsFinished) {
     constexpr std::int64_t total_size = 207366576;
     constexpr std::size_t block_size = 64 * 1024;
 
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(total_size, block_size));
+    const auto block_count = asyncdownload::core::required_block_count(
+        total_size,
+        block_size);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
 
     struct Range {
         std::int64_t start;

@@ -19,6 +19,7 @@
 
 #include "asyncdownload/error.hpp"
 #include "core/block_bitmap.hpp"
+#include "core/block_geometry.hpp"
 #include "core/models.hpp"
 #include "flow/packet_flow.hpp"
 #include "persistence/persistence_thread.hpp"
@@ -211,10 +212,11 @@ void persist_single_range_at_tail_capacity(
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(
-            session.total_size,
-            policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -332,10 +334,14 @@ PersistenceScenarioResult run_persistence_scenario(
     asyncdownload::flow::ProducerLane lane;
     EXPECT_FALSE(
         packet_flow->producer().open_lane(lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(
-            total_size,
-            policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        total_size,
+        policy.block_bytes);
+    EXPECT_TRUE(block_count.has_value());
+    if (!block_count.has_value()) {
+        return {};
+    }
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     EXPECT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -898,8 +904,11 @@ TEST(PersistenceThreadTest, PausesRangeWhenGapExceedsThreshold) {
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -965,8 +974,11 @@ TEST(PersistenceThreadTest, MarksPartiallyPersistedBlocksAsDownloading) {
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -1033,8 +1045,11 @@ TEST(PersistenceThreadTest, DrainsQueuedPacketsAfterPersistence) {
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -1103,8 +1118,11 @@ TEST(PersistenceThreadTest, CollectsSampledPacketLatencyStats) {
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);
@@ -1172,8 +1190,11 @@ TEST(PersistenceThreadTest, ClearsGapPauseAfterMissingDataArrives) {
     auto packet_flow = make_packet_flow(session);
     asyncdownload::flow::ProducerLane packet_lane;
     ASSERT_FALSE(packet_flow->producer().open_lane(packet_lane));
-    asyncdownload::core::AtomicBlockBitmap bitmap(
-        asyncdownload::core::required_block_count(session.total_size, policy.block_bytes));
+    const auto block_count = asyncdownload::core::required_block_count(
+        session.total_size,
+        policy.block_bytes);
+    ASSERT_TRUE(block_count.has_value());
+    asyncdownload::core::AtomicBlockBitmap bitmap(*block_count);
     auto checkpoint = open_checkpoint(session);
     ASSERT_NE(checkpoint, nullptr);
     BS::thread_pool<> workers(1);

@@ -1,10 +1,3 @@
-#include "asyncdownload/client.hpp"
-#include "asyncdownload/error.hpp"
-#include "core/block_bitmap.hpp"
-#include "core/crc32.hpp"
-#include "metadata/metadata_store.hpp"
-
-#include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,6 +14,15 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <gtest/gtest.h>
+
+#include "asyncdownload/client.hpp"
+#include "asyncdownload/error.hpp"
+#include "core/block_bitmap.hpp"
+#include "core/block_geometry.hpp"
+#include "core/crc32.hpp"
+#include "metadata/metadata_store.hpp"
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -491,12 +493,12 @@ void write_legacy_resume_state(
     state.resumed = true;
     state.block_size = block_size;
     state.io_alignment = 4 * 1024;
-    const auto block_count =
-        asyncdownload::core::required_block_count(
-            state.total_size,
-            block_size);
+    const auto block_count = asyncdownload::core::required_block_count(
+        state.total_size,
+        block_size);
+    ASSERT_TRUE(block_count.has_value());
     state.bitmap_states.assign(
-        block_count,
+        *block_count,
         static_cast<std::uint8_t>(
             complete
                 ? asyncdownload::core::BlockState::finished

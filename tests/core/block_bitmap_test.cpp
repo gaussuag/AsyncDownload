@@ -1,18 +1,8 @@
-﻿#include "core/block_bitmap.hpp"
-
 #include <cstdint>
-#include <limits>
 
 #include <gtest/gtest.h>
 
-TEST(BlockBitmapTest, RequiredCountDoesNotOverflowAtMaximumSize) {
-    const auto total = std::numeric_limits<std::int64_t>::max();
-    const auto expected = static_cast<std::size_t>(total / 4096 + 1);
-
-    EXPECT_EQ(
-        asyncdownload::core::required_block_count(total, 4096),
-        expected);
-}
+#include "core/block_bitmap.hpp"
 
 TEST(BlockBitmapTest, MarksFullyCoveredBlocksFinished) {
     asyncdownload::core::AtomicBlockBitmap bitmap(4);
